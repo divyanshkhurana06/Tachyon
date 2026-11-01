@@ -7,8 +7,11 @@
 
 use std::fmt;
 
+pub mod config;
+pub mod engine;
 pub mod json;
 pub mod kernels;
+pub mod model;
 pub mod pool;
 pub mod safetensors;
 pub mod tokenizer;
