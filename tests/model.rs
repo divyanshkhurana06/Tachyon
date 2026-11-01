@@ -8,9 +8,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use tachyon::chat::{ChatTemplate, Message, DEFAULT_SYSTEM};
 use tachyon::config::Config;
-use tachyon::engine::Engine;
+use tachyon::engine::{Engine, Session};
 use tachyon::generate::{generate, GenOptions};
-use tachyon::model::{CpuEngine, Weights};
+use tachyon::model::{CpuBackend, Weights};
 use tachyon::pool::Pool;
 use tachyon::sampler::SamplerConfig;
 use tachyon::speculative::generate_speculative;
@@ -38,12 +38,8 @@ fn setup() -> Option<(MutexGuard<'static, ()>, PathBuf)> {
 fn cpu(dir: &Path, format: Format) -> Box<dyn Engine> {
     let cfg = Config::load(dir).unwrap();
     let w = Weights::load(dir, &cfg, format).unwrap();
-    Box::new(CpuEngine::new(
-        cfg,
-        w,
-        Arc::new(Pool::new(Pool::default_threads())),
-        1024,
-    ))
+    let pool = Arc::new(Pool::new(Pool::default_threads()));
+    Box::new(Session::new(Box::new(CpuBackend::new(cfg, w, pool, 64))))
 }
 
 fn prompt(tok: &Tokenizer, question: &str) -> Vec<u32> {
@@ -178,12 +174,101 @@ fn gpu_matches_cpu() {
     let tok = Tokenizer::load(&dir.join("tokenizer.json")).unwrap();
     let cfg = Config::load(&dir).unwrap();
     let w = Weights::load(&dir, &cfg, Format::Bf16).unwrap();
-    let mut gpu: Box<dyn Engine> = match tachyon::gpu::GpuEngine::new(cfg, w, 1024) {
-        Ok(g) => Box::new(g),
+    let mut gpu: Box<dyn Engine> = match tachyon::gpu::GpuBackend::new(cfg, w, 64, 1024) {
+        Ok(g) => Box::new(Session::new(Box::new(g))),
         Err(e) => return eprintln!("skipping: {e}"),
     };
     let p = prompt(&tok, "Give me one tip for writing clean code.");
     let (_, on_gpu) = greedy(gpu.as_mut(), &tok, &p, 40);
     let (_, on_cpu) = greedy(cpu(&dir, Format::Bf16).as_mut(), &tok, &p, 40);
     assert_eq!(on_gpu, on_cpu);
+}
+
+/// Greedy tokens with no stop token, through the single-sequence API.
+fn greedy_raw(e: &mut dyn Engine, prompt: &[u32], n: usize) -> Vec<u32> {
+    let vocab = e.config().vocab;
+    e.truncate(0);
+    let mut next = tachyon::sampler::argmax(&e.forward(prompt, false)[..vocab]);
+    let mut out = vec![next];
+    while out.len() < n {
+        next = tachyon::sampler::argmax(&e.forward(&[next], false)[..vocab]);
+        out.push(next);
+    }
+    out
+}
+
+/// Decodes several prompts in lockstep, all in one batch per step, through
+/// the paged cache, and checks each matches decoding it alone.
+fn check_batched_matches_alone(
+    mut backend: Box<dyn tachyon::engine::Backend>,
+    alone: &mut dyn Engine,
+    tok: &Tokenizer,
+) {
+    use tachyon::kv::{Batch, BlockPool, Logits};
+    let prompts: Vec<Vec<u32>> = [
+        "Name a planet.",
+        "Write one word that rhymes with cat, then explain.",
+        "2+2=",
+    ]
+    .iter()
+    .map(|q| prompt(tok, q))
+    .collect();
+    let n = 12;
+    let expected: Vec<Vec<u32>> = prompts.iter().map(|p| greedy_raw(alone, p, n)).collect();
+
+    let vocab = backend.config().vocab;
+    let mut pool = BlockPool::new(backend.num_blocks());
+    let mut seqs: Vec<_> = prompts.iter().map(|p| pool.start(p)).collect();
+    let mut outs: Vec<Vec<u32>> = vec![Vec::new(); prompts.len()];
+    let mut batch = Batch::default();
+    for step in 0..n {
+        batch.clear();
+        for (i, seq) in seqs.iter_mut().enumerate() {
+            let new: Vec<u32> = if step == 0 {
+                prompts[i][seq.len..].to_vec()
+            } else {
+                vec![*outs[i].last().unwrap()]
+            };
+            assert!(pool.reserve(seq, seq.len + new.len()));
+            batch.push(&seq.blocks, seq.len, &new, Logits::Last);
+            seq.len += new.len();
+        }
+        let logits = backend.forward(&batch).to_vec();
+        for (i, row) in logits.chunks_exact(vocab).enumerate() {
+            outs[i].push(tachyon::sampler::argmax(&row[..tok.len()]));
+        }
+    }
+    assert_eq!(outs, expected);
+}
+
+#[test]
+fn batched_sequences_match_running_alone() {
+    let Some((_g, dir)) = setup() else { return };
+    let tok = Tokenizer::load(&dir.join("tokenizer.json")).unwrap();
+    let cfg = Config::load(&dir).unwrap();
+    let pool = Arc::new(Pool::new(Pool::default_threads()));
+    let backend = CpuBackend::new(
+        cfg.clone(),
+        Weights::load(&dir, &cfg, Format::Q8).unwrap(),
+        pool,
+        64,
+    );
+    check_batched_matches_alone(Box::new(backend), cpu(&dir, Format::Q8).as_mut(), &tok);
+
+    #[cfg(target_os = "macos")]
+    if let Ok(g) = tachyon::gpu::GpuBackend::new(
+        cfg.clone(),
+        Weights::load(&dir, &cfg, Format::Q8).unwrap(),
+        64,
+        1024,
+    ) {
+        let alone = tachyon::gpu::GpuBackend::new(
+            cfg.clone(),
+            Weights::load(&dir, &cfg, Format::Q8).unwrap(),
+            64,
+            1024,
+        )
+        .unwrap();
+        check_batched_matches_alone(Box::new(g), &mut Session::new(Box::new(alone)), &tok);
+    }
 }

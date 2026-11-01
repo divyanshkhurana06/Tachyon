@@ -15,6 +15,7 @@ pub mod generate;
 pub mod gpu;
 pub mod json;
 pub mod kernels;
+pub mod kv;
 pub mod model;
 pub mod pool;
 pub mod safetensors;

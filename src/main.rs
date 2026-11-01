@@ -6,9 +6,10 @@ use std::time::Instant;
 
 use tachyon::chat::{ChatTemplate, Message, DEFAULT_SYSTEM};
 use tachyon::config::Config;
-use tachyon::engine::Engine;
+use tachyon::engine::{Backend, Engine, Session};
 use tachyon::generate::{generate, GenOptions, GenStats, PREFILL_CHUNK};
-use tachyon::model::{CpuEngine, Weights};
+use tachyon::kv::BLOCK;
+use tachyon::model::{CpuBackend, Weights};
 use tachyon::pool::Pool;
 use tachyon::sampler::{argmax, SamplerConfig};
 use tachyon::tokenizer::Tokenizer;
@@ -200,11 +201,13 @@ fn load_from(
     let started = Instant::now();
     let weights = Weights::load(dir, &cfg, format)?;
     let bytes = weights.bytes();
-    let engine: Box<dyn Engine> = if gpu {
-        gpu_engine(cfg.clone(), weights, a.ctx)?
+    let blocks = a.ctx.div_ceil(BLOCK);
+    let backend: Box<dyn Backend> = if gpu {
+        gpu_backend(cfg.clone(), weights, blocks, a.ctx)?
     } else {
-        Box::new(CpuEngine::new(cfg.clone(), weights, pool.clone(), a.ctx))
+        Box::new(CpuBackend::new(cfg.clone(), weights, pool.clone(), blocks))
     };
+    let engine: Box<dyn Engine> = Box::new(Session::new(backend));
     eprintln!(
         "loaded {} ({:.0}M params, {}, {:.0} MB) in {:.2}s on {}",
         a.model
@@ -225,12 +228,19 @@ fn load_from(
 }
 
 #[cfg(target_os = "macos")]
-fn gpu_engine(cfg: Config, weights: Weights, ctx: usize) -> Result<Box<dyn Engine>> {
-    Ok(Box::new(tachyon::gpu::GpuEngine::new(cfg, weights, ctx)?))
+fn gpu_backend(
+    cfg: Config,
+    weights: Weights,
+    blocks: usize,
+    max_seq: usize,
+) -> Result<Box<dyn Backend>> {
+    Ok(Box::new(tachyon::gpu::GpuBackend::new(
+        cfg, weights, blocks, max_seq,
+    )?))
 }
 
 #[cfg(not(target_os = "macos"))]
-fn gpu_engine(_: Config, _: Weights, _: usize) -> Result<Box<dyn Engine>> {
+fn gpu_backend(_: Config, _: Weights, _: usize, _: usize) -> Result<Box<dyn Backend>> {
     bail!("the GPU backend needs macOS (Metal)")
 }
 

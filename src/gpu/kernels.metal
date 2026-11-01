@@ -135,19 +135,22 @@ kernel void matmul_q4(device const float *scales [[buffer(0)]], device const uch
     matmul_impl(load, x, y, bias, p, (tg * SIMDS + sg) * R, lane);
 }
 
+constant uint BLOCK = 16; // KV cache block size, as in kv.rs
+
 struct NormParams {
     uint n;
     float eps;
+    uint gather; // read input row rows[i] instead of row i
 };
 
-// One threadgroup per row.
+// One threadgroup per output row.
 kernel void rmsnorm(device const float *x [[buffer(0)]], device const float *w [[buffer(1)]],
-                    device float *out [[buffer(2)]], constant NormParams &p [[buffer(3)]],
-                    uint row [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-                    uint size [[threads_per_threadgroup]], uint lane [[thread_index_in_simdgroup]],
-                    uint sg [[simdgroup_index_in_threadgroup]]) {
+                    device float *out [[buffer(2)]], device const uint *rows [[buffer(3)]],
+                    constant NormParams &p [[buffer(4)]], uint row [[threadgroup_position_in_grid]],
+                    uint tid [[thread_index_in_threadgroup]], uint size [[threads_per_threadgroup]],
+                    uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
     threadgroup float partial[32];
-    device const float *xr = x + (ulong)row * p.n;
+    device const float *xr = x + (ulong)(p.gather ? rows[row] : row) * p.n;
     device float *o = out + (ulong)row * p.n;
     float ss = 0;
     for (uint i = tid; i < p.n; i += size) ss += xr[i] * xr[i];
@@ -160,6 +163,33 @@ kernel void rmsnorm(device const float *x [[buffer(0)]], device const float *w [
     for (uint i = tid; i < p.n; i += size) o[i] = xr[i] * inv * w[i];
 }
 
+struct HeadNormParams {
+    uint head_dim;
+    uint heads;
+    uint qkv_dim;
+    uint q_dim;
+    float eps;
+};
+
+// Qwen3: RMSNorm over each q and k head before RoPE. One threadgroup of
+// head_dim threads per (head, token); heads past `heads` are k heads.
+kernel void head_norm(device float *qkv [[buffer(0)]], device const float *qw [[buffer(1)]],
+                      device const float *kw [[buffer(2)]], constant HeadNormParams &p [[buffer(3)]],
+                      uint2 tg [[threadgroup_position_in_grid]], uint d [[thread_index_in_threadgroup]],
+                      uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float partial[4];
+    uint h = tg.x, i = tg.y;
+    bool is_q = h < p.heads;
+    device float *v = qkv + (ulong)i * p.qkv_dim + (is_q ? h * p.head_dim : p.q_dim + (h - p.heads) * p.head_dim);
+    float x = v[d];
+    float ss = simd_sum(x * x);
+    if (lane == 0) partial[sg] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total = 0;
+    for (uint j = 0; j < p.head_dim / 32; j++) total += partial[j];
+    v[d] = x * rsqrt(total / p.head_dim + p.eps) * (is_q ? qw[d] : kw[d]);
+}
+
 struct RopeParams {
     uint head_dim;
     uint heads;
@@ -167,14 +197,14 @@ struct RopeParams {
     uint qkv_dim;
     uint q_dim;
     uint kv_dim;
-    uint pos0;
 };
 
 // Rotates q in place, and writes rotated k and plain v into this layer's KV
-// cache at their positions. Grid: (head_dim/2, heads + kv_heads, tokens).
+// cache at each token's slot. Grid: (head_dim/2, heads + kv_heads, tokens).
 kernel void rope_store(device float *qkv [[buffer(0)]], device float *kc [[buffer(1)]], device float *vc [[buffer(2)]],
                        device const float *cosb [[buffer(3)]], device const float *sinb [[buffer(4)]],
-                       constant RopeParams &p [[buffer(5)]], uint3 gid [[thread_position_in_grid]]) {
+                       device const uint *slots [[buffer(5)]], constant RopeParams &p [[buffer(6)]],
+                       uint3 gid [[thread_position_in_grid]]) {
     uint half_dim = p.head_dim / 2;
     uint d = gid.x, h = gid.y, i = gid.z;
     if (d >= half_dim || h >= p.heads + p.kv_heads) return;
@@ -189,7 +219,7 @@ kernel void rope_store(device float *qkv [[buffer(0)]], device float *kc [[buffe
         uint kh = h - p.heads;
         device const float *k = row + p.q_dim + kh * p.head_dim;
         device const float *v = row + p.q_dim + p.kv_dim + kh * p.head_dim;
-        ulong at = (ulong)(p.pos0 + i) * p.kv_dim + kh * p.head_dim;
+        ulong at = (ulong)slots[i] * p.kv_dim + kh * p.head_dim;
         float a = k[d], b = k[d + half_dim];
         kc[at + d] = a * c - b * s;
         kc[at + d + half_dim] = b * c + a * s;
@@ -205,7 +235,6 @@ struct AttnParams {
     uint qkv_dim;
     uint q_dim;
     uint kv_dim;
-    uint pos0;
     uint max_seq;
     float scale;
 };
@@ -213,19 +242,27 @@ struct AttnParams {
 constant uint ATT_THREADS = 256;
 constant uint ATT_SIMDS = ATT_THREADS / 32;
 
-// One threadgroup per (head, token). Scores go to a scratch buffer so any
-// context length fits; three passes: q·k (a thread per position), softmax,
-// weighted sum of v.
+inline ulong cache_slot(device const uint *table, uint s) {
+    return (ulong)table[s / BLOCK] * BLOCK + s % BLOCK;
+}
+
+// One threadgroup per (head, token). Each token attends to its own
+// sequence's positions 0..=pos, found through the sequence's block table.
+// Scores go to a scratch buffer so any context length fits; three passes:
+// q·k (a thread per position), softmax, weighted sum of v.
 kernel void attention(device const float *qkv [[buffer(0)]], device const float *kc [[buffer(1)]],
                       device const float *vc [[buffer(2)]], device float *scores [[buffer(3)]],
-                      device float *out [[buffer(4)]], constant AttnParams &p [[buffer(5)]],
-                      uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-                      uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+                      device float *out [[buffer(4)]], device const uint *positions [[buffer(5)]],
+                      device const uint *table_of [[buffer(6)]], device const uint *tables [[buffer(7)]],
+                      constant AttnParams &p [[buffer(8)]], uint2 tg [[threadgroup_position_in_grid]],
+                      uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                      uint sg [[simdgroup_index_in_threadgroup]]) {
     threadgroup float red[ATT_SIMDS];
     threadgroup float partial[ATT_THREADS];
     threadgroup float4 q4[32]; // head_dim <= 128
     uint h = tg.x, i = tg.y;
-    uint n = p.pos0 + i + 1;
+    uint n = positions[i] + 1;
+    device const uint *table = tables + table_of[i];
     uint kv = (h / (p.heads / p.kv_heads)) * p.head_dim;
     uint d4 = p.head_dim / 4;
     device const float4 *q = (device const float4 *)(qkv + (ulong)i * p.qkv_dim + h * p.head_dim);
@@ -236,7 +273,7 @@ kernel void attention(device const float *qkv [[buffer(0)]], device const float 
     // 1. scores: one thread per cached position, a full q·k each
     float local_max = -INFINITY;
     for (uint s = tid; s < n; s += ATT_THREADS) {
-        device const float4 *k = (device const float4 *)(kc + (ulong)s * p.kv_dim + kv);
+        device const float4 *k = (device const float4 *)(kc + cache_slot(table, s) * p.kv_dim + kv);
         float d = 0;
         for (uint e = 0; e < d4; e++) d += dot(q4[e], k[e]);
         d *= p.scale;
@@ -267,7 +304,7 @@ kernel void attention(device const float *qkv [[buffer(0)]], device const float 
     uint stripes = ATT_THREADS / p.head_dim;
     uint d = tid % p.head_dim, stripe = tid / p.head_dim;
     float acc = 0;
-    for (uint s = stripe; s < n; s += stripes) acc += sc[s] * vc[(ulong)s * p.kv_dim + kv + d];
+    for (uint s = stripe; s < n; s += stripes) acc += sc[s] * vc[cache_slot(table, s) * p.kv_dim + kv + d];
     partial[tid] = acc;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid < p.head_dim) {
