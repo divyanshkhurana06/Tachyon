@@ -22,6 +22,11 @@ const SOURCE: &str = include_str!("kernels.metal");
 const MAT_SIMDS: usize = 2;
 const ROWS_PER_GROUP: usize = MAT_SIMDS * 4;
 const ATT_THREADS: u32 = 256;
+/// Output tile of the `gemm_*` kernels, and the batch size from which they
+/// beat the matrix-vector kernels.
+const GEMM_TOKENS: usize = 16;
+const GEMM_ROWS: usize = 64;
+const GEMM_MIN_BATCH: usize = 4;
 
 /// Most tokens one forward pass takes (prefill chunks, speculative checks).
 pub const MAX_BATCH: usize = 128;
@@ -32,6 +37,9 @@ enum Kernel {
     MatBf16,
     MatQ8,
     MatQ4,
+    GemmBf16,
+    GemmQ8,
+    GemmQ4,
     RmsNorm,
     HeadNorm,
     RopeStore,
@@ -39,10 +47,13 @@ enum Kernel {
     SiluMul,
 }
 
-const KERNELS: [&str; 8] = [
+const KERNELS: [&str; 11] = [
     "matmul_bf16",
     "matmul_q8",
     "matmul_q4",
+    "gemm_bf16",
+    "gemm_q8",
+    "gemm_q4",
     "rmsnorm",
     "head_norm",
     "rope_store",
@@ -458,13 +469,28 @@ impl GpuBackend {
         };
         let mut args: Vec<(&Buffer, usize)> = m.bufs.iter().map(|b| (b, 0)).collect();
         args.extend([(x, 0), (y, 0), (bias.unwrap_or(y), 0)]);
-        self.dispatch(
-            m.kernel,
-            &args,
-            &p,
-            [m.rows.div_ceil(ROWS_PER_GROUP), 1, 1],
-            [32 * MAT_SIMDS, 1, 1],
-        );
+        if t >= GEMM_MIN_BATCH {
+            let gemm = match m.kernel {
+                Kernel::MatBf16 => Kernel::GemmBf16,
+                Kernel::MatQ8 => Kernel::GemmQ8,
+                _ => Kernel::GemmQ4,
+            };
+            self.dispatch(
+                gemm,
+                &args,
+                &p,
+                [m.rows.div_ceil(GEMM_ROWS), t.div_ceil(GEMM_TOKENS), 1],
+                [128, 1, 1],
+            );
+        } else {
+            self.dispatch(
+                m.kernel,
+                &args,
+                &p,
+                [m.rows.div_ceil(ROWS_PER_GROUP), 1, 1],
+                [32 * MAT_SIMDS, 1, 1],
+            );
+        }
     }
 
     /// RMSNorm `rows` rows of `x` into `out`; with `gather`, row i of the
