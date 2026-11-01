@@ -10,6 +10,7 @@ use std::fmt;
 pub mod json;
 pub mod kernels;
 pub mod safetensors;
+pub mod tokenizer;
 
 #[derive(Debug)]
 pub struct Error(pub String);
