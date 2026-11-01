@@ -19,6 +19,7 @@ pub mod model;
 pub mod pool;
 pub mod safetensors;
 pub mod sampler;
+pub mod server;
 pub mod speculative;
 pub mod tokenizer;
 pub mod weights;
