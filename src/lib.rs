@@ -7,13 +7,16 @@
 
 use std::fmt;
 
+pub mod chat;
 pub mod config;
 pub mod engine;
+pub mod generate;
 pub mod json;
 pub mod kernels;
 pub mod model;
 pub mod pool;
 pub mod safetensors;
+pub mod sampler;
 pub mod tokenizer;
 pub mod weights;
 
