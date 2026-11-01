@@ -56,6 +56,7 @@ fn greedy(e: &mut dyn Engine, tok: &Tokenizer, prompt: &[u32], n: usize) -> (Str
         max_tokens: n,
         sampler: SamplerConfig::greedy(),
         stop_tokens: cfg.eos_ids,
+        json: false,
     };
     let mut text = String::new();
     let stats = generate(e, tok, &mut Vec::new(), prompt, &opts, &mut |p| {
@@ -132,6 +133,7 @@ fn reusing_the_kv_cache_changes_nothing() {
         max_tokens: 20,
         sampler: SamplerConfig::greedy(),
         stop_tokens: e.config().eos_ids.clone(),
+        json: false,
     };
     let p = prompt(&tok, "List three fruits.");
 
@@ -270,5 +272,52 @@ fn batched_sequences_match_running_alone() {
         )
         .unwrap();
         check_batched_matches_alone(Box::new(g), &mut Session::new(Box::new(alone)), &tok);
+    }
+}
+
+#[test]
+fn json_mode_always_parses() {
+    let Some((_g, dir)) = setup() else { return };
+    let tok = Tokenizer::load(&dir.join("tokenizer.json")).unwrap();
+    let mut e = cpu(&dir, Format::Q8);
+    // Prompts that don't ask for JSON: the constraint alone must force it.
+    for (i, q) in [
+        "Tell me a joke.",
+        "What is 2 + 2?",
+        "Write a haiku about rain.",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let opts = GenOptions {
+            max_tokens: 120,
+            sampler: SamplerConfig {
+                temperature: 1.0,
+                seed: i as u64 + 1,
+                ..SamplerConfig::default()
+            },
+            stop_tokens: e.config().eos_ids.clone(),
+            json: true,
+        };
+        let mut text = String::new();
+        let stats = generate(
+            e.as_mut(),
+            &tok,
+            &mut Vec::new(),
+            &prompt(&tok, q),
+            &opts,
+            &mut |p| {
+                text.push_str(p);
+                true
+            },
+        )
+        .unwrap();
+        if stats.finish == tachyon::generate::Finish::Stop {
+            assert!(
+                tachyon::json::Json::parse(&text).is_ok(),
+                "invalid JSON for {q:?}: {text}"
+            );
+        }
+        assert!(text.trim_start().starts_with('{'), "{text}");
     }
 }

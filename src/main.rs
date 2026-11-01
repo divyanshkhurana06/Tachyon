@@ -1,4 +1,5 @@
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, BufReader, Write};
+use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -8,10 +9,13 @@ use tachyon::chat::{ChatTemplate, Message, DEFAULT_SYSTEM};
 use tachyon::config::Config;
 use tachyon::engine::{Backend, Engine, Session};
 use tachyon::generate::{generate, GenOptions, GenStats, PREFILL_CHUNK};
+use tachyon::json::{obj, Json};
 use tachyon::kv::BLOCK;
 use tachyon::model::{CpuBackend, Weights};
 use tachyon::pool::Pool;
 use tachyon::sampler::{argmax, SamplerConfig};
+use tachyon::scheduler::{Scheduler, SchedulerOptions};
+use tachyon::server::Server;
 use tachyon::tokenizer::Tokenizer;
 use tachyon::weights::Format;
 use tachyon::{bail, Error, Result};
@@ -24,9 +28,11 @@ usage: tachyon <command> [options]
 commands:
   run        generate a reply to --prompt
   chat       interactive multi-turn chat
-  serve      OpenAI-compatible API and chat page (--port, default 8080)
+  serve      OpenAI-compatible API and chat page, batching all users together
+  loadtest   many concurrent clients against a running `serve`
   speculate  plain vs speculative decoding of --prompt, side by side
   bench      speed and quality of each weight format
+  bench-batch  decode throughput at batch sizes 1 to 64 (the engine alone)
   ppl        perplexity of the model on --file
 
 options:
@@ -51,7 +57,13 @@ options:
   --draft-model DIR  draft model folder (default: the same model)
   --draft-k K        tokens drafted per step (default 4)
   --port P           port for `serve` (default 8080)
-  --host H           address for `serve` (default 127.0.0.1)";
+  --host H           address for `serve` (default 127.0.0.1)
+  --kv-tokens N      KV cache size for `serve`, shared by all users (default 16384)
+  --max-seqs N       most requests `serve` runs at once (default 16)
+  --json             constrain the reply to a JSON object
+  --url URL          server for `loadtest` (default http://127.0.0.1:8080)
+  --clients LIST     concurrency levels for `loadtest` (default 1,4,16)
+  --requests N       requests per level for `loadtest` (default 32)";
 
 struct Args {
     cmd: String,
@@ -73,6 +85,12 @@ struct Args {
     draft_k: usize,
     port: u16,
     host: String,
+    kv_tokens: usize,
+    max_seqs: usize,
+    json: bool,
+    url: String,
+    clients: Vec<usize>,
+    requests: usize,
 }
 
 fn parse_args() -> Result<Args> {
@@ -102,6 +120,12 @@ fn parse_args() -> Result<Args> {
         draft_k: 4,
         port: 8080,
         host: "127.0.0.1".into(),
+        kv_tokens: 16384,
+        max_seqs: 16,
+        json: false,
+        url: "http://127.0.0.1:8080".into(),
+        clients: vec![1, 4, 16],
+        requests: 32,
     };
     while let Some(flag) = it.next() {
         let mut value = || {
@@ -148,6 +172,20 @@ fn parse_args() -> Result<Args> {
             "--draft-k" => a.draft_k = num(&flag, value()?)?,
             "--port" => a.port = num(&flag, value()?)?,
             "--host" => a.host = value()?,
+            "--kv-tokens" => a.kv_tokens = num(&flag, value()?)?,
+            "--max-seqs" => a.max_seqs = num(&flag, value()?)?,
+            "--json" => a.json = true,
+            "--url" => a.url = value()?,
+            "--requests" => a.requests = num(&flag, value()?)?,
+            "--clients" => {
+                a.clients = value()?
+                    .split(',')
+                    .map(|c| {
+                        c.parse()
+                            .map_err(|_| Error(format!("--clients: bad number {c:?}")))
+                    })
+                    .collect::<Result<_>>()?
+            }
             "-h" | "--help" => a.cmd = "help".into(),
             _ => bail!("unknown option {flag} (see `tachyon help`)"),
         }
@@ -163,6 +201,8 @@ fn main() -> ExitCode {
         "ppl" => perplexity_cmd(&a),
         "serve" => serve(&a),
         "speculate" => speculate(&a),
+        "loadtest" => loadtest(&a),
+        "bench-batch" => bench_batch(&a),
         "help" => {
             println!("{USAGE}");
             Ok(())
@@ -189,6 +229,51 @@ fn load(a: &Args, format: Format, gpu: bool, pool: &Arc<Pool>) -> Result<Loaded>
     load_from(a, &a.model, format, gpu, pool)
 }
 
+struct LoadedBackend {
+    backend: Box<dyn Backend>,
+    tok: Tokenizer,
+    cfg: Config,
+    bytes: usize,
+}
+
+/// Loads a model onto the CPU or GPU with a KV cache of `blocks` blocks.
+fn load_backend(
+    a: &Args,
+    dir: &std::path::Path,
+    format: Format,
+    gpu: bool,
+    pool: &Arc<Pool>,
+    blocks: usize,
+) -> Result<LoadedBackend> {
+    let cfg = Config::load(dir)?;
+    let tok = Tokenizer::load(&dir.join("tokenizer.json"))?;
+    let started = Instant::now();
+    let weights = Weights::load(dir, &cfg, format)?;
+    let bytes = weights.bytes();
+    let backend: Box<dyn Backend> = if gpu {
+        gpu_backend(cfg.clone(), weights, blocks, a.ctx)?
+    } else {
+        Box::new(CpuBackend::new(cfg.clone(), weights, pool.clone(), blocks))
+    };
+    eprintln!(
+        "loaded {} ({:.0}M params, {}, {:.0} MB) in {:.2}s on {}",
+        dir.file_name()
+            .map_or("model".into(), |n| n.to_string_lossy()),
+        cfg.params() as f64 / 1e6,
+        format.name(),
+        bytes as f64 / 1e6,
+        started.elapsed().as_secs_f64(),
+        backend.name()
+    );
+    Ok(LoadedBackend {
+        backend,
+        tok,
+        cfg,
+        bytes,
+    })
+}
+
+/// Loads a model as a single sequence with a `--ctx`-token cache.
 fn load_from(
     a: &Args,
     dir: &std::path::Path,
@@ -196,34 +281,12 @@ fn load_from(
     gpu: bool,
     pool: &Arc<Pool>,
 ) -> Result<Loaded> {
-    let cfg = Config::load(dir)?;
-    let tok = Tokenizer::load(&dir.join("tokenizer.json"))?;
-    let started = Instant::now();
-    let weights = Weights::load(dir, &cfg, format)?;
-    let bytes = weights.bytes();
-    let blocks = a.ctx.div_ceil(BLOCK);
-    let backend: Box<dyn Backend> = if gpu {
-        gpu_backend(cfg.clone(), weights, blocks, a.ctx)?
-    } else {
-        Box::new(CpuBackend::new(cfg.clone(), weights, pool.clone(), blocks))
-    };
-    let engine: Box<dyn Engine> = Box::new(Session::new(backend));
-    eprintln!(
-        "loaded {} ({:.0}M params, {}, {:.0} MB) in {:.2}s on {}",
-        a.model
-            .file_name()
-            .map_or("model".into(), |n| n.to_string_lossy()),
-        cfg.params() as f64 / 1e6,
-        format.name(),
-        bytes as f64 / 1e6,
-        started.elapsed().as_secs_f64(),
-        engine.name()
-    );
+    let m = load_backend(a, dir, format, gpu, pool, a.ctx.div_ceil(BLOCK))?;
     Ok(Loaded {
-        engine,
-        tok,
-        cfg,
-        bytes,
+        engine: Box::new(Session::new(m.backend)),
+        tok: m.tok,
+        cfg: m.cfg,
+        bytes: m.bytes,
     })
 }
 
@@ -294,6 +357,7 @@ fn run(a: &Args) -> Result<()> {
         max_tokens: a.max_tokens,
         sampler: a.sampler.clone(),
         stop_tokens: stop_tokens(&m.cfg, &m.tok),
+        json: a.json,
     };
     if a.raw {
         print!("{prompt}");
@@ -319,6 +383,7 @@ fn chat(a: &Args) -> Result<()> {
         max_tokens: a.max_tokens,
         sampler: a.sampler.clone(),
         stop_tokens: stop_tokens(&m.cfg, &m.tok),
+        json: a.json,
     };
 
     // The conversation as tokens. Each turn appends to it, and generate()
@@ -528,6 +593,7 @@ fn speculate(a: &Args) -> Result<()> {
         max_tokens: a.max_tokens,
         sampler: SamplerConfig::greedy(),
         stop_tokens: stop.clone(),
+        json: false,
     };
 
     eprintln!("\n--- plain greedy decoding on {}", target.engine.name());
@@ -575,15 +641,261 @@ fn speculate(a: &Args) -> Result<()> {
 
 fn serve(a: &Args) -> Result<()> {
     let pool = Arc::new(Pool::new(a.threads));
-    let m = load(a, a.format, a.gpu, &pool)?;
+    let blocks = a.kv_tokens.max(a.ctx).div_ceil(BLOCK);
+    let m = load_backend(a, &a.model, a.format, a.gpu, &pool, blocks)?;
     let template = ChatTemplate::new(&m.tok)?;
     let stop = stop_tokens(&m.cfg, &m.tok);
-    let id = a
-        .model
-        .file_name()
-        .map_or("model".into(), |n| n.to_string_lossy().into_owned());
-    let mut server = tachyon::server::Server::new(m.engine, m.tok, template, stop, id);
-    server.defaults = a.sampler.clone();
-    server.max_tokens = a.max_tokens;
+    let backend = m.backend.name();
+    let tok = Arc::new(m.tok);
+    let scheduler = Scheduler::spawn(
+        m.backend,
+        tok.clone(),
+        SchedulerOptions {
+            max_seqs: a.max_seqs,
+            max_seq_len: a.ctx,
+        },
+    );
+    let server = Server {
+        scheduler,
+        tok,
+        template,
+        stop,
+        model_id: a
+            .model
+            .file_name()
+            .map_or("model".into(), |n| n.to_string_lossy().into_owned()),
+        backend,
+        params: m.cfg.params(),
+        context: a.ctx,
+        kv_tokens: blocks * BLOCK,
+        defaults: a.sampler.clone(),
+        max_tokens: a.max_tokens,
+    };
     tachyon::server::serve(server, &format!("{}:{}", a.host, a.port))
+}
+
+const LOAD_PROMPTS: [&str; 8] = [
+    "Explain how a hash map works.",
+    "Write a short poem about the ocean.",
+    "What are the main causes of inflation?",
+    "Describe the water cycle to a child.",
+    "Give three tips for writing clean code.",
+    "Summarize the plot of a heist movie you invent.",
+    "How does a CPU cache improve performance?",
+    "Write a polite email declining a meeting.",
+];
+
+struct Sample {
+    ttft: f64,
+    total: f64,
+    tokens: usize,
+    mean_batch: f64,
+}
+
+/// One streamed chat completion, timed from the client's side.
+fn one_request(addr: &str, prompt: &str, max_tokens: usize, seed: u64) -> Result<Sample> {
+    let body = obj([
+        (
+            "messages",
+            Json::Arr(vec![obj([
+                ("role", "user".into()),
+                ("content", prompt.into()),
+            ])]),
+        ),
+        ("max_tokens", max_tokens.into()),
+        ("stream", true.into()),
+        ("ignore_eos", true.into()),
+        ("seed", seed.into()),
+    ])
+    .to_string();
+    let started = Instant::now();
+    let mut conn =
+        TcpStream::connect(addr).map_err(|e| Error(format!("cannot connect to {addr}: {e}")))?;
+    write!(conn, "POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())?;
+    let mut lines = BufReader::new(conn).lines();
+    let status = lines.next().transpose()?.unwrap_or_default();
+    if !status.contains(" 200 ") {
+        let rest: Vec<String> = lines.map_while(|l| l.ok()).collect();
+        bail!("{status}: {}", rest.last().map_or("", String::as_str));
+    }
+    let (mut ttft, mut tokens, mut mean_batch) = (None, 0, 0.0);
+    for line in lines {
+        let line = line?;
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if data == "[DONE]" {
+            break;
+        }
+        let j = Json::parse(data)?;
+        if let Some(e) = j.get("error") {
+            bail!("server error: {e}");
+        }
+        let content = j
+            .get("choices")
+            .and_then(Json::as_array)
+            .and_then(|c| c.first()?.get("delta")?.get("content")?.as_str());
+        if content.is_some_and(|c| !c.is_empty()) {
+            ttft.get_or_insert(started.elapsed().as_secs_f64());
+        }
+        if let Some(n) = j
+            .get("usage")
+            .and_then(|u| u.get("completion_tokens"))
+            .and_then(Json::as_usize)
+        {
+            tokens = n;
+            mean_batch = j
+                .get("timings")
+                .and_then(|t| t.get("mean_batch"))
+                .and_then(Json::as_f64)
+                .unwrap_or(0.0);
+        }
+    }
+    let total = started.elapsed().as_secs_f64();
+    Ok(Sample {
+        ttft: ttft.unwrap_or(total),
+        total,
+        tokens,
+        mean_batch,
+    })
+}
+
+fn percentile(xs: &mut [f64], p: f64) -> f64 {
+    xs.sort_by(f64::total_cmp);
+    xs[((xs.len() - 1) as f64 * p).round() as usize]
+}
+
+/// Hammers a running server with concurrent streaming clients and reports
+/// total throughput, per-user speed and latency at each concurrency level.
+fn loadtest(a: &Args) -> Result<()> {
+    let addr = a
+        .url
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string();
+    let mut rows = Vec::new();
+    for &clients in &a.clients {
+        let per_client = a.requests.div_ceil(clients).max(1);
+        let started = Instant::now();
+        let results: Vec<Result<Sample>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..clients)
+                .map(|c| {
+                    let addr = &addr;
+                    s.spawn(move || {
+                        (0..per_client)
+                            .map(|r| {
+                                let i = c * per_client + r;
+                                one_request(
+                                    addr,
+                                    LOAD_PROMPTS[i % LOAD_PROMPTS.len()],
+                                    a.max_tokens,
+                                    a.sampler.seed.wrapping_add(i as u64),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        });
+        let wall = started.elapsed().as_secs_f64();
+        let samples = results.into_iter().collect::<Result<Vec<_>>>()?;
+        let tokens: usize = samples.iter().map(|s| s.tokens).sum();
+        let mut ttft: Vec<f64> = samples.iter().map(|s| s.ttft).collect();
+        let mut latency: Vec<f64> = samples.iter().map(|s| s.total).collect();
+        let mut speed: Vec<f64> = samples
+            .iter()
+            .map(|s| s.tokens.saturating_sub(1) as f64 / (s.total - s.ttft).max(1e-9))
+            .collect();
+        let batch = samples.iter().map(|s| s.mean_batch).sum::<f64>() / samples.len() as f64;
+        let row = (
+            clients,
+            samples.len(),
+            tokens as f64 / wall,
+            percentile(&mut speed, 0.5),
+            batch,
+            percentile(&mut ttft, 0.5),
+            percentile(&mut ttft, 0.99),
+            percentile(&mut latency, 0.5),
+            percentile(&mut latency, 0.99),
+        );
+        eprintln!(
+            "{clients} clients: {:.0} tok/s total, {:.1} tok/s each, TTFT p50 {:.2}s",
+            row.2, row.3, row.5
+        );
+        rows.push(row);
+    }
+    println!("\n| clients | requests | total throughput | per user | mean batch | TTFT p50 | TTFT p99 | latency p50 | latency p99 |");
+    println!("|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+    for (c, n, total, each, batch, t50, t99, l50, l99) in rows {
+        println!("| {c} | {n} | {total:.0} tok/s | {each:.1} tok/s | {batch:.1} | {t50:.2} s | {t99:.2} s | {l50:.1} s | {l99:.1} s |");
+    }
+    println!(
+        "\n{} tokens per request (ignore_eos), streamed",
+        a.max_tokens
+    );
+    Ok(())
+}
+
+/// Decode throughput of the engine alone as the batch grows: each step
+/// feeds one token to each of `b` sequences that already hold a prompt.
+fn bench_batch(a: &Args) -> Result<()> {
+    use tachyon::kv::{Batch, BlockPool, Logits};
+    const PROMPT: usize = 128;
+    const STEPS: usize = 16;
+    let sizes = [1, 4, 8, 16, 32, 64];
+    let pool = Arc::new(Pool::new(a.threads));
+    let mut rows = Vec::new();
+    for &gpu in &a.backends {
+        let blocks = (sizes[sizes.len() - 1] * (PROMPT + STEPS + 1)).div_ceil(BLOCK) + 64;
+        let mut m = load_backend(a, &a.model, a.format, gpu, &pool, blocks)?;
+        let prompt = eval_tokens(a, &m.tok, PROMPT)?;
+        let name = m.backend.name();
+        let budget = m.backend.max_batch();
+        for &b in &sizes {
+            let mut kv = BlockPool::new(blocks);
+            let mut seqs: Vec<_> = (0..b).map(|_| kv.start(&[])).collect();
+            let mut batch = Batch::default();
+            for seq in seqs.iter_mut() {
+                assert!(kv.reserve(seq, PROMPT + STEPS + 1));
+                for chunk in prompt.chunks(budget) {
+                    batch.clear();
+                    batch.push(&seq.blocks, seq.len, chunk, Logits::None);
+                    seq.len += chunk.len();
+                    m.backend.forward(&batch);
+                }
+            }
+            let mut best = f64::MAX;
+            for step in 0..STEPS {
+                batch.clear();
+                for seq in seqs.iter_mut() {
+                    batch.push(
+                        &seq.blocks,
+                        seq.len,
+                        &[prompt[step % prompt.len()]],
+                        Logits::Last,
+                    );
+                    seq.len += 1;
+                }
+                let t0 = Instant::now();
+                m.backend.forward(&batch);
+                best = best.min(t0.elapsed().as_secs_f64());
+            }
+            eprintln!(
+                "{name}: batch {b:>2}: {:.1} ms/step, {:.0} tok/s",
+                best * 1e3,
+                b as f64 / best
+            );
+            rows.push((name.clone(), b, best, b as f64 / best));
+        }
+    }
+    println!("\n| backend | batch | step | throughput |");
+    println!("|---|---:|---:|---:|");
+    for (name, b, step, tps) in rows {
+        println!("| {name} | {b} | {:.1} ms | {tps:.0} tok/s |", step * 1e3);
+    }
+    Ok(())
 }

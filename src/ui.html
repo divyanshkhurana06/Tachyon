@@ -117,7 +117,7 @@ async function ask(question) {
       const stats = document.createElement('div');
       stats.className = 'stats';
       stats.textContent = `${u.completion_tokens} tokens · ${t.decode_tokens_per_second.toFixed(1)} tok/s · ` +
-        `prompt ${u.prompt_tokens} tokens (${t.cached_tokens} cached) at ${t.prefill_tokens_per_second.toFixed(0)} tok/s`;
+        `first token in ${(t.time_to_first_token * 1000).toFixed(0)} ms · ${t.cached_tokens} of ${u.prompt_tokens} prompt tokens cached`;
       out.appendChild(stats);
     }
   } catch (e) {

@@ -51,6 +51,7 @@ pub struct Sampler {
     cfg: SamplerConfig,
     rng: u64,
     buf: Vec<f32>,
+    ranked: Vec<(f32, u32)>,
     idx: Vec<u32>,
     probs: Vec<f32>,
 }
@@ -62,6 +63,7 @@ impl Sampler {
             cfg,
             rng,
             buf: Vec::new(),
+            ranked: Vec::new(),
             idx: Vec::new(),
             probs: Vec::new(),
         }
@@ -75,60 +77,64 @@ impl Sampler {
         if self.cfg.temperature <= 0.0 && !penalize {
             return argmax(logits);
         }
+        self.pick(logits, recent, None)
+    }
 
-        self.buf.clear();
-        self.buf.extend_from_slice(logits);
-        if penalize {
-            let mut seen: Vec<u32> = recent.to_vec();
-            seen.sort_unstable();
-            seen.dedup();
-            let p = self.cfg.repetition_penalty;
-            for id in seen {
-                if let Some(l) = self.buf.get_mut(id as usize) {
-                    *l = if *l > 0.0 { *l / p } else { *l * p };
-                }
+    /// Like [`Sampler::sample`], but only tokens for which `allowed` holds
+    /// can be picked (constrained decoding).
+    pub fn sample_with(
+        &mut self,
+        logits: &[f32],
+        vocab: usize,
+        recent: &[u32],
+        allowed: &dyn Fn(u32) -> bool,
+    ) -> u32 {
+        let logits = &logits[..vocab.min(logits.len())];
+        self.pick(logits, recent, Some(allowed))
+    }
+
+    /// The probabilities the sampler would draw from, after every setting
+    /// is applied, as (token, probability) pairs summing to 1. Greedy
+    /// sampling gives the single best token probability 1.
+    pub fn distribution(
+        &mut self,
+        logits: &[f32],
+        vocab: usize,
+        recent: &[u32],
+    ) -> Vec<(u32, f32)> {
+        let logits = &logits[..vocab.min(logits.len())];
+        let keep = self.candidates(logits, recent, None);
+        let mass: f32 = self.probs[..keep].iter().sum();
+        self.idx[..keep]
+            .iter()
+            .zip(&self.probs)
+            .map(|(&t, &p)| (t, p / mass))
+            .collect()
+    }
+
+    /// Draws a token from the output of [`Sampler::distribution`] (or any
+    /// weights; they need not sum to 1).
+    pub fn draw(&mut self, weighted: &[(u32, f32)]) -> u32 {
+        let total: f32 = weighted.iter().map(|(_, p)| p).sum();
+        let mut r = self.next_f32() * total;
+        for &(t, p) in weighted {
+            r -= p;
+            if r <= 0.0 {
+                return t;
             }
         }
-        if self.cfg.temperature <= 0.0 {
-            return argmax(&self.buf);
-        }
+        weighted.last().map_or(0, |&(t, _)| t)
+    }
 
-        let n = self.buf.len();
-        let k = if self.cfg.top_k == 0 {
-            n
-        } else {
-            self.cfg.top_k.min(n)
-        };
-        let buf = &self.buf;
-        let by_logit = |a: &u32, b: &u32| buf[*b as usize].total_cmp(&buf[*a as usize]);
-        self.idx.clear();
-        self.idx.extend(0..n as u32);
-        if k < n {
-            self.idx.select_nth_unstable_by(k - 1, by_logit);
-            self.idx.truncate(k);
-        }
-        self.idx.sort_unstable_by(by_logit);
-
-        let max = buf[self.idx[0] as usize];
-        let t = self.cfg.temperature;
-        self.probs.clear();
-        self.probs.extend(
-            self.idx
-                .iter()
-                .map(|&i| ((buf[i as usize] - max) / t).exp()),
-        );
-        let total: f32 = self.probs.iter().sum();
-
-        let mut keep = self.probs.len();
-        if self.cfg.top_p < 1.0 {
-            let mut acc = 0.0;
-            for (j, p) in self.probs.iter().enumerate() {
-                acc += p / total;
-                if acc >= self.cfg.top_p {
-                    keep = j + 1;
-                    break;
-                }
-            }
+    fn pick(
+        &mut self,
+        logits: &[f32],
+        recent: &[u32],
+        allowed: Option<&dyn Fn(u32) -> bool>,
+    ) -> u32 {
+        let keep = self.candidates(logits, recent, allowed);
+        if keep == 0 {
+            return argmax(logits); // nothing allowed: cannot happen for JSON
         }
         let mass: f32 = self.probs[..keep].iter().sum();
         let mut r = self.next_f32() * mass;
@@ -141,6 +147,102 @@ impl Sampler {
         self.idx[keep - 1]
     }
 
+    /// Fills `idx` with candidate tokens, best first, and `probs` with
+    /// their unnormalized probabilities; returns how many survive top-p.
+    fn candidates(
+        &mut self,
+        logits: &[f32],
+        recent: &[u32],
+        allowed: Option<&dyn Fn(u32) -> bool>,
+    ) -> usize {
+        let greedy = self.cfg.temperature <= 0.0;
+        let t = if greedy { 1.0 } else { self.cfg.temperature };
+        self.buf.clear();
+        self.buf.extend_from_slice(logits);
+        if self.cfg.repetition_penalty != 1.0 && !recent.is_empty() {
+            let mut seen: Vec<u32> = recent.to_vec();
+            seen.sort_unstable();
+            seen.dedup();
+            let p = self.cfg.repetition_penalty;
+            for id in seen {
+                if let Some(l) = self.buf.get_mut(id as usize) {
+                    *l = if *l > 0.0 { *l / p } else { *l * p };
+                }
+            }
+        }
+        let n = self.buf.len();
+        let want = if greedy {
+            1
+        } else if self.cfg.top_k == 0 {
+            n
+        } else {
+            self.cfg.top_k.min(n)
+        };
+        // With a constraint, rank a wider window so some allowed token is
+        // likely to be in it.
+        let window = if allowed.is_some() {
+            want.max(256).min(n)
+        } else {
+            want
+        };
+
+        self.ranked.clear();
+        if window <= 1024 {
+            top_n(&self.buf, window, &mut self.ranked);
+        } else {
+            // No top-k: everything within 30 temperatures of the best (any
+            // other token has relative probability under e^-30), sorted.
+            let max = self.buf.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let cutoff = max - 30.0 * t;
+            self.ranked.extend(
+                self.buf
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &l)| l >= cutoff)
+                    .map(|(i, &l)| (l, i as u32)),
+            );
+            self.ranked.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+        }
+        if let Some(ok) = allowed {
+            self.ranked.retain(|&(_, id)| ok(id));
+            if self.ranked.is_empty() {
+                // Every likely token is ruled out: look at the whole vocabulary.
+                self.ranked.extend(
+                    self.buf
+                        .iter()
+                        .enumerate()
+                        .filter(|&(i, _)| ok(i as u32))
+                        .map(|(i, &l)| (l, i as u32)),
+                );
+                self.ranked.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+            }
+        }
+        self.ranked.truncate(want);
+        self.idx.clear();
+        self.idx.extend(self.ranked.iter().map(|&(_, id)| id));
+        if self.idx.is_empty() {
+            self.probs.clear();
+            return 0;
+        }
+
+        let best = self.ranked[0].0;
+        self.probs.clear();
+        self.probs
+            .extend(self.ranked.iter().map(|&(l, _)| ((l - best) / t).exp()));
+        if greedy || self.cfg.top_p >= 1.0 {
+            return self.probs.len();
+        }
+        let total: f32 = self.probs.iter().sum();
+        let mut acc = 0.0;
+        for (j, p) in self.probs.iter().enumerate() {
+            acc += p / total;
+            if acc >= self.cfg.top_p {
+                return j + 1;
+            }
+        }
+        self.probs.len()
+    }
+
     /// xorshift64*: fast, and plenty random for picking tokens.
     fn next_f32(&mut self) -> f32 {
         self.rng ^= self.rng >> 12;
@@ -148,6 +250,29 @@ impl Sampler {
         self.rng ^= self.rng >> 27;
         let x = self.rng.wrapping_mul(0x2545_F491_4F6C_DD1D);
         (x >> 40) as f32 / (1u64 << 24) as f32
+    }
+}
+
+/// The `n` largest values of `x` with their indices, largest first, in one
+/// pass: a value is only inserted if it beats the current n-th best, which
+/// after the first few thousand elements almost never happens.
+fn top_n(x: &[f32], n: usize, out: &mut Vec<(f32, u32)>) {
+    out.clear();
+    if n == 0 {
+        return;
+    }
+    let mut floor = f32::NEG_INFINITY;
+    for (i, &v) in x.iter().enumerate() {
+        if out.len() < n || v > floor {
+            let at = out.partition_point(|&(w, _)| w >= v);
+            if out.len() == n {
+                out.pop();
+            }
+            out.insert(at, (v, i as u32));
+            if out.len() == n {
+                floor = out[n - 1].0;
+            }
+        }
     }
 }
 
@@ -182,6 +307,39 @@ mod tests {
         for _ in 0..200 {
             assert!(matches!(s.sample(&logits, 4, &[]), 1 | 2));
         }
+    }
+
+    #[test]
+    fn constraint_and_distribution() {
+        let logits = [0.1, 3.0, 2.9, -1.0];
+        let mut s = Sampler::new(SamplerConfig::greedy());
+        assert_eq!(s.sample_with(&logits, 4, &[], &|t| t != 1), 2);
+        let mut s = Sampler::new(SamplerConfig {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+            seed: 1,
+        });
+        let d = s.distribution(&logits, 4, &[]);
+        assert_eq!(d[0].0, 1);
+        assert!((d.iter().map(|x| x.1).sum::<f32>() - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn top_n_matches_a_full_sort() {
+        let x: Vec<f32> = (0..5000u32)
+            .map(|i| ((i.wrapping_mul(2_654_435_761)) % 10007) as f32)
+            .collect();
+        let mut sorted: Vec<(f32, u32)> =
+            x.iter().enumerate().map(|(i, &v)| (v, i as u32)).collect();
+        sorted.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let mut out = Vec::new();
+        top_n(&x, 37, &mut out);
+        assert_eq!(
+            out.iter().map(|p| p.0).collect::<Vec<_>>(),
+            sorted[..37].iter().map(|p| p.0).collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -9,6 +9,7 @@ use std::fmt;
 
 pub mod chat;
 pub mod config;
+pub mod constrain;
 pub mod engine;
 pub mod generate;
 #[cfg(target_os = "macos")]
@@ -20,6 +21,7 @@ pub mod model;
 pub mod pool;
 pub mod safetensors;
 pub mod sampler;
+pub mod scheduler;
 pub mod server;
 pub mod speculative;
 pub mod tokenizer;

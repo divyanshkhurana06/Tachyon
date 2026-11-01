@@ -377,8 +377,8 @@ impl Backend for CpuBackend {
         zeroed(&mut s.cos, t * half);
         zeroed(&mut s.sin, t * half);
         for (i, &pos) in b.positions.iter().enumerate() {
-            for j in 0..half {
-                let angle = pos as f64 * freqs[j];
+            for (j, f) in freqs.iter().enumerate() {
+                let angle = pos as f64 * f;
                 s.cos[i * half + j] = angle.cos() as f32;
                 s.sin[i * half + j] = angle.sin() as f32;
             }
