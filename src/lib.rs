@@ -9,8 +9,10 @@ use std::fmt;
 
 pub mod json;
 pub mod kernels;
+pub mod pool;
 pub mod safetensors;
 pub mod tokenizer;
+pub mod weights;
 
 #[derive(Debug)]
 pub struct Error(pub String);
