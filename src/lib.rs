@@ -11,6 +11,8 @@ pub mod chat;
 pub mod config;
 pub mod engine;
 pub mod generate;
+#[cfg(target_os = "macos")]
+pub mod gpu;
 pub mod json;
 pub mod kernels;
 pub mod model;
