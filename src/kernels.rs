@@ -1,0 +1,364 @@
+//! Inner loops: a dot product for each weight format, quantizers, and the
+//! small element-wise ops around them. NEON intrinsics on aarch64 (every
+//! Apple Silicon Mac), plain Rust elsewhere.
+//!
+//! Quantized formats store weights in blocks of [`QK`] values sharing one f32
+//! scale. Activations are quantized to 8 bits on the fly so the inner loop is
+//! integer multiply-accumulate, then each block's sum is scaled once.
+
+/// Values per quantization block.
+pub const QK: usize = 32;
+
+#[inline]
+pub fn bf16_to_f32(b: u16) -> f32 {
+    f32::from_bits((b as u32) << 16)
+}
+
+/// Round to nearest, ties to even (what PyTorch does).
+pub fn f32_to_bf16(f: f32) -> u16 {
+    if f.is_nan() {
+        return 0x7FC0;
+    }
+    let bits = f.to_bits();
+    let round = 0x7FFF + ((bits >> 16) & 1);
+    (bits.wrapping_add(round) >> 16) as u16
+}
+
+pub fn f16_to_f32(h: u16) -> f32 {
+    let sign = ((h >> 15) as u32) << 31;
+    let exp = ((h >> 10) & 0x1F) as u32;
+    let frac = (h & 0x3FF) as u32;
+    let bits = match (exp, frac) {
+        (0, 0) => sign,
+        (0, mut f) => {
+            // subnormal: renormalize
+            let mut e = 127 - 15 + 1;
+            while f & 0x400 == 0 {
+                f <<= 1;
+                e -= 1;
+            }
+            sign | (e << 23) | ((f & 0x3FF) << 13)
+        }
+        (31, f) => sign | 0x7F80_0000 | (f << 13),
+        (e, f) => sign | ((e + 127 - 15) << 23) | (f << 13),
+    };
+    f32::from_bits(bits)
+}
+
+/// Symmetric 8-bit: each block stores `max|x| / 127` and values in -127..=127.
+pub fn quantize_q8(x: &[f32], scales: &mut [f32], qs: &mut [i8]) {
+    for ((block, q), scale) in x
+        .chunks_exact(QK)
+        .zip(qs.chunks_exact_mut(QK))
+        .zip(scales.iter_mut())
+    {
+        let amax = block.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let d = amax / 127.0;
+        let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+        for (qi, &v) in q.iter_mut().zip(block) {
+            *qi = (v * id).round() as i8;
+        }
+        *scale = d;
+    }
+}
+
+/// 4-bit, llama.cpp's Q4_0 layout: 16 bytes per block, value j in the low
+/// nibble of byte j and value j+16 in the high nibble, stored offset by 8.
+/// The scale maps the largest-magnitude value exactly to -8.
+pub fn quantize_q4(x: &[f32], scales: &mut [f32], qs: &mut [u8]) {
+    for ((block, q), scale) in x
+        .chunks_exact(QK)
+        .zip(qs.chunks_exact_mut(QK / 2))
+        .zip(scales.iter_mut())
+    {
+        let max = block
+            .iter()
+            .copied()
+            .fold(0f32, |m, v| if v.abs() > m.abs() { v } else { m });
+        let d = max / -8.0;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        let nibble = |v: f32| ((v * id + 8.5) as i32).clamp(0, 15) as u8;
+        for j in 0..QK / 2 {
+            q[j] = nibble(block[j]) | (nibble(block[j + QK / 2]) << 4);
+        }
+        *scale = d;
+    }
+}
+
+pub fn dequantize_q8(scales: &[f32], qs: &[i8], out: &mut [f32]) {
+    for ((o, q), &d) in out
+        .chunks_exact_mut(QK)
+        .zip(qs.chunks_exact(QK))
+        .zip(scales)
+    {
+        for (o, &q) in o.iter_mut().zip(q) {
+            *o = q as f32 * d;
+        }
+    }
+}
+
+pub fn dequantize_q4(scales: &[f32], qs: &[u8], out: &mut [f32]) {
+    for ((o, q), &d) in out
+        .chunks_exact_mut(QK)
+        .zip(qs.chunks_exact(QK / 2))
+        .zip(scales)
+    {
+        for j in 0..QK / 2 {
+            o[j] = ((q[j] & 0xF) as i32 - 8) as f32 * d;
+            o[j + QK / 2] = ((q[j] >> 4) as i32 - 8) as f32 * d;
+        }
+    }
+}
+
+pub fn rmsnorm(out: &mut [f32], x: &[f32], w: &[f32], eps: f32) {
+    let ss = dot_f32(x, x) / x.len() as f32;
+    let inv = 1.0 / (ss + eps).sqrt();
+    for ((o, &v), &g) in out.iter_mut().zip(x).zip(w) {
+        *o = v * inv * g;
+    }
+}
+
+#[inline]
+pub fn silu(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
+}
+
+/// out += a * x
+pub fn axpy(out: &mut [f32], a: f32, x: &[f32]) {
+    for (o, &v) in out.iter_mut().zip(x) {
+        *o += a * v;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub use neon::{dot_bf16, dot_f32, dot_q4, dot_q8};
+#[cfg(not(target_arch = "aarch64"))]
+pub use scalar::{dot_bf16, dot_f32, dot_q4, dot_q8};
+
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    use super::QK;
+    use std::arch::aarch64::*;
+
+    pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+        let n = a.len().min(b.len());
+        let (pa, pb) = (a.as_ptr(), b.as_ptr());
+        let mut i = 0;
+        let mut sum = unsafe {
+            let mut acc = [vdupq_n_f32(0.0); 4];
+            while i + 16 <= n {
+                for (k, acc) in acc.iter_mut().enumerate() {
+                    *acc = vfmaq_f32(
+                        *acc,
+                        vld1q_f32(pa.add(i + 4 * k)),
+                        vld1q_f32(pb.add(i + 4 * k)),
+                    );
+                }
+                i += 16;
+            }
+            vaddvq_f32(vaddq_f32(
+                vaddq_f32(acc[0], acc[1]),
+                vaddq_f32(acc[2], acc[3]),
+            ))
+        };
+        while i < n {
+            sum += a[i] * b[i];
+            i += 1;
+        }
+        sum
+    }
+
+    /// bf16 is the top half of an f32, so widening is a zip with zeros.
+    pub fn dot_bf16(w: &[u16], x: &[f32]) -> f32 {
+        let n = w.len().min(x.len());
+        let (pw, px) = (w.as_ptr(), x.as_ptr());
+        let mut i = 0;
+        let mut sum = unsafe {
+            let zero = vdupq_n_u16(0);
+            let mut acc = [vdupq_n_f32(0.0); 4];
+            while i + 16 <= n {
+                let w0 = vld1q_u16(pw.add(i));
+                let w1 = vld1q_u16(pw.add(i + 8));
+                let f = [
+                    vreinterpretq_f32_u16(vzip1q_u16(zero, w0)),
+                    vreinterpretq_f32_u16(vzip2q_u16(zero, w0)),
+                    vreinterpretq_f32_u16(vzip1q_u16(zero, w1)),
+                    vreinterpretq_f32_u16(vzip2q_u16(zero, w1)),
+                ];
+                for k in 0..4 {
+                    acc[k] = vfmaq_f32(acc[k], f[k], vld1q_f32(px.add(i + 4 * k)));
+                }
+                i += 16;
+            }
+            vaddvq_f32(vaddq_f32(
+                vaddq_f32(acc[0], acc[1]),
+                vaddq_f32(acc[2], acc[3]),
+            ))
+        };
+        while i < n {
+            sum += super::bf16_to_f32(w[i]) * x[i];
+            i += 1;
+        }
+        sum
+    }
+
+    /// Sum of one block's 32 int8 products, as four i32 lanes.
+    #[inline(always)]
+    unsafe fn block_dot(w0: int8x16_t, w1: int8x16_t, x0: int8x16_t, x1: int8x16_t) -> int32x4_t {
+        let mut s = vpaddlq_s16(vmull_s8(vget_low_s8(w0), vget_low_s8(x0)));
+        s = vpadalq_s16(s, vmull_high_s8(w0, x0));
+        s = vpadalq_s16(s, vmull_s8(vget_low_s8(w1), vget_low_s8(x1)));
+        vpadalq_s16(s, vmull_high_s8(w1, x1))
+    }
+
+    pub fn dot_q8(ws: &[f32], wq: &[i8], xs: &[f32], xq: &[i8]) -> f32 {
+        let nb = ws.len();
+        assert!(wq.len() >= nb * QK && xq.len() >= nb * QK && xs.len() >= nb);
+        unsafe {
+            let mut acc = vdupq_n_f32(0.0);
+            for b in 0..nb {
+                let (pw, px) = (wq.as_ptr().add(b * QK), xq.as_ptr().add(b * QK));
+                let s = block_dot(
+                    vld1q_s8(pw),
+                    vld1q_s8(pw.add(16)),
+                    vld1q_s8(px),
+                    vld1q_s8(px.add(16)),
+                );
+                let d = *ws.get_unchecked(b) * *xs.get_unchecked(b);
+                acc = vfmaq_f32(acc, vcvtq_f32_s32(s), vdupq_n_f32(d));
+            }
+            vaddvq_f32(acc)
+        }
+    }
+
+    pub fn dot_q4(ws: &[f32], wq: &[u8], xs: &[f32], xq: &[i8]) -> f32 {
+        let nb = ws.len();
+        assert!(wq.len() >= nb * QK / 2 && xq.len() >= nb * QK && xs.len() >= nb);
+        unsafe {
+            let mask = vdupq_n_u8(0x0F);
+            let eight = vdupq_n_s8(8);
+            let mut acc = vdupq_n_f32(0.0);
+            for b in 0..nb {
+                let raw = vld1q_u8(wq.as_ptr().add(b * QK / 2));
+                let w0 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(raw, mask)), eight);
+                let w1 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(raw)), eight);
+                let px = xq.as_ptr().add(b * QK);
+                let s = block_dot(w0, w1, vld1q_s8(px), vld1q_s8(px.add(16)));
+                let d = *ws.get_unchecked(b) * *xs.get_unchecked(b);
+                acc = vfmaq_f32(acc, vcvtq_f32_s32(s), vdupq_n_f32(d));
+            }
+            vaddvq_f32(acc)
+        }
+    }
+}
+
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+mod scalar {
+    use super::{bf16_to_f32, QK};
+
+    pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b).map(|(x, y)| x * y).sum()
+    }
+
+    pub fn dot_bf16(w: &[u16], x: &[f32]) -> f32 {
+        w.iter().zip(x).map(|(&w, &x)| bf16_to_f32(w) * x).sum()
+    }
+
+    pub fn dot_q8(ws: &[f32], wq: &[i8], xs: &[f32], xq: &[i8]) -> f32 {
+        (0..ws.len())
+            .map(|b| {
+                let s: i32 = (0..QK)
+                    .map(|j| wq[b * QK + j] as i32 * xq[b * QK + j] as i32)
+                    .sum();
+                s as f32 * ws[b] * xs[b]
+            })
+            .sum()
+    }
+
+    pub fn dot_q4(ws: &[f32], wq: &[u8], xs: &[f32], xq: &[i8]) -> f32 {
+        (0..ws.len())
+            .map(|b| {
+                let mut s = 0i32;
+                for j in 0..QK / 2 {
+                    let byte = wq[b * QK / 2 + j];
+                    s += ((byte & 0xF) as i32 - 8) * xq[b * QK + j] as i32;
+                    s += ((byte >> 4) as i32 - 8) * xq[b * QK + j + QK / 2] as i32;
+                }
+                s as f32 * ws[b] * xs[b]
+            })
+            .sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn data(n: usize, seed: u32) -> Vec<f32> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (s >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    #[test]
+    fn simd_matches_scalar() {
+        let (a, b) = (data(896, 1), data(896, 2));
+        let exact: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
+        assert!((dot_f32(&a, &b) - exact).abs() < 1e-3);
+
+        let wb: Vec<u16> = a.iter().map(|&v| f32_to_bf16(v)).collect();
+        assert!((dot_bf16(&wb, &b) - scalar::dot_bf16(&wb, &b)).abs() < 1e-3);
+
+        let nb = a.len() / QK;
+        let (mut ws, mut wq, mut xs, mut xq) = (
+            vec![0.0; nb],
+            vec![0i8; a.len()],
+            vec![0.0; nb],
+            vec![0i8; a.len()],
+        );
+        quantize_q8(&a, &mut ws, &mut wq);
+        quantize_q8(&b, &mut xs, &mut xq);
+        let q8 = dot_q8(&ws, &wq, &xs, &xq);
+        assert!((q8 - scalar::dot_q8(&ws, &wq, &xs, &xq)).abs() < 1e-3);
+        assert!(
+            (q8 - exact).abs() < 0.05 * exact.abs().max(1.0),
+            "q8 {q8} vs {exact}"
+        );
+
+        let mut w4 = vec![0u8; a.len() / 2];
+        quantize_q4(&a, &mut ws, &mut w4);
+        let q4 = dot_q4(&ws, &w4, &xs, &xq);
+        assert!((q4 - scalar::dot_q4(&ws, &w4, &xs, &xq)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn quantizers_round_trip() {
+        let x = data(256, 7);
+        let mut s = vec![0.0; 8];
+        let (mut q8, mut q4, mut out) = (vec![0i8; 256], vec![0u8; 128], vec![0.0; 256]);
+        quantize_q8(&x, &mut s, &mut q8);
+        dequantize_q8(&s, &q8, &mut out);
+        assert!(x
+            .iter()
+            .zip(&out)
+            .all(|(a, b)| (a - b).abs() <= 1.0 / 127.0));
+        quantize_q4(&x, &mut s, &mut q4);
+        dequantize_q4(&s, &q4, &mut out);
+        assert!(x
+            .iter()
+            .zip(&out)
+            .all(|(a, b)| (a - b).abs() <= 1.0 / 8.0 + 1e-6));
+    }
+
+    #[test]
+    fn half_floats() {
+        assert_eq!(bf16_to_f32(f32_to_bf16(1.5)), 1.5);
+        assert_eq!(f16_to_f32(0x3C00), 1.0);
+        assert_eq!(f16_to_f32(0xC000), -2.0);
+        assert_eq!(f16_to_f32(0x0001), 2f32.powi(-24));
+    }
+}

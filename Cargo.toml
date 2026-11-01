@@ -1,0 +1,15 @@
+[package]
+name = "tachyon"
+version = "0.1.0"
+edition = "2021"
+description = "An LLM inference engine written from scratch in Rust, with hand-written NEON and Metal kernels"
+license = "MIT"
+
+# No dependencies on purpose: the tokenizer, JSON parser, weight loader,
+# thread pool, SIMD kernels, GPU shaders and HTTP server are all in src/.
+[dependencies]
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+debug = "line-tables-only" # readable flamegraphs
