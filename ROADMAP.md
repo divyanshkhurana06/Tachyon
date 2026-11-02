@@ -38,20 +38,25 @@ finished; every one should end with a number in the README.
 - [x] **Tool calling**: OpenAI `tools` / `tool_choice` / `tool_calls`, with schema-constrained forced calls
 - [x] **Logprobs** and `top_logprobs`, streamed or not
 
+### v0.4: measured against llama.cpp
+
+- [x] Head-to-head with llama.cpp on the same Mac: decode on par (GPU and CPU), GPU prefill ~64%
+- [x] Attention with 1,024 threads per head: +26% decode at 2k context
+- [x] 32-token GEMM tiles and 128-token prefill chunks: +15-18% prefill
+- [x] f16 KV cache by default on the GPU
+- Tried and rejected after A/B measurement: RMSNorm/SiLU kernel fusion (no gain), grouped-query flash-decoding attention (slower with 2 KV heads), 64-token half-precision tiles (no clear win)
+
 ## Next
 
-### GPU: fewer, fatter kernels
+### Close the prefill gap
 
-Single-sequence decode moves ~65 GB/s of the M3's ~100.
+GPU prefill is ~64% of llama.cpp's, CPU prefill ~20%.
 
-- **Kernel fusion.** Fold RMSNorm into the following matmul (each simdgroup
-  can recompute the norm of a 1k-float vector for free) and SiLU·up into the
-  down projection: nine dispatches per layer become six.
-- **Flash-decoding attention.** Split long contexts across threadgroups and
-  merge partial softmaxes, so a 4k-token context isn't one threadgroup per head.
-- **Bigger GEMM tiles** for batches over 32, where throughput currently flattens.
+- **GPU:** half-precision `simdgroup_matrix` tiles with a register layout that doesn't spill (the first 64-token attempt did), and double-buffered tile loads.
+- **CPU:** an optional Accelerate (AMX) path for batched matmuls, kept behind a feature flag so the default build stays dependency-free.
+- **Long context:** a flash-attention kernel on the matrix units, so 8k+ contexts don't fall off.
 
-*Done when:* 8-bit single-sequence decode beats 150 tok/s on an M3.
+*Done when:* GPU prefill is within 80% of llama.cpp.
 
 ### Better 4-bit
 

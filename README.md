@@ -65,6 +65,20 @@ The **importance matrix** (`tachyon calibrate`, then `--imatrix`) runs calibrati
 
 Qwen3-0.6B on the GPU: 55 tok/s in bf16, 86 tok/s in 8-bit.
 
+### Against llama.cpp
+
+Same model (Qwen2.5-0.5B-Instruct, 8-bit: Tachyon's `q8` against Qwen's official Q8_0 GGUF), same MacBook Air M3, llama.cpp build b12040 with its Metal backend, runs alternated between the two engines. llama.cpp numbers are from `llama-bench`; decode is measured after the given amount of context (`-d`, and `tachyon bench --context`).
+
+| | llama.cpp | Tachyon | Tachyon vs llama.cpp |
+|---|---:|---:|---:|
+| GPU decode, 256-token context | 127 tok/s | 131 tok/s | **on par** |
+| GPU decode, 2,048-token context | 119 tok/s | 108 tok/s | 91% |
+| GPU prefill, 256 tokens | 2,770–3,040 tok/s | 1,845 tok/s | ~64% |
+| CPU decode, 6 threads | 93–108 tok/s | 99–116 tok/s | **on par** |
+| CPU prefill | 945–1,054 tok/s | 160–264 tok/s | ~20% |
+
+Decoding, where a chat reply spends its time, is on par. Prefill is the gap: llama.cpp's GPU matrix multiply uses larger half-precision tiles, and its CPU prefill goes through Apple's Accelerate framework to the AMX matrix units, while Tachyon's CPU path is plain NEON with no dependencies.
+
 ### Speculative decoding: up to 2.2x faster
 
 A drafter guesses several tokens; the big model checks them all in one batched pass and keeps the ones it agrees with. Greedy runs produce output **token-for-token identical** to plain decoding; sampled runs keep the target's exact output distribution (the rejection-sampling rule, checked by a statistical test). On the GPU:
@@ -127,6 +141,9 @@ Property tests check the matchers against the JSON parser on tens of thousands o
 - **Quantization by measurement.** Keeping each matrix type at 8 bits in turn showed q/k/v buys 0.6 perplexity for 3% more memory and the down projection 0.5 for 14%; `q4` and `q4m` are built from that. Fitting 4-bit scales by least squares lowered weight error but made perplexity *worse*: what matters is error times the input it meets. Weighting the fit by measured activations (the importance matrix) is what finally helped.
 - **Constrained decoding is a matcher plus a sampler filter.** JSON mode, JSON Schema and forced tool calls are all the same mechanism: a byte-level automaton that says whether a token's bytes can come next, and a sampler that ranks the likely tokens first and asks about those, so the check costs a few hundred probes per token, not 150,000.
 - **The thread pool.** With one spinning worker per core, any background process preempts one and every matmul waits for it. Leaving two efficiency cores free doubled CPU decode speed.
+- **Measure under identical conditions, or not at all.** GPU speed on a laptop moves with power source, Low Power Mode and background load (one run measured 105 tok/s, the same code later 131). Every optimization here was decided by building both versions and alternating them in the same session. That process kept two changes and rejected two:
+  - kept: **1,024 threads per attention head** (+26% decode at 2,048 tokens of context) and **32-token GEMM tiles fed 128-token prefill chunks** (+15-18% prefill), plus an **f16 KV cache** by default (lossless here, and llama.cpp's default too);
+  - rejected: **fusing RMSNorm and SiLU into the matmuls** (no faster: launches inside one command buffer are cheap) and **grouped-query flash-decoding attention** (reads each key once instead of 7 times, but with only 2 KV heads it left most of the GPU idle, and the extra combine pass cost more than the reads it saved).
 
 ### How it's verified
 
@@ -162,6 +179,7 @@ cargo build --release
 ./target/release/tachyon serve --gpu --kv-f16             # many users; chat page at http://localhost:8080
 ./target/release/tachyon loadtest --clients 1,16,32       # against a running server
 ./target/release/tachyon bench                            # speed and perplexity per format
+./target/release/tachyon bench --context 2048             # decode speed at a long context
 ./target/release/tachyon bench-batch                      # throughput vs batch size
 ./target/release/tachyon speculate --gpu --lookup --prompt "Add type hints to this code: ..."
 ./target/release/tachyon calibrate && ./target/release/tachyon run --quant q4 \
@@ -206,7 +224,7 @@ Run `tachyon help` for every option.
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md): GPU kernel fusion and flash-decoding attention, k-quants, MoE models, CUDA and WebGPU backends.
+See [ROADMAP.md](ROADMAP.md): closing the prefill gap with llama.cpp, k-quants, MoE models, CUDA and WebGPU backends.
 
 ## License
 
