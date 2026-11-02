@@ -17,6 +17,12 @@ use crate::{Error, Result};
 pub const DEFAULT_SYSTEM: &str =
     "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.";
 
+/// The system prompt a model's own chat template adds when none is given:
+/// Qwen2.5's names itself; Qwen3's adds none.
+pub fn default_system(model_type: &str) -> Option<&'static str> {
+    (model_type == "qwen2").then_some(DEFAULT_SYSTEM)
+}
+
 #[derive(Debug, Clone)]
 pub struct Message {
     pub role: String,
@@ -78,6 +84,14 @@ impl ChatTemplate {
     pub fn open_assistant(&self, tok: &Tokenizer, out: &mut Vec<u32>) {
         out.push(self.im_start);
         out.extend(tok.encode("assistant\n", false));
+    }
+
+    /// Qwen3 thinks aloud in `<think>...</think>` before answering. Its
+    /// template turns that off by starting the reply with an empty block.
+    pub fn skip_thinking(&self, tok: &Tokenizer, out: &mut Vec<u32>) {
+        if tok.added_token("<think>").is_some() {
+            out.extend(tok.encode("<think>\n\n</think>\n\n", true));
+        }
     }
 
     pub fn close_turn(&self, out: &mut Vec<u32>) {

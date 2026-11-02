@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-use tachyon::chat::{ChatTemplate, Message, DEFAULT_SYSTEM};
+use tachyon::chat::{default_system, ChatTemplate, Message};
 use tachyon::config::Config;
 use tachyon::engine::{Backend, Engine, Session};
 use tachyon::generate::{generate, GenOptions, GenStats, PREFILL_CHUNK};
@@ -64,6 +64,7 @@ options:
   --max-seqs N       most requests `serve` runs at once (default 16)
   --json             constrain the reply to a JSON object
   --kv-f16           store the GPU KV cache as f16 (half the memory)
+  --no-think         Qwen3: answer directly, without a <think> block
   --url URL          server for `loadtest` (default http://127.0.0.1:8080)
   --clients LIST     concurrency levels for `loadtest` (default 1,4,16)
   --requests N       requests per level for `loadtest` (default 32)";
@@ -97,6 +98,7 @@ struct Args {
     lookup: bool,
     temp_set: bool,
     kv_f16: bool,
+    no_think: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -135,6 +137,7 @@ fn parse_args() -> Result<Args> {
         lookup: false,
         temp_set: false,
         kv_f16: false,
+        no_think: false,
     };
     while let Some(flag) = it.next() {
         let mut value = || {
@@ -162,6 +165,7 @@ fn parse_args() -> Result<Args> {
             }
             "--lookup" => a.lookup = true,
             "--kv-f16" => a.kv_f16 = true,
+            "--no-think" => a.no_think = true,
             "--top-k" => a.sampler.top_k = num(&flag, value()?)?,
             "--top-p" => a.sampler.top_p = num(&flag, value()?)?,
             "--repeat-penalty" => a.sampler.repetition_penalty = num(&flag, value()?)?,
@@ -362,12 +366,7 @@ fn run(a: &Args) -> Result<()> {
     let tokens = if a.raw {
         m.tok.encode(prompt, false)
     } else {
-        let tpl = ChatTemplate::new(&m.tok)?;
-        tpl.encode(
-            &m.tok,
-            &[Message::new("user", prompt)],
-            Some(a.system.as_deref().unwrap_or(DEFAULT_SYSTEM)),
-        )
+        chat_prompt(a, &m.tok, &m.cfg, prompt)?
     };
     let opts = GenOptions {
         max_tokens: a.max_tokens,
@@ -404,13 +403,11 @@ fn chat(a: &Args) -> Result<()> {
 
     // The conversation as tokens. Each turn appends to it, and generate()
     // finds everything but the new user message already in the KV cache.
+    let system = a.system.as_deref().or(default_system(&m.cfg.model_type));
     let mut convo = Vec::new();
-    tpl.push(
-        &m.tok,
-        &mut convo,
-        "system",
-        a.system.as_deref().unwrap_or(DEFAULT_SYSTEM),
-    );
+    if let Some(system) = system {
+        tpl.push(&m.tok, &mut convo, "system", system);
+    }
     let mut cache = Vec::new();
     eprintln!("chat with the model; /reset clears the conversation, Ctrl-D quits\n");
 
@@ -427,18 +424,18 @@ fn chat(a: &Args) -> Result<()> {
         }
         if line == "/reset" {
             convo.truncate(0);
-            tpl.push(
-                &m.tok,
-                &mut convo,
-                "system",
-                a.system.as_deref().unwrap_or(DEFAULT_SYSTEM),
-            );
+            if let Some(system) = system {
+                tpl.push(&m.tok, &mut convo, "system", system);
+            }
             eprintln!("(conversation cleared)");
             continue;
         }
         let mut prompt = convo.clone();
         tpl.push(&m.tok, &mut prompt, "user", line);
         tpl.open_assistant(&m.tok, &mut prompt);
+        if a.no_think {
+            tpl.skip_thinking(&m.tok, &mut prompt);
+        }
         if prompt.len() + a.max_tokens > m.engine.max_seq() {
             eprintln!("(context window full; use /reset)");
             continue;
@@ -583,13 +580,17 @@ fn bench(a: &Args) -> Result<()> {
     Ok(())
 }
 
-fn chat_prompt(a: &Args, tok: &Tokenizer, prompt: &str) -> Result<Vec<u32>> {
+fn chat_prompt(a: &Args, tok: &Tokenizer, cfg: &Config, prompt: &str) -> Result<Vec<u32>> {
     if a.raw {
         return Ok(tok.encode(prompt, false));
     }
     let tpl = ChatTemplate::new(tok)?;
-    let system = a.system.as_deref().unwrap_or(DEFAULT_SYSTEM);
-    Ok(tpl.encode(tok, &[Message::new("user", prompt)], Some(system)))
+    let system = a.system.as_deref().or(default_system(&cfg.model_type));
+    let mut tokens = tpl.encode(tok, &[Message::new("user", prompt)], system);
+    if a.no_think {
+        tpl.skip_thinking(tok, &mut tokens);
+    }
+    Ok(tokens)
 }
 
 /// Runs the same greedy generation plainly and speculatively, checks the
@@ -602,7 +603,7 @@ fn speculate(a: &Args) -> Result<()> {
         .ok_or_else(|| Error::msg("speculate needs --prompt"))?;
     let pool = Arc::new(Pool::new(a.threads));
     let mut target = load(a, a.format, a.gpu, &pool)?;
-    let tokens = chat_prompt(a, &target.tok, prompt)?;
+    let tokens = chat_prompt(a, &target.tok, &target.cfg, prompt)?;
     let stop = stop_tokens(&target.cfg, &target.tok);
     // Greedy unless a temperature was asked for: then the outputs can be
     // compared token for token.
@@ -718,6 +719,10 @@ fn serve(a: &Args) -> Result<()> {
         backend,
         params: m.cfg.params(),
         context: a.ctx,
+        system: a
+            .system
+            .clone()
+            .or(default_system(&m.cfg.model_type).map(str::to_string)),
         kv_tokens: blocks * BLOCK,
         defaults: a.sampler.clone(),
         max_tokens: a.max_tokens,

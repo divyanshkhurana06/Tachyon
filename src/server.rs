@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::chat::{ChatTemplate, Message, DEFAULT_SYSTEM};
+use crate::chat::{ChatTemplate, Message};
 use crate::constrain::JsonObject;
 use crate::generate::Finish;
 use crate::json::{obj, Json};
@@ -43,6 +43,8 @@ pub struct Server {
     pub backend: String,
     pub params: usize,
     pub context: usize,
+    /// Added when a request has no system message.
+    pub system: Option<String>,
     pub kv_tokens: usize,
     pub defaults: SamplerConfig,
     pub max_tokens: usize,
@@ -236,6 +238,9 @@ struct ChatRequest {
     stop: Vec<String>,
     json: bool,
     ignore_eos: bool,
+    /// Qwen3's `enable_thinking` (top level, or in `chat_template_kwargs`
+    /// as vLLM takes it).
+    thinking: bool,
 }
 
 fn parse_chat(body: &[u8], defaults: &SamplerConfig) -> std::result::Result<ChatRequest, String> {
@@ -317,6 +322,13 @@ fn parse_chat(body: &[u8], defaults: &SamplerConfig) -> std::result::Result<Chat
         stop: stop.into_iter().filter(|s| !s.is_empty()).collect(),
         json,
         ignore_eos: j.get("ignore_eos").and_then(Json::as_bool).unwrap_or(false),
+        thinking: j
+            .get("enable_thinking")
+            .or(j
+                .get("chat_template_kwargs")
+                .and_then(|k| k.get("enable_thinking")))
+            .and_then(Json::as_bool)
+            .unwrap_or(true),
     })
 }
 
@@ -371,9 +383,12 @@ fn chat_completion(conn: &mut TcpStream, server: &Server, body: &[u8]) -> io::Re
         Ok(r) => r,
         Err(e) => return error(conn, "400 Bad Request", &e),
     };
-    let prompt = server
+    let mut prompt = server
         .template
-        .encode(&server.tok, &req.messages, Some(DEFAULT_SYSTEM));
+        .encode(&server.tok, &req.messages, server.system.as_deref());
+    if !req.thinking {
+        server.template.skip_thinking(&server.tok, &mut prompt);
+    }
     let room = server.context.saturating_sub(prompt.len());
     if room == 0 {
         let msg = format!(

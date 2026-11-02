@@ -355,3 +355,37 @@ fn json_mode_always_parses() {
         assert!(text.trim_start().starts_with('{'), "{text}");
     }
 }
+
+/// Qwen3 adds per-head q/k RMSNorm; check it on both backends.
+/// Needs models/qwen3-0.6b; skipped without it.
+#[test]
+fn qwen3_runs_and_backends_agree() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("models/qwen3-0.6b");
+    if !dir.join("model.safetensors").exists() {
+        return eprintln!("skipping: {} not found", dir.display());
+    }
+    let tok = Tokenizer::load(&dir.join("tokenizer.json")).unwrap();
+    let tpl = ChatTemplate::new(&tok).unwrap();
+    let mut p = tpl.encode(
+        &tok,
+        &[Message::new(
+            "user",
+            "What is the capital of France? Answer briefly.",
+        )],
+        None,
+    );
+    tpl.skip_thinking(&tok, &mut p);
+
+    let (text, on_cpu) = greedy_tokens(cpu(&dir, Format::Bf16).as_mut(), &tok, &p, 20);
+    assert!(text.contains("Paris"), "{text}");
+    #[cfg(target_os = "macos")]
+    {
+        let cfg = Config::load(&dir).unwrap();
+        let w = Weights::load(&dir, &cfg, Format::Bf16).unwrap();
+        if let Ok(g) = tachyon::gpu::GpuBackend::new(cfg, w, 64, 1024, false) {
+            let (_, on_gpu) = greedy_tokens(&mut Session::new(Box::new(g)), &tok, &p, 20);
+            assert_eq!(on_gpu, on_cpu);
+        }
+    }
+}
