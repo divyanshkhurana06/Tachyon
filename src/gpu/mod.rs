@@ -22,6 +22,12 @@ const SOURCE: &str = include_str!("kernels.metal");
 const MAT_SIMDS: usize = 2;
 const ROWS_PER_GROUP: usize = MAT_SIMDS * 4;
 const ATT_THREADS: u32 = 1024;
+/// Queries per `attention_prefill` threadgroup (FA_Q), and the shortest run
+/// of a sequence's consecutive tokens worth giving to that kernel: shorter
+/// runs, like decode steps and speculative checks, are faster with a full
+/// threadgroup per query.
+const FLASH_TOKENS: usize = 32;
+const FLASH_MIN_RUN: usize = 16;
 /// Output tile of the `gemm_*` kernels, and the batch size from which they
 /// beat the matrix-vector kernels.
 const GEMM_TOKENS: usize = 32;
@@ -46,10 +52,11 @@ enum Kernel {
     HeadNorm,
     RopeStore,
     Attention,
+    AttentionPrefill,
     SiluMul,
 }
 
-const KERNELS: [&str; 11] = [
+const KERNELS: [&str; 12] = [
     "matmul_bf16",
     "matmul_q8",
     "matmul_q4",
@@ -60,6 +67,7 @@ const KERNELS: [&str; 11] = [
     "head_norm",
     "rope_store",
     "attention",
+    "attention_prefill",
     "silu_mul",
 ];
 
@@ -288,6 +296,9 @@ struct Activations {
     table_of: Buffer,
     tables: Buffer,
     rows: Buffer,
+    /// Tokens for `attention`, and (first, count) tiles for `attention_prefill`.
+    att_tokens: Buffer,
+    att_tiles: Buffer,
     k_cache: Buffer,
     v_cache: Buffer,
 }
@@ -413,6 +424,8 @@ impl GpuBackend {
             table_of: Buffer::new(&ctx, b * 4)?,
             tables: Buffer::new(&ctx, b * (max_seq.div_ceil(BLOCK) + 1) * 4)?,
             rows: Buffer::new(&ctx, b * 4)?,
+            att_tokens: Buffer::new(&ctx, b * 4)?,
+            att_tiles: Buffer::new(&ctx, b * 2 * 4)?,
             k_cache: Buffer::new(&ctx, cache)?,
             v_cache: Buffer::new(&ctx, cache)?,
         };
@@ -610,6 +623,11 @@ impl Backend for GpuBackend {
             a.tables.write_u32(&batch.tables);
             a.rows.write_u32(&batch.logit_rows);
         }
+        let (singles, tiles) = attention_split(batch);
+        unsafe {
+            a.att_tokens.write_u32(&singles);
+            a.att_tiles.write_u32(&tiles);
+        }
 
         let rope = RopeParams {
             head_dim: hd as u32,
@@ -669,22 +687,43 @@ impl Backend for GpuBackend {
                 [1, c.heads + c.kv_heads, t],
                 [half, 1, 1],
             );
-            self.dispatch(
-                Kernel::Attention,
-                &[
-                    (&a.qkv, 0),
-                    (&a.k_cache, cache_off),
-                    (&a.v_cache, cache_off),
-                    (&a.scores, 0),
-                    (&a.att, 0),
-                    (&a.positions, 0),
-                    (&a.table_of, 0),
-                    (&a.tables, 0),
-                ],
-                &attn,
-                [c.heads, t, 1],
-                [ATT_THREADS as usize, 1, 1],
-            );
+            if !singles.is_empty() {
+                self.dispatch(
+                    Kernel::Attention,
+                    &[
+                        (&a.qkv, 0),
+                        (&a.k_cache, cache_off),
+                        (&a.v_cache, cache_off),
+                        (&a.scores, 0),
+                        (&a.att, 0),
+                        (&a.positions, 0),
+                        (&a.table_of, 0),
+                        (&a.tables, 0),
+                        (&a.att_tokens, 0),
+                    ],
+                    &attn,
+                    [c.heads, singles.len(), 1],
+                    [ATT_THREADS as usize, 1, 1],
+                );
+            }
+            if !tiles.is_empty() {
+                self.dispatch(
+                    Kernel::AttentionPrefill,
+                    &[
+                        (&a.qkv, 0),
+                        (&a.k_cache, cache_off),
+                        (&a.v_cache, cache_off),
+                        (&a.att, 0),
+                        (&a.positions, 0),
+                        (&a.table_of, 0),
+                        (&a.tables, 0),
+                        (&a.att_tiles, 0),
+                    ],
+                    &attn,
+                    [c.heads, tiles.len() / 2, 1],
+                    [FLASH_TOKENS * 4, 1, 1],
+                );
+            }
             self.matmul(&layer.wo, &a.att, &a.x, t, None, true);
             self.rmsnorm(&a.x, &layer.mlp_norm, &a.xb, t, false);
             self.matmul(&layer.w_gate_up, &a.xb, &a.gate_up, t, None, false);
@@ -709,4 +748,32 @@ impl Backend for GpuBackend {
         }
         unsafe { self.act.logits.floats(n * self.lm_head.rows) }
     }
+}
+
+/// Splits a batch for the two attention kernels: runs of at least
+/// FLASH_MIN_RUN consecutive tokens of one sequence become (first, count)
+/// tiles of up to FLASH_TOKENS for `attention_prefill`; every other token
+/// is listed for `attention`.
+fn attention_split(batch: &Batch) -> (Vec<u32>, Vec<u32>) {
+    let (mut singles, mut tiles) = (Vec::new(), Vec::new());
+    let t = batch.len();
+    let mut i = 0;
+    while i < t {
+        let mut j = i + 1;
+        while j < t
+            && batch.table_of[j] == batch.table_of[i]
+            && batch.positions[j] == batch.positions[j - 1] + 1
+        {
+            j += 1;
+        }
+        if j - i >= FLASH_MIN_RUN {
+            for first in (i..j).step_by(FLASH_TOKENS) {
+                tiles.extend([first as u32, (j - first).min(FLASH_TOKENS) as u32]);
+            }
+        } else {
+            singles.extend(i as u32..j as u32);
+        }
+        i = j;
+    }
+    (singles, tiles)
 }
