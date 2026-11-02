@@ -1,0 +1,50 @@
+The lighthouse keeper had not spoken to another person in eleven days. Each morning she climbed the iron stairs, wiped the salt from the great lens, and wrote the weather in a leather book: wind from the north-west, visibility good, sea moderate. On the twelfth morning a small boat appeared on the horizon, rowing steadily toward the rocks, and she put the kettle on for the first time in a long while for someone other than herself.
+
+How does a refrigerator keep food cold? It does not make cold; it moves heat. A liquid called a refrigerant is pumped through a loop of pipes. Inside the fridge, the refrigerant evaporates at low pressure, and evaporating takes heat from its surroundings, so the air inside cools down. A compressor then squeezes the vapour, which makes it hot, and pushes it through coils on the back of the fridge, where it gives that heat to the kitchen and turns back into a liquid. The cycle repeats for as long as the motor runs.
+
+def word_counts(text):
+    """Count how often each word appears, ignoring case and punctuation."""
+    counts = {}
+    for raw in text.split():
+        word = raw.strip(".,!?;:\"'()").lower()
+        if word:
+            counts[word] = counts.get(word, 0) + 1
+    return sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+
+if __name__ == "__main__":
+    print(word_counts("The cat sat on the mat. The mat was flat.")[:3])
+
+fn fibonacci(n: u64) -> u64 {
+    let (mut a, mut b) = (0, 1);
+    for _ in 0..n {
+        (a, b) = (b, a + b);
+    }
+    a
+}
+
+Simple tomato soup, serves four:
+1. Soften one chopped onion and two cloves of garlic in olive oil for five minutes.
+2. Add a kilogram of ripe tomatoes, roughly chopped, and half a litre of stock.
+3. Simmer for twenty minutes, then blend until smooth.
+4. Season with salt, pepper and a pinch of sugar; finish with fresh basil.
+
+"Are you sure this is the right train?" asked Maya, looking at the departure board.
+"Platform four, the 9:15 to Edinburgh," said her brother. "It says so right there."
+"It also says it's delayed by forty minutes."
+"Then we have time for coffee. Problem solved."
+
+Some facts worth knowing: water boils at 100 degrees Celsius at sea level but at a lower temperature on a mountain, because the air pressure is lower. Light from the Sun takes about eight minutes to reach the Earth. The human heart beats roughly one hundred thousand times a day. Honey that is sealed properly can last for decades without spoiling, because it holds so little water that bacteria cannot grow in it.
+
+In economics, opportunity cost is the value of the best alternative you give up when you make a choice. If you spend an evening studying instead of working a paid shift, the opportunity cost of studying includes the wages you did not earn. The idea is simple, but it explains a great deal: why prices change, why people specialise, and why free things are rarely free.
+
+SELECT customer_id, COUNT(*) AS orders, SUM(total) AS spent
+FROM orders
+WHERE created_at >= '2024-01-01'
+GROUP BY customer_id
+HAVING COUNT(*) > 3
+ORDER BY spent DESC
+LIMIT 10;
+
+Dear team, thank you all for your hard work this quarter. We shipped the new search feature two weeks early, cut page load times by a third, and closed more support tickets than in any quarter before. Next month we will focus on reliability: fewer pages at night, better alerts, and a clear plan for every incident. Please add your ideas to the shared document before Friday.
+
+The old library smelled of dust and cedar. Rows of shelves rose into the dark, and somewhere above, a clock ticked with the patience of something that had never once been in a hurry. Tom ran his finger along the spines until he found the book his grandmother had described: green cloth, no title, a small brass clasp. It was exactly where she had said it would be.
