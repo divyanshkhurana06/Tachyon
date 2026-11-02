@@ -56,6 +56,7 @@ options:
   --ctx N            context window in tokens (default 4096)
   --file PATH        text for `ppl` / `bench` (default bench/eval.txt)
   --formats LIST     formats for `bench` (default bf16,q8,q4m,q4)
+  --context N        `bench` decodes after N tokens of context (default 256)
   --backends LIST    backends for `bench` (default cpu,gpu)
   --draft F          speculative decoding with a draft model in format F
   --draft-model DIR  draft model folder (default: the same model)
@@ -105,6 +106,7 @@ struct Args {
     lookup: bool,
     temp_set: bool,
     kv_f16: bool,
+    context: Option<usize>,
     no_think: bool,
     imatrix: Option<PathBuf>,
     out: Option<PathBuf>,
@@ -148,6 +150,7 @@ fn parse_args() -> Result<Args> {
         lookup: false,
         temp_set: false,
         kv_f16: false,
+        context: None,
         no_think: false,
         imatrix: None,
         out: None,
@@ -179,6 +182,7 @@ fn parse_args() -> Result<Args> {
             }
             "--lookup" => a.lookup = true,
             "--kv-f16" => a.kv_f16 = true,
+            "--context" => a.context = Some(num(&flag, value()?)?),
             "--no-think" => a.no_think = true,
             "--imatrix" => a.imatrix = Some(value()?.into()),
             "--out" => a.out = Some(value()?.into()),
@@ -537,7 +541,9 @@ fn perplexity_cmd(a: &Args) -> Result<()> {
 /// For each format: load time, weight size, prefill and decode speed, and
 /// perplexity, as a Markdown table.
 fn bench(a: &Args) -> Result<()> {
-    const PREFILL: usize = 256;
+    // Decode is measured after `--context` tokens (default 256): attention
+    // reads every cached position, so long contexts are slower.
+    let prefill_len = a.context.unwrap_or(256);
     const DECODE: usize = 128;
     const RUNS: usize = 3;
     let pool = Arc::new(Pool::new(a.threads));
@@ -549,6 +555,14 @@ fn bench(a: &Args) -> Result<()> {
             let load_secs = started.elapsed().as_secs_f64();
             let bytes = m.bytes;
             let tokens = eval_tokens(a, &m.tok, 1024)?;
+            // The eval text, repeated as needed to fill the context.
+            let context: Vec<u32> = tokens.iter().copied().cycle().take(prefill_len).collect();
+            if prefill_len + DECODE > m.engine.max_seq() {
+                bail!(
+                    "--context {prefill_len} plus {DECODE} decoded tokens exceeds --ctx {}",
+                    m.engine.max_seq()
+                );
+            }
             let e = m.engine.as_mut();
 
             // warm-up, so page faults and cold caches don't count
@@ -562,10 +576,10 @@ fn bench(a: &Args) -> Result<()> {
                 e.truncate(0);
                 let t0 = Instant::now();
                 let mut next = 0;
-                for chunk in tokens[..PREFILL].chunks(PREFILL_CHUNK) {
+                for chunk in context[..prefill_len].chunks(PREFILL_CHUNK) {
                     next = argmax(e.forward(chunk, false));
                 }
-                prefill = prefill.max(PREFILL as f64 / t0.elapsed().as_secs_f64());
+                prefill = prefill.max(prefill_len as f64 / t0.elapsed().as_secs_f64());
 
                 let t0 = Instant::now();
                 for _ in 0..DECODE {
@@ -597,7 +611,7 @@ fn bench(a: &Args) -> Result<()> {
     }
     if let Some(r) = rows.first() {
         println!(
-            "\nprefill {PREFILL} tokens, decode {DECODE} tokens (best of {RUNS} runs), perplexity over {} tokens of {}",
+            "\nprefill {prefill_len} tokens, decode {DECODE} tokens (best of {RUNS} runs), perplexity over {} tokens of {}",
             r.6,
             a.file.display()
         );

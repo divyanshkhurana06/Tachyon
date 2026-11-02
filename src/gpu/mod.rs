@@ -21,7 +21,7 @@ const SOURCE: &str = include_str!("kernels.metal");
 /// Must match `SIMDS`, `R` and `ATT_THREADS` in kernels.metal.
 const MAT_SIMDS: usize = 2;
 const ROWS_PER_GROUP: usize = MAT_SIMDS * 4;
-const ATT_THREADS: u32 = 256;
+const ATT_THREADS: u32 = 1024;
 /// Output tile of the `gemm_*` kernels, and the batch size from which they
 /// beat the matrix-vector kernels.
 const GEMM_TOKENS: usize = 16;

@@ -397,7 +397,7 @@ struct AttnParams {
     float scale;
 };
 
-constant uint ATT_THREADS = 256;
+constant uint ATT_THREADS = 1024;
 constant uint ATT_SIMDS = ATT_THREADS / 32;
 
 inline ulong cache_slot(device const uint *table, uint s) {
