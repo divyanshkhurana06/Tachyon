@@ -46,17 +46,32 @@ finished; every one should end with a number in the README.
 - [x] f16 KV cache by default on the GPU
 - Tried and rejected after A/B measurement: RMSNorm/SiLU kernel fusion (no gain), grouped-query flash-decoding attention (slower with 2 KV heads), 64-token half-precision tiles (no clear win)
 
+### v0.5: closing the prefill gap, and Llama
+
+- [x] **FlashAttention-style prefill kernel** on the matrix units: +30% prefill at 256 tokens, 2x at 2,048
+- [x] **Half-precision GEMM weight tiles**, with the output tile reusing their memory: +11-14% prefill
+- [x] GPU prefill on par with llama.cpp at 256 tokens (was 64%)
+- [x] **SDOT** inline assembly and four tokens per weight load on the CPU: 1.7x prefill (42% of llama.cpp, was 20%), 2.7x throughput at batch 4
+- [x] Decode attention reads four value dims per thread: +11% decode at 2k context
+- [x] **Llama 3.2**: Llama 3 RoPE scaling, `ignore_merges` tokenization, Llama 3 chat format; GPU and CPU agree token for token
+- Tried and rejected: 64-token tiles and half-precision activations again (no gain), attention threadgroups sized to the context (slower on long prompts), 256-token prefill chunks, splitting keys across lanes in decode attention
+
 ## Next
 
-### Close the prefill gap
+### Long context
 
-GPU prefill is ~64% of llama.cpp's, CPU prefill ~20%.
+At 2,048 tokens, prefill is 65% of llama.cpp's and decode 87%.
 
-- **GPU:** half-precision `simdgroup_matrix` tiles with a register layout that doesn't spill (the first 64-token attempt did), and double-buffered tile loads.
-- **CPU:** an optional Accelerate (AMX) path for batched matmuls, kept behind a feature flag so the default build stays dependency-free.
-- **Long context:** a flash-attention kernel on the matrix units, so 8k+ contexts don't fall off.
+- **Prefill:** share each key/value tile across a KV head's query heads (7 of them in Qwen2.5-0.5B), and split long caches across threadgroups.
+- **Decode:** keep scores in threadgroup memory for contexts that fit, instead of a device-memory round trip.
 
-*Done when:* GPU prefill is within 80% of llama.cpp.
+*Done when:* both are within 90% of llama.cpp at 2k and 8k tokens.
+
+### CPU prefill
+
+At 42% of llama.cpp. The M3 has ARM's I8MM extension: `smmla` multiplies a 2x8 by an 8x2 int8 matrix per instruction, twice SDOT's work, for two tokens and two rows at once.
+
+*Done when:* CPU prefill is within 70% of llama.cpp without adding dependencies.
 
 ### Better 4-bit
 
@@ -76,7 +91,7 @@ worse; with the importance matrix, `q4` is 8.5% behind bf16 (it was 11%).
 
 ### Models
 
-- **Llama 3.x:** `rope_scaling` type `llama3` (needs gated model access to test).
+- **Llama 3 tool calling** (its JSON tool format, next to Qwen's `<tool_call>`), and SmolLM2 (a GPT-2 style pre-tokenizer).
 - **Mixture of experts** (Qwen-MoE / Mixtral): a router and top-k expert matmuls.
 
 ### Other platforms

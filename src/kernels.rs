@@ -201,14 +201,137 @@ pub fn axpy(out: &mut [f32], a: f32, x: &[f32]) {
 }
 
 #[cfg(target_arch = "aarch64")]
-pub use neon::{dot_bf16, dot_f32, dot_q4, dot_q8};
+pub use neon::{dot_bf16, dot_f32, dot_q4, dot_q4_x4, dot_q8, dot_q8_x4};
 #[cfg(not(target_arch = "aarch64"))]
-pub use scalar::{dot_bf16, dot_f32, dot_q4, dot_q8};
+pub use scalar::{dot_bf16, dot_f32, dot_q4, dot_q4_x4, dot_q8, dot_q8_x4};
 
 #[cfg(target_arch = "aarch64")]
 mod neon {
     use super::QK;
     use std::arch::aarch64::*;
+
+    /// Whether this CPU has SDOT (ARMv8.4 dot product; every Apple Silicon
+    /// chip does). Checked once.
+    fn dotprod() -> bool {
+        use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+        static HAS: AtomicU8 = AtomicU8::new(0);
+        match HAS.load(Relaxed) {
+            1 => false,
+            2 => true,
+            _ => {
+                let has = std::arch::is_aarch64_feature_detected!("dotprod");
+                HAS.store(if has { 2 } else { 1 }, Relaxed);
+                has
+            }
+        }
+    }
+
+    /// `acc += dot(a, b)` four bytes at a time: 16 int8 multiply-adds into
+    /// four int32 lanes in one instruction, where plain NEON needs a widening
+    /// multiply and a pairwise add per 8. Rust's intrinsic for it isn't
+    /// stable yet, so it is a line of inline assembly.
+    #[inline]
+    #[target_feature(enable = "dotprod")]
+    unsafe fn sdot(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
+        let mut acc = acc;
+        std::arch::asm!(
+            "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
+            acc = inout(vreg) acc,
+            a = in(vreg) a,
+            b = in(vreg) b,
+            options(pure, nomem, nostack, preserves_flags)
+        );
+        acc
+    }
+
+    /// The 32 weights of a 4-bit block as two vectors of signed bytes.
+    #[inline(always)]
+    unsafe fn unpack_q4(p: *const u8) -> (int8x16_t, int8x16_t) {
+        let raw = vld1q_u8(p);
+        let eight = vdupq_n_s8(8);
+        (
+            vsubq_s8(vreinterpretq_s8_u8(vandq_u8(raw, vdupq_n_u8(0x0F))), eight),
+            vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(raw)), eight),
+        )
+    }
+
+    /// One weight row against `N` tokens' activations: each weight block is
+    /// loaded (and for 4-bit, unpacked) once and used for every token, which
+    /// is what makes batched prefill faster than N separate dots.
+    #[target_feature(enable = "dotprod")]
+    unsafe fn dot_rows_sdot<const N: usize, const Q4: bool>(
+        ws: &[f32],
+        wq: *const u8,
+        xs: [&[f32]; N],
+        xq: [&[i8]; N],
+    ) -> [f32; N] {
+        let nb = ws.len();
+        for j in 0..N {
+            assert!(xq[j].len() >= nb * QK && xs[j].len() >= nb);
+        }
+        let mut acc = [vdupq_n_f32(0.0); N];
+        for b in 0..nb {
+            let (w0, w1) = if Q4 {
+                unpack_q4(wq.add(b * QK / 2))
+            } else {
+                let p = wq.add(b * QK) as *const i8;
+                (vld1q_s8(p), vld1q_s8(p.add(16)))
+            };
+            let wd = *ws.get_unchecked(b);
+            for j in 0..N {
+                let px = xq[j].as_ptr().add(b * QK);
+                let s = sdot(
+                    sdot(vdupq_n_s32(0), w0, vld1q_s8(px)),
+                    w1,
+                    vld1q_s8(px.add(16)),
+                );
+                acc[j] = vfmaq_f32(
+                    acc[j],
+                    vcvtq_f32_s32(s),
+                    vdupq_n_f32(wd * *xs[j].get_unchecked(b)),
+                );
+            }
+        }
+        acc.map(|a| vaddvq_f32(a))
+    }
+
+    pub fn dot_q8(ws: &[f32], wq: &[i8], xs: &[f32], xq: &[i8]) -> f32 {
+        if dotprod() {
+            assert!(wq.len() >= ws.len() * QK);
+            unsafe { dot_rows_sdot::<1, false>(ws, wq.as_ptr() as *const u8, [xs], [xq])[0] }
+        } else {
+            dot_q8_neon(ws, wq, xs, xq)
+        }
+    }
+
+    pub fn dot_q4(ws: &[f32], wq: &[u8], xs: &[f32], xq: &[i8]) -> f32 {
+        if dotprod() {
+            assert!(wq.len() >= ws.len() * QK / 2);
+            unsafe { dot_rows_sdot::<1, true>(ws, wq.as_ptr(), [xs], [xq])[0] }
+        } else {
+            dot_q4_neon(ws, wq, xs, xq)
+        }
+    }
+
+    /// Four tokens against one 8-bit weight row.
+    pub fn dot_q8_x4(ws: &[f32], wq: &[i8], xs: [&[f32]; 4], xq: [&[i8]; 4]) -> [f32; 4] {
+        if dotprod() {
+            assert!(wq.len() >= ws.len() * QK);
+            unsafe { dot_rows_sdot::<4, false>(ws, wq.as_ptr() as *const u8, xs, xq) }
+        } else {
+            [0, 1, 2, 3].map(|j| dot_q8_neon(ws, wq, xs[j], xq[j]))
+        }
+    }
+
+    /// Four tokens against one 4-bit weight row.
+    pub fn dot_q4_x4(ws: &[f32], wq: &[u8], xs: [&[f32]; 4], xq: [&[i8]; 4]) -> [f32; 4] {
+        if dotprod() {
+            assert!(wq.len() >= ws.len() * QK / 2);
+            unsafe { dot_rows_sdot::<4, true>(ws, wq.as_ptr(), xs, xq) }
+        } else {
+            [0, 1, 2, 3].map(|j| dot_q4_neon(ws, wq, xs[j], xq[j]))
+        }
+    }
 
     pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
         let n = a.len().min(b.len());
@@ -281,7 +404,7 @@ mod neon {
         vpadalq_s16(s, vmull_high_s8(w1, x1))
     }
 
-    pub fn dot_q8(ws: &[f32], wq: &[i8], xs: &[f32], xq: &[i8]) -> f32 {
+    fn dot_q8_neon(ws: &[f32], wq: &[i8], xs: &[f32], xq: &[i8]) -> f32 {
         let nb = ws.len();
         assert!(wq.len() >= nb * QK && xq.len() >= nb * QK && xs.len() >= nb);
         unsafe {
@@ -301,7 +424,7 @@ mod neon {
         }
     }
 
-    pub fn dot_q4(ws: &[f32], wq: &[u8], xs: &[f32], xq: &[i8]) -> f32 {
+    fn dot_q4_neon(ws: &[f32], wq: &[u8], xs: &[f32], xq: &[i8]) -> f32 {
         let nb = ws.len();
         assert!(wq.len() >= nb * QK / 2 && xq.len() >= nb * QK && xs.len() >= nb);
         unsafe {
@@ -358,6 +481,14 @@ mod scalar {
             })
             .sum()
     }
+
+    pub fn dot_q8_x4(ws: &[f32], wq: &[i8], xs: [&[f32]; 4], xq: [&[i8]; 4]) -> [f32; 4] {
+        [0, 1, 2, 3].map(|j| dot_q8(ws, wq, xs[j], xq[j]))
+    }
+
+    pub fn dot_q4_x4(ws: &[f32], wq: &[u8], xs: [&[f32]; 4], xq: [&[i8]; 4]) -> [f32; 4] {
+        [0, 1, 2, 3].map(|j| dot_q4(ws, wq, xs[j], xq[j]))
+    }
 }
 
 #[cfg(test)]
@@ -403,6 +534,35 @@ mod tests {
         quantize_q4(&a, &mut ws, &mut w4);
         let q4 = dot_q4(&ws, &w4, &xs, &xq);
         assert!((q4 - scalar::dot_q4(&ws, &w4, &xs, &xq)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn four_token_dots_match_single_dots() {
+        let cols = 896;
+        let nb = cols / QK;
+        let w = data(cols, 21);
+        let (mut ws, mut wq8, mut wq4) = (vec![0.0; nb], vec![0i8; cols], vec![0u8; cols / 2]);
+        quantize_q8(&w, &mut ws, &mut wq8);
+        let mut ws4 = vec![0.0; nb];
+        quantize_q4(&w, &mut ws4, &mut wq4);
+        let xs_all: Vec<(Vec<f32>, Vec<i8>)> = (0..4)
+            .map(|j| {
+                let x = data(cols, 30 + j);
+                let (mut s, mut q) = (vec![0.0; nb], vec![0i8; cols]);
+                quantize_q8(&x, &mut s, &mut q);
+                (s, q)
+            })
+            .collect();
+        let xs: [&[f32]; 4] = [0, 1, 2, 3].map(|j| xs_all[j].0.as_slice());
+        let xq: [&[i8]; 4] = [0, 1, 2, 3].map(|j| xs_all[j].1.as_slice());
+        let q8 = dot_q8_x4(&ws, &wq8, xs, xq);
+        let q4 = dot_q4_x4(&ws4, &wq4, xs, xq);
+        for j in 0..4 {
+            assert_eq!(q8[j], dot_q8(&ws, &wq8, xs[j], xq[j]));
+            assert_eq!(q4[j], dot_q4(&ws4, &wq4, xs[j], xq[j]));
+            assert!((q8[j] - scalar::dot_q8(&ws, &wq8, xs[j], xq[j])).abs() < 1e-3);
+            assert!((q4[j] - scalar::dot_q4(&ws4, &wq4, xs[j], xq[j])).abs() < 1e-3);
+        }
     }
 
     #[test]

@@ -571,6 +571,18 @@ fn chat_completion(conn: &mut TcpStream, server: &Server, body: &[u8]) -> io::Re
         Ok(r) => r,
         Err(e) => return error(conn, "400 Bad Request", &e),
     };
+    let uses_tools = !req.tools.is_empty()
+        || req
+            .messages
+            .iter()
+            .any(|m| m.role == "tool" || !m.tool_calls.is_empty());
+    if uses_tools && !server.template.supports_tools() {
+        return error(
+            conn,
+            "400 Bad Request",
+            "tool calling needs a model with ChatML tool calls (Qwen)",
+        );
+    }
     let shown: &[Json] = if req.tool_choice == ToolChoice::None {
         &[]
     } else {

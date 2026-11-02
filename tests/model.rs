@@ -218,6 +218,52 @@ fn gpu_matches_cpu() {
     assert_eq!(on_gpu, on_cpu);
 }
 
+/// The prefill attention kernel (a run of tokens at once, through a
+/// scrambled block table) against the per-token kernel, over many cache
+/// blocks and query tiles.
+#[cfg(target_os = "macos")]
+#[test]
+fn gpu_prefill_attention_matches_token_by_token() {
+    use tachyon::engine::Backend;
+    use tachyon::kv::{Batch, Logits};
+    let Some((_g, dir)) = setup() else { return };
+    let tok = Tokenizer::load(&dir.join("tokenizer.json")).unwrap();
+    let cfg = Config::load(&dir).unwrap();
+    let load = || {
+        let w = Weights::load(&dir, &cfg, Format::Q8).unwrap();
+        tachyon::gpu::GpuBackend::new(cfg.clone(), w, 64, 1024, true)
+    };
+    let mut whole = match load() {
+        Ok(g) => g,
+        Err(e) => return eprintln!("skipping: {e}"),
+    };
+    let mut alone = Session::new(Box::new(load().unwrap()));
+    let text =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("bench/eval.txt"))
+            .unwrap();
+    let ids = &tok.encode(&text, false)[..200];
+
+    let table: Vec<u32> = (0..64).rev().collect();
+    let mut batch = Batch::default();
+    batch.push(&table, 0, ids, Logits::Last);
+    let at_once = whole.forward(&batch)[..cfg.vocab].to_vec();
+    let mut step = Vec::new();
+    for &id in ids {
+        step = alone.forward(&[id], false)[..cfg.vocab].to_vec();
+    }
+    let diff = at_once
+        .iter()
+        .zip(&step)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    eprintln!("largest logit difference {diff}");
+    assert_eq!(
+        tachyon::sampler::argmax(&at_once),
+        tachyon::sampler::argmax(&step)
+    );
+    assert!(diff < 0.05, "logits differ by {diff}");
+}
+
 /// Greedy tokens with no stop token, through the single-sequence API.
 fn greedy_raw(e: &mut dyn Engine, prompt: &[u32], n: usize) -> Vec<u32> {
     let vocab = e.config().vocab;
