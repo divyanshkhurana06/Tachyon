@@ -11,7 +11,7 @@ use std::mem::size_of;
 
 use crate::config::Config;
 use crate::engine::Backend;
-use crate::kv::{Batch, BLOCK};
+use crate::kv::{Batch, Logits, BLOCK};
 use crate::model::{rope_frequencies, Weights};
 use crate::weights::Matrix;
 use crate::{Error, Result};
@@ -421,7 +421,7 @@ impl GpuBackend {
             w.format.name().to_string()
         };
         let Weights { embed, .. } = w; // everything else now lives on the GPU
-        Ok(GpuBackend {
+        let mut gpu = GpuBackend {
             freqs: rope_frequencies(&cfg),
             cfg,
             device,
@@ -435,7 +435,27 @@ impl GpuBackend {
             blocks,
             max_seq,
             ctx,
-        })
+        };
+        gpu.self_test()?;
+        Ok(gpu)
+    }
+
+    /// Runs one token through the model and checks the logits look like
+    /// logits. Some virtual Macs (CI runners) expose a Metal device that
+    /// accepts work but returns zeros; better to refuse than to generate
+    /// garbage. The cache slot it writes is overwritten before any real
+    /// sequence reads it.
+    fn self_test(&mut self) -> Result<()> {
+        let mut batch = Batch::default();
+        batch.push(&[0], 0, &[0], Logits::Last);
+        let logits = self.forward(&batch);
+        if logits.iter().all(|&v| v == 0.0) || logits.iter().any(|v| !v.is_finite()) {
+            return Err(Error(format!(
+                "the Metal device ({}) returned no usable output; virtual GPUs are not supported",
+                self.device
+            )));
+        }
+        Ok(())
     }
 
     fn dispatch<P>(
