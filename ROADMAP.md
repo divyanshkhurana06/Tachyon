@@ -56,22 +56,27 @@ finished; every one should end with a number in the README.
 - [x] **Llama 3.2**: Llama 3 RoPE scaling, `ignore_merges` tokenization, Llama 3 chat format; GPU and CPU agree token for token
 - Tried and rejected: 64-token tiles and half-precision activations again (no gain), attention threadgroups sized to the context (slower on long prompts), 256-token prefill chunks, splitting keys across lanes in decode attention
 
+### v0.6: I8MM, and agents on Llama
+
+- [x] **I8MM** (`smmla`) CPU matmuls: two weight rows by two tokens per instruction, eight tokens per weight load. CPU prefill +45% (about 65% of llama.cpp, from 42%), batch throughput +40-60% from 8 sequences up
+- [x] **Batch-invariant CPU results**: every int8 path does the same arithmetic in the same order, so batching never changes a sequence's logits (checked bit for bit)
+- [x] **Llama 3 tool calling** in its own format, with forced calls schema-constrained; indented JSON matching Python's `json.dumps`
+- Tried and rejected: split-context decode attention with threadgroup-memory scores, unrolled value loads (no faster); 16- and 64-query prefill attention tiles (slower)
+
 ## Next
 
 ### Long context
 
-At 2,048 tokens, prefill is 65% of llama.cpp's and decode 87%.
+At 2,048 tokens, prefill is 65% of llama.cpp's and decode 87%. Attention is a third of prefill time there and an eighth of decode. Splitting a head's context across threadgroups, scores in threadgroup memory, and smaller or larger query tiles were all measured and didn't help, so the next attempts are structural:
 
-- **Prefill:** share each key/value tile across a KV head's query heads (7 of them in Qwen2.5-0.5B), and split long caches across threadgroups.
-- **Decode:** keep scores in threadgroup memory for contexts that fit, instead of a device-memory round trip.
+- **Decode:** a single-pass kernel with an online softmax per simdgroup (no scores pass, no barriers until the merge), reading keys a cache block at a time.
+- **Prefill:** double-buffered key/value tiles, so loading the next tile overlaps the matrix multiplies on this one.
 
 *Done when:* both are within 90% of llama.cpp at 2k and 8k tokens.
 
 ### CPU prefill
 
-At 42% of llama.cpp. The M3 has ARM's I8MM extension: `smmla` multiplies a 2x8 by an 8x2 int8 matrix per instruction, twice SDOT's work, for two tokens and two rows at once.
-
-*Done when:* CPU prefill is within 70% of llama.cpp without adding dependencies.
+About 65% of llama.cpp. Next: repack weights at load into the interleaved layout `smmla` reads, so the per-block shuffles go away, and fuse activation quantization into the previous op.
 
 ### Better 4-bit
 
@@ -91,7 +96,7 @@ worse; with the importance matrix, `q4` is 8.5% behind bf16 (it was 11%).
 
 ### Models
 
-- **Llama 3 tool calling** (its JSON tool format, next to Qwen's `<tool_call>`), and SmolLM2 (a GPT-2 style pre-tokenizer).
+- SmolLM2 (a GPT-2 style pre-tokenizer).
 - **Mixture of experts** (Qwen-MoE / Mixtral): a router and top-k expert matmuls.
 
 ### Other platforms
