@@ -38,7 +38,7 @@ commands:
 
 options:
   --model DIR        model folder (default models/qwen2.5-0.5b-instruct)
-  --quant F          bf16 | q8 | q4 (default q8)
+  --quant F          bf16 | q8 | q4m | q4 (default q8)
   --prompt TEXT      prompt for `run`
   --system TEXT      system prompt
   --raw              no chat template: continue --prompt as plain text
@@ -52,7 +52,7 @@ options:
   --threads N        CPU threads (default: performance cores + half the rest)
   --ctx N            context window in tokens (default 4096)
   --file PATH        text for `ppl` / `bench` (default bench/eval.txt)
-  --formats LIST     formats for `bench` (default bf16,q8,q4)
+  --formats LIST     formats for `bench` (default bf16,q8,q4m,q4)
   --backends LIST    backends for `bench` (default cpu,gpu)
   --draft F          speculative decoding with a draft model in format F
   --draft-model DIR  draft model folder (default: the same model)
@@ -112,7 +112,7 @@ fn parse_args() -> Result<Args> {
         threads: Pool::default_threads(),
         ctx: 4096,
         file: PathBuf::from("bench/eval.txt"),
-        formats: vec![Format::Bf16, Format::Q8, Format::Q4],
+        formats: vec![Format::Bf16, Format::Q8, Format::Q4M, Format::Q4],
         gpu: false,
         backends: if cfg!(target_os = "macos") {
             vec![false, true]
@@ -143,7 +143,8 @@ fn parse_args() -> Result<Args> {
                 .map_err(|_| Error(format!("{flag}: invalid number {v:?}")))
         }
         let format = |v: &str| {
-            Format::parse(v).ok_or_else(|| Error(format!("unknown format {v:?} (bf16, q8, q4)")))
+            Format::parse(v)
+                .ok_or_else(|| Error(format!("unknown format {v:?} (bf16, q8, q4m, q4)")))
         };
         match flag.as_str() {
             "--model" | "-m" => a.model = value()?.into(),

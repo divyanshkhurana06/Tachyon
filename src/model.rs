@@ -51,11 +51,7 @@ impl Weights {
         // The output layer is the most sensitive matrix to quantize, so
         // 4-bit models keep it (and the embedding it may share) at 8 bits,
         // as llama.cpp does.
-        let outer = if format == Format::Q4 {
-            Format::Q8
-        } else {
-            format
-        };
+        let outer = format.for_matrix("output");
 
         // The embedding (the single biggest matrix) loads alongside the layers.
         let embed = thread::scope(|s| {
@@ -128,6 +124,7 @@ fn load_layer(st: &SafeTensors, c: &Config, l: usize, format: Format) -> Result<
     } else {
         None
     };
+    let fmt = |name: &str| format.for_matrix(name);
     let layer = LayerWeights {
         attn_norm: vector(st, &n("input_layernorm.weight"))?,
         wqkv: matrix(
@@ -137,19 +134,19 @@ fn load_layer(st: &SafeTensors, c: &Config, l: usize, format: Format) -> Result<
                 &n("self_attn.k_proj.weight"),
                 &n("self_attn.v_proj.weight"),
             ],
-            format,
+            fmt("qkv"),
         )?,
         bqkv,
         q_norm: optional(st, &n("self_attn.q_norm.weight")),
         k_norm: optional(st, &n("self_attn.k_norm.weight")),
-        wo: matrix(st, &[&n("self_attn.o_proj.weight")], format)?,
+        wo: matrix(st, &[&n("self_attn.o_proj.weight")], fmt("o"))?,
         mlp_norm: vector(st, &n("post_attention_layernorm.weight"))?,
         w_gate_up: matrix(
             st,
             &[&n("mlp.gate_proj.weight"), &n("mlp.up_proj.weight")],
-            format,
+            fmt("gate_up"),
         )?,
-        w_down: matrix(st, &[&n("mlp.down_proj.weight")], format)?,
+        w_down: matrix(st, &[&n("mlp.down_proj.weight")], fmt("down"))?,
     };
     let qkv = c.q_dim() + 2 * c.kv_dim();
     let shapes = [
