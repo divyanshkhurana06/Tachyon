@@ -98,3 +98,80 @@ fn answers_and_gpu_matches_cpu() {
         }
     }
 }
+
+/// Llama 3's own tool format: definitions in the first user turn, and a
+/// call is the whole reply as `{"name": .., "parameters": ..}`. Asked
+/// plainly, the model calls the tool; forced, its arguments fit the schema.
+#[test]
+fn calls_tools_in_llama_format() {
+    use tachyon::constrain::OutputFormat;
+    use tachyon::generate::{generate, GenOptions};
+    use tachyon::json::Json;
+    use tachyon::sampler::SamplerConfig;
+    use tachyon::schema::{JsonSchema, Schema};
+    let Some((_g, dir)) = setup() else { return };
+    let tok = Tokenizer::load(&dir.join("tokenizer.json")).unwrap();
+    let cfg = Config::load(&dir).unwrap();
+    let tpl = ChatTemplate::new(&tok).unwrap();
+    assert_eq!(tpl.arguments_key(), "parameters");
+    let pool = Arc::new(Pool::new(Pool::default_threads()));
+    let w = Weights::load(&dir, &cfg, Format::Q8).unwrap();
+    let mut e = Session::new(Box::new(CpuBackend::new(cfg.clone(), w, pool, 32)));
+    let params = r#"{"type":"object","properties":{"city":{"type":"string"},"unit":{"enum":["celsius","fahrenheit"]}}}"#;
+    let tool = Json::parse(&format!(
+        r#"{{"type":"function","function":{{"name":"get_weather","description":"Get the current weather in a city","parameters":{params}}}}}"#
+    ))
+    .unwrap();
+    let p = tpl.encode_with_tools(
+        &tok,
+        &[Message::new(
+            "user",
+            "What is the weather in Tokyo right now?",
+        )],
+        None,
+        &[tool],
+    );
+    let shown = tok.decode(&p, false);
+    assert!(shown.contains("Environment: ipython\nCutting Knowledge Date"));
+    assert!(shown.contains("{\n    \"type\": \"function\",\n    \"function\": {\n"));
+
+    let run = |e: &mut Session, format: OutputFormat, temperature: f32, seed: u64| {
+        let opts = GenOptions {
+            max_tokens: 60,
+            sampler: SamplerConfig {
+                temperature,
+                seed,
+                ..SamplerConfig::default()
+            },
+            // with tools, a call ends with <|eom_id|>, not <|eot_id|>
+            stop_tokens: cfg.eos_ids.clone(),
+            format,
+        };
+        let mut text = String::new();
+        generate(e, &tok, &mut Vec::new(), &p, &opts, &mut |s| {
+            text.push_str(s);
+            true
+        })
+        .unwrap();
+        let (_, calls) = tpl.parse_calls(&text, false);
+        assert_eq!(calls.len(), 1, "{text}");
+        assert_eq!(calls[0].name, "get_weather");
+        calls[0].arguments.clone()
+    };
+    let args = run(&mut e, OutputFormat::Text, 0.0, 1);
+    assert_eq!(args.get("city").and_then(Json::as_str), Some("Tokyo"));
+
+    let schema = Json::parse(&format!(
+        r#"{{"type":"object","properties":{{"name":{{"const":"get_weather"}},"parameters":{params}}}}}"#
+    ))
+    .unwrap();
+    for seed in 1..=3 {
+        let format = OutputFormat::JsonSchema(JsonSchema::new(Schema::parse(&schema).unwrap()));
+        let args = run(&mut e, format, 1.0, seed);
+        assert!(args.get("city").and_then(Json::as_str).is_some());
+        assert!(matches!(
+            args.get("unit").and_then(Json::as_str),
+            Some("celsius" | "fahrenheit")
+        ));
+    }
+}

@@ -451,7 +451,9 @@ fn json_schema_output_has_the_requested_shape() {
     let format = OutputFormat::JsonSchema(JsonSchema::new(Schema::parse(&schema).unwrap()));
     for seed in 1..=3 {
         let opts = GenOptions {
-            max_tokens: 150,
+            // Room to finish: at temperature 1.0 a reply can spend many
+            // tokens on whitespace, which JSON allows anywhere between values.
+            max_tokens: 300,
             sampler: SamplerConfig {
                 temperature: 1.0,
                 seed,

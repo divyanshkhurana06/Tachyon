@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::chat::{parse_tool_calls, ChatTemplate, Message, ToolCall};
+use crate::chat::{ChatTemplate, Message, ToolCall};
 use crate::constrain::OutputFormat;
 use crate::generate::Finish;
 use crate::json::{obj, Json};
@@ -267,9 +267,14 @@ fn tool_name(tool: &Json) -> Option<&str> {
         .and_then(Json::as_str)
 }
 
-/// The schema a forced call must match: `{"name": ..., "arguments": ...}`,
-/// with the named function's own parameter schema for the arguments.
-fn call_schema(tools: &[Json], choice: &ToolChoice) -> std::result::Result<Schema, String> {
+/// The schema a forced call must match: `{"name": ..., <key>: ...}`, with
+/// the named function's own parameter schema for the arguments (`key` is
+/// "arguments" for Qwen, "parameters" for Llama 3).
+fn call_schema(
+    tools: &[Json],
+    choice: &ToolChoice,
+    key: &str,
+) -> std::result::Result<Schema, String> {
     let any_object = obj([("type", "object".into())]);
     let (name, arguments) = match choice {
         ToolChoice::Named(n) => {
@@ -293,7 +298,7 @@ fn call_schema(tools: &[Json], choice: &ToolChoice) -> std::result::Result<Schem
         ("type", "object".into()),
         (
             "properties",
-            obj([("name", name), ("arguments", arguments)]),
+            Json::Obj(vec![("name".into(), name), (key.into(), arguments)]),
         ),
     ]);
     Schema::parse(&schema).map_err(|e| format!("bad tool parameters: {e}"))
@@ -571,18 +576,6 @@ fn chat_completion(conn: &mut TcpStream, server: &Server, body: &[u8]) -> io::Re
         Ok(r) => r,
         Err(e) => return error(conn, "400 Bad Request", &e),
     };
-    let uses_tools = !req.tools.is_empty()
-        || req
-            .messages
-            .iter()
-            .any(|m| m.role == "tool" || !m.tool_calls.is_empty());
-    if uses_tools && !server.template.supports_tools() {
-        return error(
-            conn,
-            "400 Bad Request",
-            "tool calling needs a model with ChatML tool calls (Qwen)",
-        );
-    }
     let shown: &[Json] = if req.tool_choice == ToolChoice::None {
         &[]
     } else {
@@ -597,12 +590,13 @@ fn chat_completion(conn: &mut TcpStream, server: &Server, body: &[u8]) -> io::Re
     if !req.thinking {
         server.template.skip_thinking(&server.tok, &mut prompt);
     }
-    // A forced call: open the <tool_call> ourselves and constrain what
-    // follows to {"name": ..., "arguments": <the function's schema>}.
+    // A forced call: open the call ourselves (Qwen's <tool_call>) and
+    // constrain what follows to {"name": ..., "arguments": <its schema>}.
     let forced = matches!(req.tool_choice, ToolChoice::Required | ToolChoice::Named(_));
     let format = if forced {
-        prompt.extend(server.tok.encode("<tool_call>\n", true));
-        match call_schema(&req.tools, &req.tool_choice) {
+        server.template.open_call(&server.tok, &mut prompt);
+        let key = server.template.arguments_key();
+        match call_schema(&req.tools, &req.tool_choice, key) {
             Ok(schema) => OutputFormat::JsonSchema(JsonSchema::new(schema)),
             Err(e) => return error(conn, "400 Bad Request", &e),
         }
@@ -697,10 +691,8 @@ fn chat_completion(conn: &mut TcpStream, server: &Server, body: &[u8]) -> io::Re
                 if let Some(buf) = held.as_mut() {
                     buf.push_str(&piece);
                     let start = buf.trim_start();
-                    if forced
-                        || start.starts_with("<tool_call>")
-                        || "<tool_call>".starts_with(start)
-                    {
+                    let opener = server.template.call_opener();
+                    if forced || start.starts_with(opener) || opener.starts_with(start) {
                         continue; // a call, or still might be
                     }
                     piece = held.take().unwrap();
@@ -732,13 +724,8 @@ fn chat_completion(conn: &mut TcpStream, server: &Server, body: &[u8]) -> io::Re
     if !hit_stop {
         text.push_str(&stops.finish());
     }
-    let (content, mut calls) = if forced {
-        (
-            String::new(),
-            parse_tool_calls(&format!("<tool_call>{text}</tool_call>")).1,
-        )
-    } else if tools_on {
-        parse_tool_calls(&text)
+    let (content, mut calls) = if forced || tools_on {
+        server.template.parse_calls(&text, forced)
     } else {
         (text.clone(), Vec::new())
     };

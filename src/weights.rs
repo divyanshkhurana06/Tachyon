@@ -201,7 +201,8 @@ impl Matrix {
         let (rows, cols) = (self.rows(), self.cols());
         assert_eq!(x.len(), t * cols);
         assert_eq!(out.len(), t * rows);
-        let grain = (rows / (pool.threads() * 8)).clamp(4, 256);
+        // Even, so the I8MM path's row pairs don't straddle chunks.
+        let grain = (rows / (pool.threads() * 8)).clamp(4, 256) & !1;
         let out = SyncPtr::new(out);
         match self {
             Matrix::Bf16 { data, .. } => pool.parallel_for(rows, grain, |range| {
@@ -215,67 +216,200 @@ impl Matrix {
                     }
                 }
             }),
-            Matrix::Q8 { scales, qs, .. } => {
-                let (xs, xq) = quantize_input(x, t, cols);
-                let nb = cols / QK;
-                let tok = |i: usize| (&xs[i * nb..(i + 1) * nb], &xq[i * cols..(i + 1) * cols]);
-                pool.parallel_for(rows, grain, |range| {
-                    for r in range {
-                        let (ws, wq) =
-                            (&scales[r * nb..(r + 1) * nb], &qs[r * cols..(r + 1) * cols]);
-                        // Four tokens at a time share each weight block load.
-                        let mut i = 0;
-                        while i + 4 <= t {
-                            let ys = dot_q8_x4(
-                                ws,
-                                wq,
-                                [0, 1, 2, 3].map(|j| tok(i + j).0),
-                                [0, 1, 2, 3].map(|j| tok(i + j).1),
-                            );
-                            for (j, y) in ys.into_iter().enumerate() {
-                                unsafe { out.write((i + j) * rows + r, y) };
-                            }
-                            i += 4;
-                        }
-                        for i in i..t {
-                            let (s, q) = tok(i);
-                            unsafe { out.write(i * rows + r, dot_q8(ws, wq, s, q)) };
-                        }
-                    }
-                })
-            }
-            Matrix::Q4 { scales, qs, .. } => {
-                let (xs, xq) = quantize_input(x, t, cols);
-                let nb = cols / QK;
-                let tok = |i: usize| (&xs[i * nb..(i + 1) * nb], &xq[i * cols..(i + 1) * cols]);
-                pool.parallel_for(rows, grain, |range| {
-                    for r in range {
-                        let (ws, wq) = (
-                            &scales[r * nb..(r + 1) * nb],
-                            &qs[r * cols / 2..(r + 1) * cols / 2],
-                        );
-                        let mut i = 0;
-                        while i + 4 <= t {
-                            let ys = dot_q4_x4(
-                                ws,
-                                wq,
-                                [0, 1, 2, 3].map(|j| tok(i + j).0),
-                                [0, 1, 2, 3].map(|j| tok(i + j).1),
-                            );
-                            for (j, y) in ys.into_iter().enumerate() {
-                                unsafe { out.write((i + j) * rows + r, y) };
-                            }
-                            i += 4;
-                        }
-                        for i in i..t {
-                            let (s, q) = tok(i);
-                            unsafe { out.write(i * rows + r, dot_q4(ws, wq, s, q)) };
-                        }
-                    }
-                })
-            }
+            Matrix::Q8 { scales, qs, .. } => int_matmul(
+                pool,
+                &Q8Rows { scales, qs, cols },
+                rows,
+                cols,
+                x,
+                t,
+                grain,
+                out,
+            ),
+            Matrix::Q4 { scales, qs, .. } => int_matmul(
+                pool,
+                &Q4Rows { scales, qs, cols },
+                rows,
+                cols,
+                x,
+                t,
+                grain,
+                out,
+            ),
         }
     }
+}
+
+/// The rows of an 8- or 4-bit matrix, for the shared integer matmul.
+trait IntRows: Sync {
+    fn dot(&self, r: usize, xs: &[f32], xq: &[i8]) -> f32;
+    fn dot_x4(&self, r: usize, xs: [&[f32]; 4], xq: [&[i8]; 4]) -> [f32; 4];
+    /// Rows `r` and `r + 1` against token pairs (see `kernels::pair_tokens`).
+    fn dot2_pairs<const P: usize>(
+        &self,
+        r: usize,
+        ps: [&[f32]; P],
+        pq: [&[i8]; P],
+    ) -> [[f32; 4]; P];
+}
+
+struct Q8Rows<'a> {
+    scales: &'a [f32],
+    qs: &'a [i8],
+    cols: usize,
+}
+
+impl Q8Rows<'_> {
+    fn row(&self, r: usize) -> (&[f32], &[i8]) {
+        let (nb, cols) = (self.cols / QK, self.cols);
+        (
+            &self.scales[r * nb..(r + 1) * nb],
+            &self.qs[r * cols..(r + 1) * cols],
+        )
+    }
+}
+
+impl IntRows for Q8Rows<'_> {
+    fn dot(&self, r: usize, xs: &[f32], xq: &[i8]) -> f32 {
+        let (ws, wq) = self.row(r);
+        dot_q8(ws, wq, xs, xq)
+    }
+    fn dot_x4(&self, r: usize, xs: [&[f32]; 4], xq: [&[i8]; 4]) -> [f32; 4] {
+        let (ws, wq) = self.row(r);
+        dot_q8_x4(ws, wq, xs, xq)
+    }
+    fn dot2_pairs<const P: usize>(
+        &self,
+        r: usize,
+        ps: [&[f32]; P],
+        pq: [&[i8]; P],
+    ) -> [[f32; 4]; P] {
+        let (a, b) = (self.row(r), self.row(r + 1));
+        kernels::dot2_q8_pairs([a.0, b.0], [a.1, b.1], ps, pq)
+    }
+}
+
+struct Q4Rows<'a> {
+    scales: &'a [f32],
+    qs: &'a [u8],
+    cols: usize,
+}
+
+impl Q4Rows<'_> {
+    fn row(&self, r: usize) -> (&[f32], &[u8]) {
+        let (nb, half) = (self.cols / QK, self.cols / 2);
+        (
+            &self.scales[r * nb..(r + 1) * nb],
+            &self.qs[r * half..(r + 1) * half],
+        )
+    }
+}
+
+impl IntRows for Q4Rows<'_> {
+    fn dot(&self, r: usize, xs: &[f32], xq: &[i8]) -> f32 {
+        let (ws, wq) = self.row(r);
+        dot_q4(ws, wq, xs, xq)
+    }
+    fn dot_x4(&self, r: usize, xs: [&[f32]; 4], xq: [&[i8]; 4]) -> [f32; 4] {
+        let (ws, wq) = self.row(r);
+        dot_q4_x4(ws, wq, xs, xq)
+    }
+    fn dot2_pairs<const P: usize>(
+        &self,
+        r: usize,
+        ps: [&[f32]; P],
+        pq: [&[i8]; P],
+    ) -> [[f32; 4]; P] {
+        let (a, b) = (self.row(r), self.row(r + 1));
+        kernels::dot2_q4_pairs([a.0, b.0], [a.1, b.1], ps, pq)
+    }
+}
+
+/// `out = m · x` for quantized `m`, with `x` quantized to 8 bits first.
+/// With I8MM and several tokens, rows go two at a time against token pairs
+/// on the matrix instructions; otherwise (and for an odd row or token left
+/// over) each row takes four tokens per weight load with SDOT.
+#[allow(clippy::too_many_arguments)]
+fn int_matmul(
+    pool: &Pool,
+    m: &impl IntRows,
+    rows: usize,
+    cols: usize,
+    x: &[f32],
+    t: usize,
+    grain: usize,
+    out: SyncPtr<f32>,
+) {
+    let (xs, xq) = quantize_input(x, t, cols);
+    let nb = cols / QK;
+    let tok = |i: usize| (&xs[i * nb..(i + 1) * nb], &xq[i * cols..(i + 1) * cols]);
+    let paired = (t >= 2 && kernels::has_i8mm()).then(|| kernels::pair_tokens(&xs, &xq, t, cols));
+    pool.parallel_for(rows, grain, |range| {
+        // SAFETY: each (token, row) of `out` is written by exactly one thread.
+        let put = |i: usize, r: usize, y: f32| unsafe { out.write(i * rows + r, y) };
+        let mut r = range.start;
+        if let Some((ps, pq)) = &paired {
+            let pair = |p: usize| {
+                (
+                    &ps[p * 2 * nb..(p + 1) * 2 * nb],
+                    &pq[p * 2 * cols..(p + 1) * 2 * cols],
+                )
+            };
+            // Rows r and r + 1 against tokens 2p and 2p + 1.
+            let store = |r: usize, p: usize, y: [f32; 4]| {
+                put(2 * p, r, y[0]);
+                put(2 * p + 1, r, y[1]);
+                put(2 * p, r + 1, y[2]);
+                put(2 * p + 1, r + 1, y[3]);
+            };
+            while r + 2 <= range.end {
+                let mut p = 0;
+                while p + 4 <= t / 2 {
+                    let g = [pair(p), pair(p + 1), pair(p + 2), pair(p + 3)];
+                    let ys = m.dot2_pairs(r, g.map(|x| x.0), g.map(|x| x.1));
+                    for (k, y) in ys.into_iter().enumerate() {
+                        store(r, p + k, y);
+                    }
+                    p += 4;
+                }
+                while p + 2 <= t / 2 {
+                    let (a, b) = (pair(p), pair(p + 1));
+                    let ys = m.dot2_pairs(r, [a.0, b.0], [a.1, b.1]);
+                    store(r, p, ys[0]);
+                    store(r, p + 1, ys[1]);
+                    p += 2;
+                }
+                if p < t / 2 {
+                    store(r, p, m.dot2_pairs(r, [pair(p).0], [pair(p).1])[0]);
+                }
+                if t % 2 == 1 {
+                    let (s, q) = tok(t - 1);
+                    put(t - 1, r, m.dot(r, s, q));
+                    put(t - 1, r + 1, m.dot(r + 1, s, q));
+                }
+                r += 2;
+            }
+        }
+        for r in r..range.end {
+            // Four tokens at a time share each weight block load.
+            let mut i = 0;
+            while i + 4 <= t {
+                let ys = m.dot_x4(
+                    r,
+                    [0, 1, 2, 3].map(|j| tok(i + j).0),
+                    [0, 1, 2, 3].map(|j| tok(i + j).1),
+                );
+                for (j, y) in ys.into_iter().enumerate() {
+                    put(i + j, r, y);
+                }
+                i += 4;
+            }
+            for i in i..t {
+                let (s, q) = tok(i);
+                put(i, r, m.dot(r, s, q));
+            }
+        }
+    });
 }
 
 fn quantize_input(x: &[f32], t: usize, cols: usize) -> (Vec<f32>, Vec<i8>) {
