@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use tachyon::chat::{default_system, ChatTemplate, Message};
 use tachyon::config::Config;
+use tachyon::constrain::OutputFormat;
 use tachyon::engine::{Backend, Engine, Session};
 use tachyon::generate::{generate, GenOptions, GenStats, PREFILL_CHUNK};
 use tachyon::json::{obj, Json};
@@ -65,6 +66,7 @@ options:
   --kv-tokens N      KV cache size for `serve`, shared by all users (default 16384)
   --max-seqs N       most requests `serve` runs at once (default 16)
   --json             constrain the reply to a JSON object
+  --schema FILE      constrain the reply to JSON matching this JSON Schema
   --kv-f16           store the GPU KV cache as f16 (half the memory)
   --no-think         Qwen3: answer directly, without a <think> block
   --imatrix FILE     fit 4-bit weights to this importance matrix (from `calibrate`)
@@ -96,6 +98,7 @@ struct Args {
     kv_tokens: usize,
     max_seqs: usize,
     json: bool,
+    schema: Option<PathBuf>,
     url: String,
     clients: Vec<usize>,
     requests: usize,
@@ -138,6 +141,7 @@ fn parse_args() -> Result<Args> {
         kv_tokens: 16384,
         max_seqs: 16,
         json: false,
+        schema: None,
         url: "http://127.0.0.1:8080".into(),
         clients: vec![1, 4, 16],
         requests: 32,
@@ -209,6 +213,7 @@ fn parse_args() -> Result<Args> {
             "--kv-tokens" => a.kv_tokens = num(&flag, value()?)?,
             "--max-seqs" => a.max_seqs = num(&flag, value()?)?,
             "--json" => a.json = true,
+            "--schema" => a.schema = Some(value()?.into()),
             "--url" => a.url = value()?,
             "--requests" => a.requests = num(&flag, value()?)?,
             "--clients" => {
@@ -392,7 +397,7 @@ fn run(a: &Args) -> Result<()> {
         max_tokens: a.max_tokens,
         sampler: a.sampler.clone(),
         stop_tokens: stop_tokens(&m.cfg, &m.tok),
-        json: a.json,
+        format: output_format(a)?,
     };
     if a.raw {
         print!("{prompt}");
@@ -418,7 +423,7 @@ fn chat(a: &Args) -> Result<()> {
         max_tokens: a.max_tokens,
         sampler: a.sampler.clone(),
         stop_tokens: stop_tokens(&m.cfg, &m.tok),
-        json: a.json,
+        format: output_format(a)?,
     };
 
     // The conversation as tokens. Each turn appends to it, and generate()
@@ -637,7 +642,7 @@ fn speculate(a: &Args) -> Result<()> {
         max_tokens: a.max_tokens,
         sampler: sampling.clone(),
         stop_tokens: stop.clone(),
-        json: false,
+        format: OutputFormat::Text,
     };
 
     let mode = if greedy {
@@ -1020,4 +1025,21 @@ fn calibrate(a: &Args) -> Result<()> {
         out.display()
     );
     Ok(())
+}
+
+/// `--schema` or `--json`, as an output constraint.
+fn output_format(a: &Args) -> Result<OutputFormat> {
+    if let Some(path) = &a.schema {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| Error(format!("cannot read {}: {e}", path.display())))?;
+        let schema = tachyon::schema::Schema::parse(&Json::parse(&text)?)?;
+        return Ok(OutputFormat::JsonSchema(tachyon::schema::JsonSchema::new(
+            schema,
+        )));
+    }
+    Ok(if a.json {
+        OutputFormat::JsonObject
+    } else {
+        OutputFormat::Text
+    })
 }

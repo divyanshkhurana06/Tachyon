@@ -3,7 +3,8 @@
 //!
 //! - `POST /v1/chat/completions`: chat, optionally streamed as server-sent
 //!   events, so the official `openai` clients and chat UIs work unchanged.
-//!   Supports `stop` strings, `response_format: {"type": "json_object"}`
+//!   Supports `stop` strings, `response_format` (`json_object`, or
+//!   `json_schema` for output matching a schema)
 //!   (constrained decoding: always valid JSON) and vLLM's `ignore_eos`.
 //! - `GET /v1/models`, `GET /health`, `GET /info`
 //! - `GET /`: a small chat page
@@ -21,11 +22,12 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::chat::{ChatTemplate, Message};
-use crate::constrain::JsonObject;
+use crate::constrain::OutputFormat;
 use crate::generate::Finish;
 use crate::json::{obj, Json};
 use crate::sampler::SamplerConfig;
 use crate::scheduler::{Event, Request, Scheduler, Summary};
+use crate::schema::{JsonSchema, Schema};
 use crate::tokenizer::Tokenizer;
 use crate::Result;
 
@@ -236,7 +238,7 @@ struct ChatRequest {
     max_tokens: Option<usize>,
     sampler: SamplerConfig,
     stop: Vec<String>,
-    json: bool,
+    format: OutputFormat,
     ignore_eos: bool,
     /// Qwen3's `enable_thinking` (top level, or in `chat_template_kwargs`
     /// as vLLM takes it).
@@ -298,19 +300,24 @@ fn parse_chat(body: &[u8], defaults: &SamplerConfig) -> std::result::Result<Chat
             .collect(),
         _ => Vec::new(),
     };
-    let json = match j
-        .get("response_format")
-        .and_then(|f| f.get("type"))
-        .and_then(Json::as_str)
-    {
-        None | Some("text") => false,
-        Some("json_object") => true,
-        Some(other) => {
-            return Err(format!(
-                "response_format type {other:?} is not supported (text, json_object)"
-            ))
-        }
-    };
+    let rf = j.get("response_format");
+    let format =
+        match rf.and_then(|f| f.get("type")).and_then(Json::as_str) {
+            None | Some("text") => OutputFormat::Text,
+            Some("json_object") => OutputFormat::JsonObject,
+            Some("json_schema") => {
+                let schema = rf
+                    .and_then(|f| f.get("json_schema"))
+                    .and_then(|s| s.get("schema"))
+                    .ok_or("response_format json_schema needs json_schema.schema")?;
+                OutputFormat::JsonSchema(JsonSchema::new(
+                    Schema::parse(schema).map_err(|e| format!("bad schema: {e}"))?,
+                ))
+            }
+            Some(other) => return Err(format!(
+                "response_format type {other:?} is not supported (text, json_object, json_schema)"
+            )),
+        };
     Ok(ChatRequest {
         messages,
         stream: j.get("stream").and_then(Json::as_bool).unwrap_or(false),
@@ -320,7 +327,7 @@ fn parse_chat(body: &[u8], defaults: &SamplerConfig) -> std::result::Result<Chat
             .and_then(Json::as_usize),
         sampler,
         stop: stop.into_iter().filter(|s| !s.is_empty()).collect(),
-        json,
+        format,
         ignore_eos: j.get("ignore_eos").and_then(Json::as_bool).unwrap_or(false),
         thinking: j
             .get("enable_thinking")
@@ -409,7 +416,7 @@ fn chat_completion(conn: &mut TcpStream, server: &Server, body: &[u8]) -> io::Re
         } else {
             server.stop.clone()
         },
-        constraint: req.json.then(|| Box::new(JsonObject::default()) as _),
+        constraint: req.format.constraint(),
         events: tx,
         cancel: cancel.clone(),
     });
