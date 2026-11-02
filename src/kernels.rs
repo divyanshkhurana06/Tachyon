@@ -200,30 +200,77 @@ pub fn axpy(out: &mut [f32], a: f32, x: &[f32]) {
     }
 }
 
+/// Interleaves quantized activations two tokens at a time for the I8MM
+/// kernels ([`dot2_q8_pairs`]): for tokens 2p and 2p+1, every 8 values of
+/// one are followed by the same 8 of the other, so each 16 bytes is the 8x2
+/// matrix `smmla` takes, and their block scales sit side by side. A last odd
+/// token is left out. Returns (scales, quants), `2 * cols / QK` scales and
+/// `2 * cols` quants per pair.
+pub fn pair_tokens(xs: &[f32], xq: &[i8], t: usize, cols: usize) -> (Vec<f32>, Vec<i8>) {
+    let nb = cols / QK;
+    let pairs = t / 2;
+    let (mut ps, mut pq) = (vec![0.0; pairs * 2 * nb], vec![0i8; pairs * 2 * cols]);
+    for p in 0..pairs {
+        let (a, b) = (2 * p * cols, (2 * p + 1) * cols);
+        for (blk, s) in ps[p * 2 * nb..(p + 1) * 2 * nb]
+            .chunks_exact_mut(2)
+            .enumerate()
+        {
+            s[0] = xs[2 * p * nb + blk];
+            s[1] = xs[(2 * p + 1) * nb + blk];
+        }
+        for (c, chunk) in pq[p * 2 * cols..(p + 1) * 2 * cols]
+            .chunks_exact_mut(16)
+            .enumerate()
+        {
+            chunk[..8].copy_from_slice(&xq[a + c * 8..a + c * 8 + 8]);
+            chunk[8..].copy_from_slice(&xq[b + c * 8..b + c * 8 + 8]);
+        }
+    }
+    (ps, pq)
+}
+
 #[cfg(target_arch = "aarch64")]
-pub use neon::{dot_bf16, dot_f32, dot_q4, dot_q4_x4, dot_q8, dot_q8_x4};
+pub use neon::{
+    dot2_q4_pairs, dot2_q8_pairs, dot_bf16, dot_f32, dot_q4, dot_q4_x4, dot_q8, dot_q8_x4, has_i8mm,
+};
 #[cfg(not(target_arch = "aarch64"))]
-pub use scalar::{dot_bf16, dot_f32, dot_q4, dot_q4_x4, dot_q8, dot_q8_x4};
+pub use scalar::{
+    dot2_q4_pairs, dot2_q8_pairs, dot_bf16, dot_f32, dot_q4, dot_q4_x4, dot_q8, dot_q8_x4, has_i8mm,
+};
 
 #[cfg(target_arch = "aarch64")]
 mod neon {
     use super::QK;
     use std::arch::aarch64::*;
 
-    /// Whether this CPU has SDOT (ARMv8.4 dot product; every Apple Silicon
-    /// chip does). Checked once.
-    fn dotprod() -> bool {
-        use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
-        static HAS: AtomicU8 = AtomicU8::new(0);
-        match HAS.load(Relaxed) {
+    use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+
+    /// A CPU feature check, done once.
+    fn cached(flag: &AtomicU8, detect: fn() -> bool) -> bool {
+        match flag.load(Relaxed) {
             1 => false,
             2 => true,
             _ => {
-                let has = std::arch::is_aarch64_feature_detected!("dotprod");
-                HAS.store(if has { 2 } else { 1 }, Relaxed);
+                let has = detect();
+                flag.store(if has { 2 } else { 1 }, Relaxed);
                 has
             }
         }
+    }
+
+    /// Whether this CPU has SDOT (ARMv8.4 dot product; every Apple Silicon
+    /// chip does).
+    fn dotprod() -> bool {
+        static HAS: AtomicU8 = AtomicU8::new(0);
+        cached(&HAS, || std::arch::is_aarch64_feature_detected!("dotprod"))
+    }
+
+    /// Whether this CPU has I8MM, the int8 matrix multiply instructions
+    /// (Apple M2 and later).
+    pub fn has_i8mm() -> bool {
+        static HAS: AtomicU8 = AtomicU8::new(0);
+        cached(&HAS, || std::arch::is_aarch64_feature_detected!("i8mm"))
     }
 
     /// `acc += dot(a, b)` four bytes at a time: 16 int8 multiply-adds into
@@ -244,6 +291,116 @@ mod neon {
         acc
     }
 
+    /// `acc += a · bᵀ` for a 2x8 matrix `a` and an 8x2 matrix `b` (each a
+    /// 16-byte vector, row after row): the 2x2 int32 result is
+    /// `[a0·b0, a0·b1, a1·b0, a1·b1]`. 32 multiply-adds in one instruction,
+    /// twice SDOT's 16.
+    #[inline]
+    #[target_feature(enable = "i8mm")]
+    unsafe fn smmla(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
+        let mut acc = acc;
+        std::arch::asm!(
+            "smmla {acc:v}.4s, {a:v}.16b, {b:v}.16b",
+            acc = inout(vreg) acc,
+            a = in(vreg) a,
+            b = in(vreg) b,
+            options(pure, nomem, nostack, preserves_flags)
+        );
+        acc
+    }
+
+    /// The first (`HI = false`) or second 8 bytes of `a` followed by the same
+    /// of `b`.
+    #[inline(always)]
+    unsafe fn zip64<const HI: bool>(a: int8x16_t, b: int8x16_t) -> int8x16_t {
+        let (a, b) = (vreinterpretq_s64_s8(a), vreinterpretq_s64_s8(b));
+        vreinterpretq_s8_s64(if HI {
+            vzip2q_s64(a, b)
+        } else {
+            vzip1q_s64(a, b)
+        })
+    }
+
+    /// Two weight rows against `P` token pairs laid out by `pair_tokens`.
+    /// Per block, the rows' weights become four 2x8 matrices, each multiplied
+    /// by a pair's matching 8x2 slice: one `smmla` covers 2 rows x 2 tokens
+    /// x 8 values.
+    #[target_feature(enable = "i8mm")]
+    unsafe fn dot2_pairs<const P: usize, const Q4: bool>(
+        ws: [&[f32]; 2],
+        wq: [*const u8; 2],
+        ps: [&[f32]; P],
+        pq: [&[i8]; P],
+    ) -> [[f32; 4]; P] {
+        let nb = ws[0].len();
+        assert!(ws[1].len() >= nb);
+        for p in 0..P {
+            assert!(pq[p].len() >= nb * 2 * QK && ps[p].len() >= nb * 2);
+        }
+        let mut acc = [vdupq_n_f32(0.0); P];
+        for b in 0..nb {
+            let [r0, r1] = wq.map(|w| {
+                if Q4 {
+                    unpack_q4(w.add(b * QK / 2))
+                } else {
+                    let p = w.add(b * QK) as *const i8;
+                    (vld1q_s8(p), vld1q_s8(p.add(16)))
+                }
+            });
+            let w = [
+                zip64::<false>(r0.0, r1.0),
+                zip64::<true>(r0.0, r1.0),
+                zip64::<false>(r0.1, r1.1),
+                zip64::<true>(r0.1, r1.1),
+            ];
+            let wd = vcombine_f32(
+                vdup_n_f32(*ws[0].get_unchecked(b)),
+                vdup_n_f32(*ws[1].get_unchecked(b)),
+            );
+            for p in 0..P {
+                let q = pq[p].as_ptr().add(b * 2 * QK);
+                let mut s = vdupq_n_s32(0);
+                for (k, &w) in w.iter().enumerate() {
+                    s = smmla(s, w, vld1q_s8(q.add(16 * k)));
+                }
+                let xd = vld1_f32(ps[p].as_ptr().add(2 * b));
+                acc[p] = vfmaq_f32(
+                    acc[p],
+                    vcvtq_f32_s32(s),
+                    vmulq_f32(wd, vcombine_f32(xd, xd)),
+                );
+            }
+        }
+        acc.map(|a| {
+            let mut out = [0.0; 4];
+            vst1q_f32(out.as_mut_ptr(), a);
+            out
+        })
+    }
+
+    /// Two 8-bit weight rows against `P` token pairs: for each pair
+    /// `[row0·t0, row0·t1, row1·t0, row1·t1]`. Needs [`has_i8mm`].
+    pub fn dot2_q8_pairs<const P: usize>(
+        ws: [&[f32]; 2],
+        wq: [&[i8]; 2],
+        ps: [&[f32]; P],
+        pq: [&[i8]; P],
+    ) -> [[f32; 4]; P] {
+        assert!(has_i8mm() && wq.iter().all(|w| w.len() >= ws[0].len() * QK));
+        unsafe { dot2_pairs::<P, false>(ws, wq.map(|w| w.as_ptr() as *const u8), ps, pq) }
+    }
+
+    /// Two 4-bit weight rows against `P` token pairs, as [`dot2_q8_pairs`].
+    pub fn dot2_q4_pairs<const P: usize>(
+        ws: [&[f32]; 2],
+        wq: [&[u8]; 2],
+        ps: [&[f32]; P],
+        pq: [&[i8]; P],
+    ) -> [[f32; 4]; P] {
+        assert!(has_i8mm() && wq.iter().all(|w| w.len() >= ws[0].len() * QK / 2));
+        unsafe { dot2_pairs::<P, true>(ws, wq.map(|w| w.as_ptr()), ps, pq) }
+    }
+
     /// The 32 weights of a 4-bit block as two vectors of signed bytes.
     #[inline(always)]
     unsafe fn unpack_q4(p: *const u8) -> (int8x16_t, int8x16_t) {
@@ -258,6 +415,11 @@ mod neon {
     /// One weight row against `N` tokens' activations: each weight block is
     /// loaded (and for 4-bit, unpacked) once and used for every token, which
     /// is what makes batched prefill faster than N separate dots.
+    ///
+    /// Each block's exact integer sum is scaled into one running total per
+    /// token with a fused multiply-add, the same arithmetic `dot2_pairs`
+    /// does per lane, so a token's result doesn't depend on which kernel or
+    /// which batch it went through.
     #[target_feature(enable = "dotprod")]
     unsafe fn dot_rows_sdot<const N: usize, const Q4: bool>(
         ws: &[f32],
@@ -269,7 +431,7 @@ mod neon {
         for j in 0..N {
             assert!(xq[j].len() >= nb * QK && xs[j].len() >= nb);
         }
-        let mut acc = [vdupq_n_f32(0.0); N];
+        let mut acc = [0f32; N];
         for b in 0..nb {
             let (w0, w1) = if Q4 {
                 unpack_q4(wq.add(b * QK / 2))
@@ -285,14 +447,10 @@ mod neon {
                     w1,
                     vld1q_s8(px.add(16)),
                 );
-                acc[j] = vfmaq_f32(
-                    acc[j],
-                    vcvtq_f32_s32(s),
-                    vdupq_n_f32(wd * *xs[j].get_unchecked(b)),
-                );
+                acc[j] = (vaddvq_s32(s) as f32).mul_add(wd * *xs[j].get_unchecked(b), acc[j]);
             }
         }
-        acc.map(|a| vaddvq_f32(a))
+        acc
     }
 
     pub fn dot_q8(ws: &[f32], wq: &[i8], xs: &[f32], xq: &[i8]) -> f32 {
@@ -489,6 +647,56 @@ mod scalar {
     pub fn dot_q4_x4(ws: &[f32], wq: &[u8], xs: [&[f32]; 4], xq: [&[i8]; 4]) -> [f32; 4] {
         [0, 1, 2, 3].map(|j| dot_q4(ws, wq, xs[j], xq[j]))
     }
+
+    pub fn has_i8mm() -> bool {
+        false
+    }
+
+    /// Reads one token back out of a pair laid out by `pair_tokens`.
+    fn unpair(ps: &[f32], pq: &[i8], second: bool) -> (Vec<f32>, Vec<i8>) {
+        let o = second as usize;
+        let s = ps.iter().skip(o).step_by(2).copied().collect();
+        let q = pq
+            .chunks_exact(16)
+            .flat_map(|c| c[o * 8..o * 8 + 8].iter().copied())
+            .collect();
+        (s, q)
+    }
+
+    fn pairs<const P: usize>(
+        ps: [&[f32]; P],
+        pq: [&[i8]; P],
+        dot: impl Fn(usize, &[f32], &[i8]) -> f32,
+    ) -> [[f32; 4]; P] {
+        std::array::from_fn(|p| {
+            let (s0, q0) = unpair(ps[p], pq[p], false);
+            let (s1, q1) = unpair(ps[p], pq[p], true);
+            [
+                dot(0, &s0, &q0),
+                dot(0, &s1, &q1),
+                dot(1, &s0, &q0),
+                dot(1, &s1, &q1),
+            ]
+        })
+    }
+
+    pub fn dot2_q8_pairs<const P: usize>(
+        ws: [&[f32]; 2],
+        wq: [&[i8]; 2],
+        ps: [&[f32]; P],
+        pq: [&[i8]; P],
+    ) -> [[f32; 4]; P] {
+        pairs(ps, pq, |r, s, q| dot_q8(ws[r], wq[r], s, q))
+    }
+
+    pub fn dot2_q4_pairs<const P: usize>(
+        ws: [&[f32]; 2],
+        wq: [&[u8]; 2],
+        ps: [&[f32]; P],
+        pq: [&[i8]; P],
+    ) -> [[f32; 4]; P] {
+        pairs(ps, pq, |r, s, q| dot_q4(ws[r], wq[r], s, q))
+    }
 }
 
 #[cfg(test)]
@@ -562,6 +770,74 @@ mod tests {
             assert_eq!(q4[j], dot_q4(&ws4, &wq4, xs[j], xq[j]));
             assert!((q8[j] - scalar::dot_q8(&ws, &wq8, xs[j], xq[j])).abs() < 1e-3);
             assert!((q4[j] - scalar::dot_q4(&ws4, &wq4, xs[j], xq[j])).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn pair_dots_match_single_dots() {
+        let (cols, t) = (896, 5);
+        let nb = cols / QK;
+        type Row = (Vec<f32>, Vec<i8>, Vec<f32>, Vec<u8>);
+        let rows: Vec<Row> = (0..2)
+            .map(|r| {
+                let w = data(cols, 40 + r);
+                let (mut s8, mut q8) = (vec![0.0; nb], vec![0i8; cols]);
+                let (mut s4, mut q4) = (vec![0.0; nb], vec![0u8; cols / 2]);
+                quantize_q8(&w, &mut s8, &mut q8);
+                quantize_q4(&w, &mut s4, &mut q4);
+                (s8, q8, s4, q4)
+            })
+            .collect();
+        let x: Vec<f32> = (0..t).flat_map(|i| data(cols, 50 + i as u32)).collect();
+        let (mut xs, mut xq) = (vec![0.0; t * nb], vec![0i8; t * cols]);
+        quantize_q8(&x, &mut xs, &mut xq);
+        let tok = |i: usize| (&xs[i * nb..(i + 1) * nb], &xq[i * cols..(i + 1) * cols]);
+        let (ps, pq) = pair_tokens(&xs, &xq, t, cols);
+        assert_eq!(pq.len(), 2 * 2 * cols);
+        let pair = |p: usize| {
+            (
+                &ps[p * 2 * nb..(p + 1) * 2 * nb],
+                &pq[p * 2 * cols..(p + 1) * 2 * cols],
+            )
+        };
+        let close = |a: f32, b: f32| (a - b).abs() <= 1e-4 * b.abs().max(1.0);
+
+        let q8 = scalar::dot2_q8_pairs::<2>(
+            [&rows[0].0, &rows[1].0],
+            [&rows[0].1, &rows[1].1],
+            [pair(0).0, pair(1).0],
+            [pair(0).1, pair(1).1],
+        );
+        let fast8 = has_i8mm().then(|| {
+            dot2_q8_pairs::<2>(
+                [&rows[0].0, &rows[1].0],
+                [&rows[0].1, &rows[1].1],
+                [pair(0).0, pair(1).0],
+                [pair(0).1, pair(1).1],
+            )
+        });
+        let fast4 = has_i8mm().then(|| {
+            dot2_q4_pairs::<2>(
+                [&rows[0].2, &rows[1].2],
+                [&rows[0].3, &rows[1].3],
+                [pair(0).0, pair(1).0],
+                [pair(0).1, pair(1).1],
+            )
+        });
+        for p in 0..2 {
+            for (k, (r, i)) in [(0, 2 * p), (0, 2 * p + 1), (1, 2 * p), (1, 2 * p + 1)]
+                .into_iter()
+                .enumerate()
+            {
+                let want8 = dot_q8(&rows[r].0, &rows[r].1, tok(i).0, tok(i).1);
+                let want4 = dot_q4(&rows[r].2, &rows[r].3, tok(i).0, tok(i).1);
+                assert!(close(q8[p][k], want8), "{} vs {want8}", q8[p][k]);
+                // Bit for bit, so batching never changes a token's result.
+                if let (Some(f8), Some(f4)) = (fast8, fast4) {
+                    assert_eq!(f8[p][k], want8);
+                    assert_eq!(f4[p][k], want4);
+                }
+            }
         }
     }
 
