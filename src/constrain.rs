@@ -7,7 +7,30 @@
 //! its bytes are run through a copy of the automaton; tokens that would make
 //! the output invalid are skipped. Once the object closes, generation stops.
 
+use crate::schema::JsonSchema;
 use crate::tokenizer::Tokenizer;
+
+/// What shape the output must take.
+#[derive(Debug, Clone, Default)]
+pub enum OutputFormat {
+    #[default]
+    Text,
+    /// Any JSON object (`response_format: json_object`).
+    JsonObject,
+    /// JSON matching a schema (`response_format: json_schema`).
+    JsonSchema(JsonSchema),
+}
+
+impl OutputFormat {
+    /// A fresh constraint enforcing this format, if it has one.
+    pub fn constraint(&self) -> Option<Box<dyn Constraint>> {
+        match self {
+            OutputFormat::Text => None,
+            OutputFormat::JsonObject => Some(Box::new(JsonObject::default())),
+            OutputFormat::JsonSchema(m) => Some(Box::new(m.clone())),
+        }
+    }
+}
 
 pub trait Constraint: Send {
     /// May `token` come next?

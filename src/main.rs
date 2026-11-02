@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use tachyon::chat::{default_system, ChatTemplate, Message};
 use tachyon::config::Config;
+use tachyon::constrain::OutputFormat;
 use tachyon::engine::{Backend, Engine, Session};
 use tachyon::generate::{generate, GenOptions, GenStats, PREFILL_CHUNK};
 use tachyon::json::{obj, Json};
@@ -35,6 +36,8 @@ commands:
   bench      speed and quality of each weight format
   bench-batch  decode throughput at batch sizes 1 to 64 (the engine alone)
   ppl        perplexity of the model on --file
+  calibrate  measure activations on --file (default bench/calib.txt) and save
+             an importance matrix that improves 4-bit quantization
 
 options:
   --model DIR        model folder (default models/qwen2.5-0.5b-instruct)
@@ -63,8 +66,11 @@ options:
   --kv-tokens N      KV cache size for `serve`, shared by all users (default 16384)
   --max-seqs N       most requests `serve` runs at once (default 16)
   --json             constrain the reply to a JSON object
+  --schema FILE      constrain the reply to JSON matching this JSON Schema
   --kv-f16           store the GPU KV cache as f16 (half the memory)
   --no-think         Qwen3: answer directly, without a <think> block
+  --imatrix FILE     fit 4-bit weights to this importance matrix (from `calibrate`)
+  --out FILE         where `calibrate` writes (default <model>/imatrix.bin)
   --url URL          server for `loadtest` (default http://127.0.0.1:8080)
   --clients LIST     concurrency levels for `loadtest` (default 1,4,16)
   --requests N       requests per level for `loadtest` (default 32)";
@@ -92,6 +98,7 @@ struct Args {
     kv_tokens: usize,
     max_seqs: usize,
     json: bool,
+    schema: Option<PathBuf>,
     url: String,
     clients: Vec<usize>,
     requests: usize,
@@ -99,6 +106,9 @@ struct Args {
     temp_set: bool,
     kv_f16: bool,
     no_think: bool,
+    imatrix: Option<PathBuf>,
+    out: Option<PathBuf>,
+    file_set: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -131,6 +141,7 @@ fn parse_args() -> Result<Args> {
         kv_tokens: 16384,
         max_seqs: 16,
         json: false,
+        schema: None,
         url: "http://127.0.0.1:8080".into(),
         clients: vec![1, 4, 16],
         requests: 32,
@@ -138,6 +149,9 @@ fn parse_args() -> Result<Args> {
         temp_set: false,
         kv_f16: false,
         no_think: false,
+        imatrix: None,
+        out: None,
+        file_set: false,
     };
     while let Some(flag) = it.next() {
         let mut value = || {
@@ -166,13 +180,18 @@ fn parse_args() -> Result<Args> {
             "--lookup" => a.lookup = true,
             "--kv-f16" => a.kv_f16 = true,
             "--no-think" => a.no_think = true,
+            "--imatrix" => a.imatrix = Some(value()?.into()),
+            "--out" => a.out = Some(value()?.into()),
             "--top-k" => a.sampler.top_k = num(&flag, value()?)?,
             "--top-p" => a.sampler.top_p = num(&flag, value()?)?,
             "--repeat-penalty" => a.sampler.repetition_penalty = num(&flag, value()?)?,
             "--seed" => a.sampler.seed = num(&flag, value()?)?,
             "--threads" | "-t" => a.threads = num(&flag, value()?)?,
             "--ctx" => a.ctx = num(&flag, value()?)?,
-            "--file" => a.file = value()?.into(),
+            "--file" => {
+                a.file = value()?.into();
+                a.file_set = true;
+            }
             "--formats" => a.formats = value()?.split(',').map(format).collect::<Result<_>>()?,
             "--gpu" => a.gpu = true,
             "--cpu" => a.gpu = false,
@@ -194,6 +213,7 @@ fn parse_args() -> Result<Args> {
             "--kv-tokens" => a.kv_tokens = num(&flag, value()?)?,
             "--max-seqs" => a.max_seqs = num(&flag, value()?)?,
             "--json" => a.json = true,
+            "--schema" => a.schema = Some(value()?.into()),
             "--url" => a.url = value()?,
             "--requests" => a.requests = num(&flag, value()?)?,
             "--clients" => {
@@ -222,6 +242,7 @@ fn main() -> ExitCode {
         "speculate" => speculate(&a),
         "loadtest" => loadtest(&a),
         "bench-batch" => bench_batch(&a),
+        "calibrate" => calibrate(&a),
         "help" => {
             println!("{USAGE}");
             Ok(())
@@ -267,7 +288,11 @@ fn load_backend(
     let cfg = Config::load(dir)?;
     let tok = Tokenizer::load(&dir.join("tokenizer.json"))?;
     let started = Instant::now();
-    let weights = Weights::load(dir, &cfg, format)?;
+    let importance = match &a.imatrix {
+        Some(path) => Some(tachyon::imatrix::Importance::load(path, &cfg)?.normalized()),
+        None => None,
+    };
+    let weights = Weights::load_with(dir, &cfg, format, importance.as_ref())?;
     let bytes = weights.bytes();
     let backend: Box<dyn Backend> = if gpu {
         gpu_backend(cfg.clone(), weights, blocks, a.ctx, a.kv_f16)?
@@ -372,7 +397,7 @@ fn run(a: &Args) -> Result<()> {
         max_tokens: a.max_tokens,
         sampler: a.sampler.clone(),
         stop_tokens: stop_tokens(&m.cfg, &m.tok),
-        json: a.json,
+        format: output_format(a)?,
     };
     if a.raw {
         print!("{prompt}");
@@ -398,7 +423,7 @@ fn chat(a: &Args) -> Result<()> {
         max_tokens: a.max_tokens,
         sampler: a.sampler.clone(),
         stop_tokens: stop_tokens(&m.cfg, &m.tok),
-        json: a.json,
+        format: output_format(a)?,
     };
 
     // The conversation as tokens. Each turn appends to it, and generate()
@@ -617,7 +642,7 @@ fn speculate(a: &Args) -> Result<()> {
         max_tokens: a.max_tokens,
         sampler: sampling.clone(),
         stop_tokens: stop.clone(),
-        json: false,
+        format: OutputFormat::Text,
     };
 
     let mode = if greedy {
@@ -954,4 +979,67 @@ fn bench_batch(a: &Args) -> Result<()> {
         println!("| {name} | {b} | {:.1} ms | {tps:.0} tok/s |", step * 1e3);
     }
     Ok(())
+}
+
+/// Runs calibration text through the model in bf16 on the CPU, recording
+/// each linear layer's mean squared input per channel, and saves it.
+fn calibrate(a: &Args) -> Result<()> {
+    use tachyon::imatrix::Importance;
+    use tachyon::kv::{Batch, Logits};
+    let file = if a.file_set {
+        a.file.clone()
+    } else {
+        PathBuf::from("bench/calib.txt")
+    };
+    let out = a.out.clone().unwrap_or_else(|| a.model.join("imatrix.bin"));
+    let cfg = Config::load(&a.model)?;
+    let tok = Tokenizer::load(&a.model.join("tokenizer.json"))?;
+    let text = std::fs::read_to_string(&file)
+        .map_err(|e| Error(format!("cannot read {}: {e}", file.display())))?;
+    let tokens = tok.encode(&text, false);
+    let ctx = tokens.len().min(cfg.max_positions);
+    let blocks = ctx.div_ceil(BLOCK);
+    let pool = Arc::new(Pool::new(a.threads));
+    let mut backend = CpuBackend::new(
+        cfg.clone(),
+        Weights::load(&a.model, &cfg, tachyon::weights::Format::Bf16)?,
+        pool,
+        blocks,
+    );
+    backend.calibration = Some(Importance::new(&cfg));
+    let started = Instant::now();
+    let table: Vec<u32> = (0..blocks as u32).collect();
+    let mut batch = Batch::default();
+    for (i, chunk) in tokens[..ctx].chunks(PREFILL_CHUNK).enumerate() {
+        batch.clear();
+        batch.push(&table, i * PREFILL_CHUNK, chunk, Logits::None);
+        backend.forward(&batch);
+    }
+    let importance = backend.calibration.take().unwrap();
+    importance.save(&out)?;
+    eprintln!(
+        "measured {} tokens of {} in {:.1}s; wrote {}",
+        importance.tokens,
+        file.display(),
+        started.elapsed().as_secs_f64(),
+        out.display()
+    );
+    Ok(())
+}
+
+/// `--schema` or `--json`, as an output constraint.
+fn output_format(a: &Args) -> Result<OutputFormat> {
+    if let Some(path) = &a.schema {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| Error(format!("cannot read {}: {e}", path.display())))?;
+        let schema = tachyon::schema::Schema::parse(&Json::parse(&text)?)?;
+        return Ok(OutputFormat::JsonSchema(tachyon::schema::JsonSchema::new(
+            schema,
+        )));
+    }
+    Ok(if a.json {
+        OutputFormat::JsonObject
+    } else {
+        OutputFormat::Text
+    })
 }

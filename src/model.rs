@@ -9,6 +9,7 @@ use std::thread;
 
 use crate::config::Config;
 use crate::engine::Backend;
+use crate::imatrix::{Importance, LayerImportance};
 use crate::kernels::{axpy, dot_f32, rmsnorm, silu};
 use crate::kv::{slot, Batch, BLOCK};
 use crate::pool::{Pool, SyncPtr};
@@ -44,6 +45,17 @@ pub struct Weights {
 impl Weights {
     /// Reads the checkpoint and converts it to `format`, one layer per core.
     pub fn load(dir: &Path, c: &Config, format: Format) -> Result<Weights> {
+        Weights::load_with(dir, c, format, None)
+    }
+
+    /// [`Weights::load`], fitting 4-bit matrices to an importance matrix
+    /// (mean squared inputs per channel, from calibration).
+    pub fn load_with(
+        dir: &Path,
+        c: &Config,
+        format: Format,
+        importance: Option<&Importance>,
+    ) -> Result<Weights> {
         let st = SafeTensors::open_dir(dir)?;
         let next = AtomicUsize::new(0);
         let done = Mutex::new(Vec::new());
@@ -55,14 +67,14 @@ impl Weights {
 
         // The embedding (the single biggest matrix) loads alongside the layers.
         let embed = thread::scope(|s| {
-            let embed = s.spawn(|| matrix(&st, &["model.embed_tokens.weight"], outer));
+            let embed = s.spawn(|| matrix(&st, &["model.embed_tokens.weight"], (outer, None)));
             for _ in 0..threads {
                 s.spawn(|| loop {
                     let l = next.fetch_add(1, Relaxed);
                     if l >= c.layers {
                         break;
                     }
-                    let layer = load_layer(&st, c, l, format);
+                    let layer = load_layer(&st, c, l, format, importance.map(|i| &i.layers[l]));
                     done.lock().unwrap().push((l, layer));
                 });
             }
@@ -78,7 +90,7 @@ impl Weights {
         let lm_head = if c.tied_embeddings || !st.contains("lm_head.weight") {
             None
         } else {
-            Some(matrix(&st, &["lm_head.weight"], outer)?)
+            Some(matrix(&st, &["lm_head.weight"], (outer, None))?)
         };
         if embed.rows() < c.vocab || embed.cols() != c.hidden {
             bail!(
@@ -112,7 +124,13 @@ impl Weights {
     }
 }
 
-fn load_layer(st: &SafeTensors, c: &Config, l: usize, format: Format) -> Result<LayerWeights> {
+fn load_layer(
+    st: &SafeTensors,
+    c: &Config,
+    l: usize,
+    format: Format,
+    imp: Option<&LayerImportance>,
+) -> Result<LayerWeights> {
     let n = |s: &str| format!("model.layers.{l}.{s}");
     let biases = ["q_proj", "k_proj", "v_proj"].map(|p| n(&format!("self_attn.{p}.bias")));
     let bqkv = if biases.iter().all(|b| st.contains(b)) {
@@ -124,7 +142,7 @@ fn load_layer(st: &SafeTensors, c: &Config, l: usize, format: Format) -> Result<
     } else {
         None
     };
-    let fmt = |name: &str| format.for_matrix(name);
+    let fmt = |name: &str| (format.for_matrix(name), imp.and_then(|i| i.get(name)));
     let layer = LayerWeights {
         attn_norm: vector(st, &n("input_layernorm.weight"))?,
         wqkv: matrix(
@@ -168,7 +186,11 @@ fn load_layer(st: &SafeTensors, c: &Config, l: usize, format: Format) -> Result<
 }
 
 /// Stacks the named 2-D tensors row-wise into one matrix.
-fn matrix(st: &SafeTensors, names: &[&str], format: Format) -> Result<Matrix> {
+fn matrix(
+    st: &SafeTensors,
+    names: &[&str],
+    (format, importance): (Format, Option<&[f32]>),
+) -> Result<Matrix> {
     let mut data = Vec::new();
     let (mut rows, mut cols) = (0, None);
     for name in names {
@@ -183,7 +205,13 @@ fn matrix(st: &SafeTensors, names: &[&str], format: Format) -> Result<Matrix> {
         rows += r;
         data.extend(t.to_f32());
     }
-    Ok(Matrix::from_f32(&data, rows, cols.unwrap_or(0), format))
+    Ok(Matrix::from_f32_weighted(
+        &data,
+        rows,
+        cols.unwrap_or(0),
+        format,
+        importance,
+    ))
 }
 
 fn optional(st: &SafeTensors, name: &str) -> Option<Vec<f32>> {
@@ -254,6 +282,9 @@ pub struct CpuBackend {
     k_cache: Vec<f32>,
     v_cache: Vec<f32>,
     s: Scratch,
+    /// When set, every forward pass adds its linear layers' squared inputs
+    /// here (see `imatrix.rs`).
+    pub calibration: Option<Importance>,
 }
 
 impl CpuBackend {
@@ -270,6 +301,7 @@ impl CpuBackend {
             pool,
             blocks,
             s: Scratch::default(),
+            calibration: None,
         }
     }
 }
@@ -349,6 +381,7 @@ impl Backend for CpuBackend {
             k_cache,
             v_cache,
             s,
+            calibration,
             ..
         } = self;
         let t = b.len();
@@ -358,6 +391,9 @@ impl Backend for CpuBackend {
         let qkv_dim = q_dim + 2 * kv_dim;
         let half = hd / 2;
         let layer_cache = self.blocks * BLOCK * kv_dim;
+        if let Some(cal) = calibration.as_mut() {
+            cal.tokens += t as u64;
+        }
 
         zeroed(&mut s.x, t * dim);
         zeroed(&mut s.xb, t * dim);
@@ -391,6 +427,9 @@ impl Backend for CpuBackend {
                     c.norm_eps,
                 );
             }
+            if let Some(cal) = calibration.as_mut() {
+                Importance::accumulate(&mut cal.layers[l].qkv, &s.xb);
+            }
             layer.wqkv.matmul(pool, &s.xb, t, &mut s.qkv);
             let (kc, vc) = (
                 &mut k_cache[l * layer_cache..(l + 1) * layer_cache],
@@ -418,6 +457,9 @@ impl Backend for CpuBackend {
                 vc[at..at + kv_dim].copy_from_slice(v);
             }
             attention(c, pool, kc, vc, b, &s.qkv, &mut s.att);
+            if let Some(cal) = calibration.as_mut() {
+                Importance::accumulate(&mut cal.layers[l].o, &s.att);
+            }
             layer.wo.matmul(pool, &s.att, t, &mut s.proj);
             s.x.iter_mut().zip(&s.proj).for_each(|(x, p)| *x += p);
 
@@ -430,6 +472,9 @@ impl Backend for CpuBackend {
                     c.norm_eps,
                 );
             }
+            if let Some(cal) = calibration.as_mut() {
+                Importance::accumulate(&mut cal.layers[l].gate_up, &s.xb);
+            }
             layer.w_gate_up.matmul(pool, &s.xb, t, &mut s.gate_up);
             for i in 0..t {
                 let (g, u) = s.gate_up[i * 2 * inter..(i + 1) * 2 * inter].split_at(inter);
@@ -439,6 +484,9 @@ impl Backend for CpuBackend {
                 {
                     *h = silu(g) * u;
                 }
+            }
+            if let Some(cal) = calibration.as_mut() {
+                Importance::accumulate(&mut cal.layers[l].down, &s.hidden);
             }
             layer.w_down.matmul(pool, &s.hidden, t, &mut s.proj);
             s.x.iter_mut().zip(&s.proj).for_each(|(x, p)| *x += p);

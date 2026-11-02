@@ -107,6 +107,39 @@ impl Matrix {
         }
     }
 
+    /// Like [`Matrix::from_f32`], but 4-bit rows are fitted using
+    /// `importance` (one value per column; see `imatrix.rs`).
+    pub fn from_f32_weighted(
+        data: &[f32],
+        rows: usize,
+        cols: usize,
+        format: Format,
+        importance: Option<&[f32]>,
+    ) -> Matrix {
+        let (Some(imp), Format::Q4 | Format::Q4M) = (importance, format) else {
+            return Matrix::from_f32(data, rows, cols, format);
+        };
+        if cols % QK != 0 || imp.len() != cols {
+            return Matrix::from_f32(data, rows, cols, format);
+        }
+        let nb = cols / QK;
+        let (mut scales, mut qs) = (vec![0.0; rows * nb], vec![0u8; rows * cols / 2]);
+        for r in 0..rows {
+            kernels::quantize_q4_weighted(
+                &data[r * cols..(r + 1) * cols],
+                imp,
+                &mut scales[r * nb..(r + 1) * nb],
+                &mut qs[r * cols / 2..(r + 1) * cols / 2],
+            );
+        }
+        Matrix::Q4 {
+            rows,
+            cols,
+            scales,
+            qs,
+        }
+    }
+
     pub fn rows(&self) -> usize {
         match *self {
             Matrix::Bf16 { rows, .. } | Matrix::Q8 { rows, .. } | Matrix::Q4 { rows, .. } => rows,

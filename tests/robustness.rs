@@ -253,3 +253,84 @@ fn safetensors_reader_rejects_corrupt_files() {
     }
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// A schema describing `v`'s exact shape.
+fn schema_of(v: &Json) -> Json {
+    let ty = |t: &str| Json::Obj(vec![("type".into(), Json::Str(t.into()))]);
+    match v {
+        Json::Null => ty("null"),
+        Json::Bool(_) => ty("boolean"),
+        Json::Num(n) if n.fract() == 0.0 => ty("integer"),
+        Json::Num(_) => ty("number"),
+        Json::Str(_) => ty("string"),
+        Json::Arr(items) => {
+            // Items share a schema only if every element has the same one.
+            let schemas: Vec<String> = items.iter().map(|i| schema_of(i).to_string()).collect();
+            let items = if schemas.windows(2).all(|w| w[0] == w[1]) {
+                items.first().map(schema_of).unwrap_or(Json::Obj(vec![]))
+            } else {
+                Json::Obj(vec![])
+            };
+            Json::Obj(vec![
+                ("type".into(), Json::Str("array".into())),
+                ("items".into(), items),
+            ])
+        }
+        Json::Obj(fields) => Json::Obj(vec![
+            ("type".into(), Json::Str("object".into())),
+            (
+                "properties".into(),
+                Json::Obj(
+                    fields
+                        .iter()
+                        .map(|(k, v)| (k.clone(), schema_of(v)))
+                        .collect(),
+                ),
+            ),
+        ]),
+    }
+}
+
+#[test]
+fn json_schema_matcher_accepts_its_instances_and_only_valid_json() {
+    use tachyon::schema::{JsonSchema, Schema};
+    let mut rng = Rng(0xC0FF_EE11);
+    for _ in 0..1500 {
+        let v = object(&mut rng, 3);
+        let m = JsonSchema::new(Schema::parse(&schema_of(&v)).unwrap());
+        let compact = v.to_string();
+        // Our strings contain no ',' or ':', so this only adds whitespace.
+        let spaced = compact.replace(',', ", ").replace(':', ": ");
+        for text in [&compact, &spaced] {
+            let mut c = m.clone();
+            assert!(c.accepts_bytes(text.as_bytes()), "rejected {text}");
+            c.advance(text.as_bytes());
+            assert!(c.is_complete(), "incomplete {text}");
+        }
+    }
+    // Anything an any-JSON schema calls complete must parse.
+    let any = JsonSchema::new(Schema::parse(&Json::parse("{}").unwrap()).unwrap());
+    for _ in 0..20000 {
+        let len = 1 + rng.below(30);
+        let bytes = noise(&mut rng, len);
+        let mut c = any.clone();
+        let mut accepted = 0;
+        for (i, &b) in bytes.iter().enumerate() {
+            if !c.accepts_bytes(&[b]) {
+                break;
+            }
+            c.advance(&[b]);
+            accepted = i + 1;
+            if c.is_complete() {
+                break;
+            }
+        }
+        if c.is_complete() {
+            let text = String::from_utf8_lossy(&bytes[..accepted]);
+            assert!(
+                Json::parse(&text).is_ok(),
+                "matcher accepted invalid JSON {text:?}"
+            );
+        }
+    }
+}

@@ -61,7 +61,7 @@ fn greedy_tokens(
         max_tokens: n,
         sampler: SamplerConfig::greedy(),
         stop_tokens: cfg.eos_ids,
-        json: false,
+        format: tachyon::constrain::OutputFormat::Text,
     };
     let mut text = String::new();
     let stats = generate(e, tok, &mut Vec::new(), prompt, &opts, &mut |p| {
@@ -138,7 +138,7 @@ fn reusing_the_kv_cache_changes_nothing() {
         max_tokens: 20,
         sampler: SamplerConfig::greedy(),
         stop_tokens: e.config().eos_ids.clone(),
-        json: false,
+        format: tachyon::constrain::OutputFormat::Text,
     };
     let p = prompt(&tok, "List three fruits.");
 
@@ -331,7 +331,7 @@ fn json_mode_always_parses() {
                 ..SamplerConfig::default()
             },
             stop_tokens: e.config().eos_ids.clone(),
-            json: true,
+            format: tachyon::constrain::OutputFormat::JsonObject,
         };
         let mut text = String::new();
         let stats = generate(
@@ -387,5 +387,131 @@ fn qwen3_runs_and_backends_agree() {
             let (_, on_gpu) = greedy_tokens(&mut Session::new(Box::new(g)), &tok, &p, 20);
             assert_eq!(on_gpu, on_cpu);
         }
+    }
+}
+
+#[test]
+fn json_schema_output_has_the_requested_shape() {
+    use tachyon::constrain::OutputFormat;
+    use tachyon::json::Json;
+    use tachyon::schema::{JsonSchema, Schema};
+    let Some((_g, dir)) = setup() else { return };
+    let tok = Tokenizer::load(&dir.join("tokenizer.json")).unwrap();
+    let mut e = cpu(&dir, Format::Q8);
+    let schema = Json::parse(
+        r#"{"type":"object","properties":{"city":{"type":"string"},"population":{"type":"integer"},"coastal":{"type":"boolean"},"landmarks":{"type":"array","items":{"type":"string"},"maxItems":2}}}"#,
+    )
+    .unwrap();
+    let format = OutputFormat::JsonSchema(JsonSchema::new(Schema::parse(&schema).unwrap()));
+    for seed in 1..=3 {
+        let opts = GenOptions {
+            max_tokens: 150,
+            sampler: SamplerConfig {
+                temperature: 1.0,
+                seed,
+                ..SamplerConfig::default()
+            },
+            stop_tokens: e.config().eos_ids.clone(),
+            format: format.clone(),
+        };
+        let mut text = String::new();
+        generate(
+            e.as_mut(),
+            &tok,
+            &mut Vec::new(),
+            &prompt(&tok, "Tell me about a city."),
+            &opts,
+            &mut |p| {
+                text.push_str(p);
+                true
+            },
+        )
+        .unwrap();
+        let v = Json::parse(&text).unwrap_or_else(|e| panic!("{e}: {text}"));
+        let keys: Vec<&str> = v
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            ["city", "population", "coastal", "landmarks"],
+            "{text}"
+        );
+        assert!(
+            v.get("population").unwrap().as_u64().is_some()
+                || v.get("population")
+                    .unwrap()
+                    .as_f64()
+                    .is_some_and(|n| n.fract() == 0.0)
+        );
+        assert!(v.get("coastal").unwrap().as_bool().is_some());
+        assert!(v.get("landmarks").unwrap().as_array().unwrap().len() <= 2);
+    }
+}
+
+/// A forced call: the reply opens with <tool_call> and the arguments are
+/// constrained to the function's schema, so they always fit it.
+#[test]
+fn forced_tool_calls_fit_the_function_schema() {
+    use tachyon::chat::parse_tool_calls;
+    use tachyon::constrain::OutputFormat;
+    use tachyon::json::Json;
+    use tachyon::schema::{JsonSchema, Schema};
+    let Some((_g, dir)) = setup() else { return };
+    let tok = Tokenizer::load(&dir.join("tokenizer.json")).unwrap();
+    let tpl = ChatTemplate::new(&tok).unwrap();
+    let mut e = cpu(&dir, Format::Q8);
+    let params = r#"{"type":"object","properties":{"city":{"type":"string"},"unit":{"enum":["celsius","fahrenheit"]}}}"#;
+    let tool = Json::parse(&format!(
+        r#"{{"type":"function","function":{{"name":"get_weather","parameters":{params}}}}}"#
+    ))
+    .unwrap();
+    let schema = Json::parse(&format!(r#"{{"type":"object","properties":{{"name":{{"const":"get_weather"}},"arguments":{params}}}}}"#)).unwrap();
+
+    let mut p = tpl.encode_with_tools(
+        &tok,
+        &[Message::new("user", "Is it cold in Helsinki?")],
+        Some(DEFAULT_SYSTEM),
+        &[tool],
+    );
+    assert!(
+        p.contains(&tok.added_token("<tool_call>").unwrap()),
+        "tool markup should use the added token"
+    );
+    p.extend(tok.encode("<tool_call>\n", true));
+    for seed in 1..=3 {
+        let opts = GenOptions {
+            max_tokens: 60,
+            sampler: SamplerConfig {
+                temperature: 1.0,
+                seed,
+                ..SamplerConfig::default()
+            },
+            stop_tokens: e.config().eos_ids.clone(),
+            format: OutputFormat::JsonSchema(JsonSchema::new(Schema::parse(&schema).unwrap())),
+        };
+        let mut text = String::new();
+        generate(e.as_mut(), &tok, &mut Vec::new(), &p, &opts, &mut |s| {
+            text.push_str(s);
+            true
+        })
+        .unwrap();
+        let (_, calls) = parse_tool_calls(&format!("<tool_call>{text}</tool_call>"));
+        assert_eq!(calls.len(), 1, "{text}");
+        assert_eq!(calls[0].name, "get_weather");
+        assert!(
+            calls[0]
+                .arguments
+                .get("city")
+                .and_then(Json::as_str)
+                .is_some(),
+            "{text}"
+        );
+        assert!(matches!(
+            calls[0].arguments.get("unit").and_then(Json::as_str),
+            Some("celsius" | "fahrenheit")
+        ));
     }
 }

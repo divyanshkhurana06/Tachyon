@@ -20,6 +20,7 @@ pub mod engine;
 pub mod generate;
 #[cfg(target_os = "macos")]
 pub mod gpu;
+pub mod imatrix;
 pub mod json;
 pub mod kernels;
 pub mod kv;
@@ -28,6 +29,7 @@ pub mod pool;
 pub mod safetensors;
 pub mod sampler;
 pub mod scheduler;
+pub mod schema;
 pub mod server;
 pub mod speculative;
 pub mod tokenizer;

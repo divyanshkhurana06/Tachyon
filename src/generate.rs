@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::constrain::{Constraint, JsonObject};
+use crate::constrain::{Constraint, OutputFormat};
 use crate::engine::Engine;
 use crate::sampler::{Sampler, SamplerConfig};
 use crate::tokenizer::{Tokenizer, Utf8Stream};
@@ -16,8 +16,8 @@ pub struct GenOptions {
     pub max_tokens: usize,
     pub sampler: SamplerConfig,
     pub stop_tokens: Vec<u32>,
-    /// Constrain the output to a JSON object.
-    pub json: bool,
+    /// Constrain the output's shape (JSON, a schema).
+    pub format: OutputFormat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,12 +103,14 @@ pub fn generate(
 
     let vocab = tok.len();
     let mut sampler = Sampler::new(opts.sampler.clone());
-    let mut constraint = opts.json.then(JsonObject::default);
-    let pick =
-        |sampler: &mut Sampler, logits: &[f32], recent: &[u32], c: &Option<JsonObject>| match c {
-            Some(c) => sampler.sample_with(logits, vocab, recent, &|t| c.allows(tok, t)),
-            None => sampler.sample(logits, vocab, recent),
-        };
+    let mut constraint = opts.format.constraint();
+    let pick = |sampler: &mut Sampler,
+                logits: &[f32],
+                recent: &[u32],
+                c: &Option<Box<dyn Constraint>>| match c {
+        Some(c) => sampler.sample_with(logits, vocab, recent, &|t| c.allows(tok, t)),
+        None => sampler.sample(logits, vocab, recent),
+    };
     let started = Instant::now();
     let pending = &prompt[reuse..];
     let chunks = pending.chunks(PREFILL_CHUNK).count();
