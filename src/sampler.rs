@@ -261,7 +261,7 @@ impl Sampler {
 /// The `n` largest values of `x` with their indices, largest first, in one
 /// pass: a value is only inserted if it beats the current n-th best, which
 /// after the first few thousand elements almost never happens.
-fn top_n(x: &[f32], n: usize, out: &mut Vec<(f32, u32)>) {
+pub fn top_n(x: &[f32], n: usize, out: &mut Vec<(f32, u32)>) {
     out.clear();
     if n == 0 {
         return;
@@ -278,6 +278,33 @@ fn top_n(x: &[f32], n: usize, out: &mut Vec<(f32, u32)>) {
                 floor = out[n - 1].0;
             }
         }
+    }
+}
+
+/// A token's log-probability under the model, and the `n` most likely
+/// alternatives', from raw logits (before temperature or penalties, as
+/// OpenAI reports them).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokenLogprob {
+    pub token: u32,
+    pub logprob: f32,
+    pub top: Vec<(u32, f32)>,
+}
+
+pub fn logprobs(logits: &[f32], token: u32, n: usize) -> TokenLogprob {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let lse = max
+        + logits
+            .iter()
+            .map(|&l| ((l - max) as f64).exp())
+            .sum::<f64>()
+            .ln() as f32;
+    let mut best = Vec::new();
+    top_n(logits, n, &mut best);
+    TokenLogprob {
+        token,
+        logprob: logits[token as usize] - lse,
+        top: best.into_iter().map(|(l, t)| (t, l - lse)).collect(),
     }
 }
 
@@ -345,6 +372,14 @@ mod tests {
             out.iter().map(|p| p.0).collect::<Vec<_>>(),
             sorted[..37].iter().map(|p| p.0).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn logprobs_are_log_softmax() {
+        let lp = logprobs(&[1.0, 2.0, 3.0], 1, 2);
+        let z = (1f32.exp() + 2f32.exp() + 3f32.exp()).ln();
+        assert!((lp.logprob - (2.0 - z)).abs() < 1e-5);
+        assert_eq!(lp.top.iter().map(|t| t.0).collect::<Vec<_>>(), [2, 1]);
     }
 
     #[test]

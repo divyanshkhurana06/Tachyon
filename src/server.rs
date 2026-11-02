@@ -26,6 +26,7 @@ use crate::constrain::OutputFormat;
 use crate::generate::Finish;
 use crate::json::{obj, Json};
 use crate::sampler::SamplerConfig;
+use crate::sampler::TokenLogprob;
 use crate::scheduler::{Event, Request, Scheduler, Summary};
 use crate::schema::{JsonSchema, Schema};
 use crate::tokenizer::Tokenizer;
@@ -240,6 +241,8 @@ struct ChatRequest {
     stop: Vec<String>,
     format: OutputFormat,
     ignore_eos: bool,
+    /// `logprobs`: report each token's log-probability and this many alternatives.
+    logprobs: Option<usize>,
     /// Qwen3's `enable_thinking` (top level, or in `chat_template_kwargs`
     /// as vLLM takes it).
     thinking: bool,
@@ -294,6 +297,50 @@ fn call_schema(tools: &[Json], choice: &ToolChoice) -> std::result::Result<Schem
         ),
     ]);
     Schema::parse(&schema).map_err(|e| format!("bad tool parameters: {e}"))
+}
+
+/// One `logprobs.content` entry, as OpenAI shapes it.
+fn logprob_json(tok: &Tokenizer, lp: &TokenLogprob) -> Json {
+    let entry = |t: u32, logprob: f32| {
+        let bytes = tok.token_bytes(t);
+        vec![
+            (
+                "token".to_string(),
+                Json::from(String::from_utf8_lossy(bytes).into_owned()),
+            ),
+            ("logprob".to_string(), Json::Num(logprob as f64)),
+            (
+                "bytes".to_string(),
+                Json::Arr(bytes.iter().map(|&b| Json::from(b as usize)).collect()),
+            ),
+        ]
+    };
+    let mut fields = entry(lp.token, lp.logprob);
+    fields.push((
+        "top_logprobs".to_string(),
+        Json::Arr(
+            lp.top
+                .iter()
+                .map(|&(t, l)| Json::Obj(entry(t, l)))
+                .collect(),
+        ),
+    ));
+    Json::Obj(fields)
+}
+
+/// Adds `logprobs: {"content": entries}` to a chunk's choice, when asked for.
+fn with_logprobs(mut chunk: Json, entries: Option<&[Json]>) -> Json {
+    if let (Some(entries), Json::Obj(fields)) = (entries, &mut chunk) {
+        if let Some((_, Json::Arr(choices))) = fields.iter_mut().find(|(k, _)| k == "choices") {
+            if let Some(Json::Obj(choice)) = choices.first_mut() {
+                choice.push((
+                    "logprobs".to_string(),
+                    obj([("content", Json::Arr(entries.to_vec()))]),
+                ));
+            }
+        }
+    }
+    chunk
 }
 
 fn tool_call_json(c: &ToolCall, index: Option<usize>) -> Json {
@@ -460,6 +507,16 @@ fn parse_chat(body: &[u8], defaults: &SamplerConfig) -> std::result::Result<Chat
             .unwrap_or(true),
         tools,
         tool_choice,
+        logprobs: j
+            .get("logprobs")
+            .and_then(Json::as_bool)
+            .unwrap_or(false)
+            .then(|| {
+                j.get("top_logprobs")
+                    .and_then(Json::as_usize)
+                    .unwrap_or(0)
+                    .min(20)
+            }),
     })
 }
 
@@ -563,6 +620,7 @@ fn chat_completion(conn: &mut TcpStream, server: &Server, body: &[u8]) -> io::Re
         constraint: format.constraint(),
         events: tx,
         cancel: cancel.clone(),
+        logprobs: req.logprobs,
     });
 
     let created = SystemTime::now()
@@ -609,6 +667,8 @@ fn chat_completion(conn: &mut TcpStream, server: &Server, body: &[u8]) -> io::Re
     let tools_on = !shown.is_empty();
     let mut held: Option<String> = (tools_on || forced).then(String::new);
     let mut sent = 0; // bytes of `text` already streamed
+    let mut lps: Vec<Json> = Vec::new();
+    let mut lps_sent = 0;
     let summary: Summary = loop {
         match rx.recv() {
             Ok(Event::Text(piece)) if !hit_stop => {
@@ -634,17 +694,21 @@ fn chat_completion(conn: &mut TcpStream, server: &Server, body: &[u8]) -> io::Re
                     piece = held.take().unwrap();
                 }
                 if req.stream {
-                    send(
-                        conn,
-                        &format!(
-                            "data: {}\n\n",
-                            chunk(obj([("content", piece.into())]), None)
-                        ),
-                    )?;
+                    let c = with_logprobs(
+                        chunk(obj([("content", piece.into())]), None),
+                        req.logprobs.map(|_| &lps[lps_sent..]),
+                    );
+                    lps_sent = lps.len();
+                    send(conn, &format!("data: {c}\n\n"))?;
                     sent = text.len();
                 }
             }
             Ok(Event::Text(_)) => {}
+            Ok(Event::Logprob(lp)) => {
+                if !hit_stop {
+                    lps.push(logprob_json(&server.tok, &lp));
+                }
+            }
             Ok(Event::Done(s)) => break s,
             Ok(Event::Error(e)) if req.stream => {
                 return send(conn, &format!("data: {}\n\n", obj([("error", e.into())])))
@@ -678,14 +742,12 @@ fn chat_completion(conn: &mut TcpStream, server: &Server, body: &[u8]) -> io::Re
         } else {
             String::new()
         };
-        if !unsent.is_empty() {
-            send(
-                conn,
-                &format!(
-                    "data: {}\n\n",
-                    chunk(obj([("content", unsent.into())]), None)
-                ),
-            )?;
+        if !unsent.is_empty() || (req.logprobs.is_some() && lps_sent < lps.len()) {
+            let c = with_logprobs(
+                chunk(obj([("content", unsent.into())]), None),
+                req.logprobs.map(|_| &lps[lps_sent..]),
+            );
+            send(conn, &format!("data: {c}\n\n"))?;
         }
         if !calls.is_empty() {
             let deltas = calls
@@ -765,6 +827,14 @@ fn chat_completion(conn: &mut TcpStream, server: &Server, body: &[u8]) -> io::Re
                     ("index", 0usize.into()),
                     ("message", message),
                     ("finish_reason", finish.into()),
+                    (
+                        "logprobs",
+                        if req.logprobs.is_some() {
+                            obj([("content", Json::Arr(lps))])
+                        } else {
+                            Json::Null
+                        },
+                    ),
                 ])]),
             ),
             ("usage", usage),

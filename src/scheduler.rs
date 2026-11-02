@@ -28,7 +28,7 @@ use crate::constrain::Constraint;
 use crate::engine::Backend;
 use crate::generate::Finish;
 use crate::kv::{Batch, BlockPool, Logits, Seq};
-use crate::sampler::{Sampler, SamplerConfig};
+use crate::sampler::{Sampler, SamplerConfig, TokenLogprob};
 use crate::tokenizer::{Tokenizer, Utf8Stream};
 
 /// Threads used to sample a big batch's next tokens.
@@ -44,6 +44,8 @@ pub struct Request {
     pub events: Sender<Event>,
     /// Set by the caller to abandon the request (e.g. the client hung up).
     pub cancel: Arc<AtomicBool>,
+    /// Report each token's log-probability and this many alternatives.
+    pub logprobs: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +65,9 @@ pub struct Summary {
 
 #[derive(Debug)]
 pub enum Event {
+    /// The log-probability of the next generated token (only when the
+    /// request asked), sent just before that token's text.
+    Logprob(TokenLogprob),
     Text(String),
     Done(Summary),
     Error(String),
@@ -134,6 +139,7 @@ struct Sequence {
     batch_steps: usize,
     /// The token just sampled, before it is checked and appended.
     picked: u32,
+    picked_logprob: Option<TokenLogprob>,
 }
 
 impl Sequence {
@@ -236,6 +242,7 @@ impl Worker {
             batch_sum: 0,
             batch_steps: 0,
             picked: 0,
+            picked_logprob: None,
         });
     }
 
@@ -383,6 +390,10 @@ impl Worker {
                     .sample_with(logits, usable, recent, &|t| c.allows(tok, t)),
                 None => s.sampler.sample(logits, usable, recent),
             };
+            s.picked_logprob = s
+                .req
+                .logprobs
+                .map(|n| crate::sampler::logprobs(logits, s.picked, n));
         };
         let threads = work.len().div_ceil(4).min(SAMPLE_THREADS);
         if threads <= 1 {
@@ -410,6 +421,12 @@ impl Worker {
                 continue;
             }
             s.tokens.push(next);
+            if let Some(lp) = s.picked_logprob.take() {
+                if !s.send(Event::Logprob(lp)) {
+                    finished.push((idx, Finish::Cancelled));
+                    continue;
+                }
+            }
             if let Some(c) = &mut s.req.constraint {
                 c.advance(self.tok.token_bytes(next));
             }
