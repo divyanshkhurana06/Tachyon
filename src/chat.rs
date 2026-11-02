@@ -81,22 +81,28 @@ pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
         .to_string();
     for (i, block) in text.split("<tool_call>").skip(1).enumerate() {
         let body = block.split("</tool_call>").next().unwrap_or("").trim();
-        let Ok(v) = Json::parse(body) else { continue };
-        let Some(name) = v.get("name").and_then(Json::as_str) else {
-            continue;
-        };
-        let arguments = match v.get("arguments") {
-            Some(Json::Str(s)) => Json::parse(s).unwrap_or(Json::Obj(Vec::new())),
-            Some(a) => a.clone(),
-            None => Json::Obj(Vec::new()),
-        };
-        calls.push(ToolCall {
-            id: format!("call_{i}"),
-            name: name.to_string(),
-            arguments,
-        });
+        if let Some(call) = Json::parse(body).ok().and_then(|v| call_from_json(&v, i)) {
+            calls.push(call);
+        }
     }
     (content, calls)
+}
+
+/// `{"name": .., "arguments" or "parameters": ..}` as a call; arguments may
+/// also come as a JSON string.
+fn call_from_json(v: &Json, i: usize) -> Option<ToolCall> {
+    let name = v.get("name")?.as_str()?;
+    let arguments = match v.get("arguments").or(v.get("parameters")) {
+        Some(Json::Str(s)) => Json::parse(s).unwrap_or(Json::Obj(Vec::new())),
+        Some(a @ Json::Obj(_)) => a.clone(),
+        Some(_) => return None,
+        None => Json::Obj(Vec::new()),
+    };
+    Some(ToolCall {
+        id: format!("call_{i}"),
+        name: name.to_string(),
+        arguments,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -157,9 +163,48 @@ impl ChatTemplate {
         self.end
     }
 
-    /// Whether this format has Qwen-style `<tool_call>` tool calling.
-    pub fn supports_tools(&self) -> bool {
-        self.style == Style::ChatMl
+    /// What a reply that calls a tool starts with: Qwen's `<tool_call>`
+    /// block, or the bare JSON object Llama 3 answers with.
+    pub fn call_opener(&self) -> &'static str {
+        match self.style {
+            Style::ChatMl => "<tool_call>",
+            Style::Llama3 => "{",
+        }
+    }
+
+    /// The key a call's arguments go under.
+    pub fn arguments_key(&self) -> &'static str {
+        match self.style {
+            Style::ChatMl => "arguments",
+            Style::Llama3 => "parameters",
+        }
+    }
+
+    /// Starts a reply that must be a call; the rest is constrained to the
+    /// call's JSON.
+    pub fn open_call(&self, tok: &Tokenizer, out: &mut Vec<u32>) {
+        if self.style == Style::ChatMl {
+            out.extend(tok.encode("<tool_call>\n", true));
+        }
+    }
+
+    /// A reply's text and the tool calls in it. `opened`: the reply began
+    /// inside a call that `open_call` started.
+    pub fn parse_calls(&self, text: &str, opened: bool) -> (String, Vec<ToolCall>) {
+        match self.style {
+            Style::ChatMl if opened => (
+                String::new(),
+                parse_tool_calls(&format!("<tool_call>{text}</tool_call>")).1,
+            ),
+            Style::ChatMl => parse_tool_calls(text),
+            Style::Llama3 => match Json::parse(text.trim())
+                .ok()
+                .and_then(|v| call_from_json(&v, 0))
+            {
+                Some(call) => (String::new(), vec![call]),
+                None => (text.to_string(), Vec::new()),
+            },
+        }
     }
 
     /// A whole conversation, ending with an open assistant turn.
@@ -233,13 +278,15 @@ impl ChatTemplate {
         system: Option<&str>,
         tools: &[Json],
     ) -> Vec<u32> {
-        if !self.supports_tools()
-            || tools.is_empty()
-                && messages
-                    .iter()
-                    .all(|m| m.tool_calls.is_empty() && m.role != "tool")
+        if tools.is_empty()
+            && messages
+                .iter()
+                .all(|m| m.tool_calls.is_empty() && m.role != "tool")
         {
             return self.encode(tok, messages, system);
+        }
+        if self.style == Style::Llama3 {
+            return self.encode_llama_tools(tok, messages, system, tools);
         }
         let mut out = Vec::new();
         let (first_system, rest) = match messages.first() {
@@ -303,6 +350,78 @@ impl ChatTemplate {
                 role => self.push(tok, &mut out, role, &m.content),
             }
             i += 1;
+        }
+        self.open_assistant(tok, &mut out);
+        out
+    }
+
+    /// Tools as Llama 3.2's template renders them: an `ipython` environment
+    /// line in the system turn, the tool definitions (as indented JSON) at
+    /// the top of the first user turn, a call as the assistant's whole reply
+    /// (`{"name": .., "parameters": ..}`, one per turn), and results in
+    /// `ipython` turns, JSON-quoted as its template quotes them.
+    fn encode_llama_tools(
+        &self,
+        tok: &Tokenizer,
+        messages: &[Message],
+        system: Option<&str>,
+        tools: &[Json],
+    ) -> Vec<u32> {
+        let text = |out: &mut Vec<u32>, text: &str| out.extend(tok.encode(text, false));
+        let (system, mut rest) = match messages.first() {
+            Some(m) if m.role == "system" => (Some(m.content.as_str()), &messages[1..]),
+            _ => (system, messages),
+        };
+        let mut out = Vec::new();
+        out.extend(self.bos);
+        self.header(tok, &mut out, "system");
+        let env = if tools.is_empty() {
+            ""
+        } else {
+            "Environment: ipython\n"
+        };
+        text(
+            &mut out,
+            &format!(
+                "\n\n{env}Cutting Knowledge Date: December 2023\nToday Date: {}\n\n{}",
+                date(today()),
+                system.unwrap_or("").trim()
+            ),
+        );
+        self.close_turn(&mut out);
+        if let (false, Some(first)) = (tools.is_empty(), rest.first()) {
+            self.header(tok, &mut out, "user");
+            let mut intro = String::from(
+                "\n\nGiven the following functions, please respond with a JSON for a function call with its proper arguments that best answers the given prompt.\n\nRespond in the format {\"name\": function name, \"parameters\": dictionary of argument name and its value}.Do not use variables.\n\n",
+            );
+            for t in tools {
+                intro.push_str(&t.to_indented_string(4));
+                intro.push_str("\n\n");
+            }
+            intro.push_str(first.content.trim());
+            text(&mut out, &intro);
+            self.close_turn(&mut out);
+            rest = &rest[1..];
+        }
+        for m in rest {
+            match (m.role.as_str(), m.tool_calls.first()) {
+                (_, Some(c)) => {
+                    self.header(tok, &mut out, "assistant");
+                    let call = format!(
+                        "\n\n{{\"name\": {}, \"parameters\": {}}}",
+                        Json::Str(c.name.clone()),
+                        c.arguments.to_spaced_string()
+                    );
+                    text(&mut out, &call);
+                    self.close_turn(&mut out);
+                }
+                ("tool" | "ipython", None) => {
+                    self.header(tok, &mut out, "ipython");
+                    text(&mut out, &format!("\n\n{}", Json::Str(m.content.clone())));
+                    self.close_turn(&mut out);
+                }
+                (role, None) => self.push(tok, &mut out, role, &m.content),
+            }
         }
         self.open_assistant(tok, &mut out);
         out

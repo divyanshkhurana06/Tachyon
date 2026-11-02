@@ -121,6 +121,50 @@ impl Json {
             other => out.push_str(&other.to_string()),
         }
     }
+
+    /// Serialized as Python's `json.dumps(v, indent=indent)` writes it: one
+    /// element per line, nested levels indented (Llama 3 shows tools so).
+    pub fn to_indented_string(&self, indent: usize) -> String {
+        let mut out = String::new();
+        self.write_indented(&mut out, indent, 0);
+        out
+    }
+
+    fn write_indented(&self, out: &mut String, indent: usize, level: usize) {
+        let pad = |out: &mut String, level: usize| {
+            out.push('\n');
+            out.extend(std::iter::repeat_n(' ', indent * level));
+        };
+        match self {
+            Json::Arr(a) if !a.is_empty() => {
+                out.push('[');
+                for (i, v) in a.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    pad(out, level + 1);
+                    v.write_indented(out, indent, level + 1);
+                }
+                pad(out, level);
+                out.push(']');
+            }
+            Json::Obj(m) if !m.is_empty() => {
+                out.push('{');
+                for (i, (k, v)) in m.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    pad(out, level + 1);
+                    let _ = write_escaped(out, k);
+                    out.push_str(": ");
+                    v.write_indented(out, indent, level + 1);
+                }
+                pad(out, level);
+                out.push('}');
+            }
+            other => out.push_str(&other.to_string()),
+        }
+    }
 }
 
 /// Builds an object: `obj([("id", "x".into()), ("n", 3.into())])`.
@@ -422,6 +466,15 @@ mod tests {
         assert_eq!(
             v.to_spaced_string(),
             r#"{"a": [1, "x", {"b": null}], "c": true}"#
+        );
+    }
+
+    #[test]
+    fn indented_matches_python_json_dumps() {
+        let v = Json::parse(r#"{"a":{"b":[1,"x"],"c":{},"d":[]},"e":null}"#).unwrap();
+        assert_eq!(
+            v.to_indented_string(4),
+            "{\n    \"a\": {\n        \"b\": [\n            1,\n            \"x\"\n        ],\n        \"c\": {},\n        \"d\": []\n    },\n    \"e\": null\n}"
         );
     }
 
