@@ -1,7 +1,7 @@
 //! Weight matrices in each storage format, and the parallel matrix multiply
 //! over them.
 
-use crate::kernels::{self, dot_bf16, dot_q4, dot_q8, f32_to_bf16, QK};
+use crate::kernels::{self, dot_bf16, dot_q4, dot_q4_x4, dot_q8, dot_q8_x4, f32_to_bf16, QK};
 use crate::pool::{Pool, SyncPtr};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,18 +218,28 @@ impl Matrix {
             Matrix::Q8 { scales, qs, .. } => {
                 let (xs, xq) = quantize_input(x, t, cols);
                 let nb = cols / QK;
+                let tok = |i: usize| (&xs[i * nb..(i + 1) * nb], &xq[i * cols..(i + 1) * cols]);
                 pool.parallel_for(rows, grain, |range| {
                     for r in range {
                         let (ws, wq) =
                             (&scales[r * nb..(r + 1) * nb], &qs[r * cols..(r + 1) * cols]);
-                        for i in 0..t {
-                            let y = dot_q8(
+                        // Four tokens at a time share each weight block load.
+                        let mut i = 0;
+                        while i + 4 <= t {
+                            let ys = dot_q8_x4(
                                 ws,
                                 wq,
-                                &xs[i * nb..(i + 1) * nb],
-                                &xq[i * cols..(i + 1) * cols],
+                                [0, 1, 2, 3].map(|j| tok(i + j).0),
+                                [0, 1, 2, 3].map(|j| tok(i + j).1),
                             );
-                            unsafe { out.write(i * rows + r, y) };
+                            for (j, y) in ys.into_iter().enumerate() {
+                                unsafe { out.write((i + j) * rows + r, y) };
+                            }
+                            i += 4;
+                        }
+                        for i in i..t {
+                            let (s, q) = tok(i);
+                            unsafe { out.write(i * rows + r, dot_q8(ws, wq, s, q)) };
                         }
                     }
                 })
@@ -237,20 +247,29 @@ impl Matrix {
             Matrix::Q4 { scales, qs, .. } => {
                 let (xs, xq) = quantize_input(x, t, cols);
                 let nb = cols / QK;
+                let tok = |i: usize| (&xs[i * nb..(i + 1) * nb], &xq[i * cols..(i + 1) * cols]);
                 pool.parallel_for(rows, grain, |range| {
                     for r in range {
                         let (ws, wq) = (
                             &scales[r * nb..(r + 1) * nb],
                             &qs[r * cols / 2..(r + 1) * cols / 2],
                         );
-                        for i in 0..t {
-                            let y = dot_q4(
+                        let mut i = 0;
+                        while i + 4 <= t {
+                            let ys = dot_q4_x4(
                                 ws,
                                 wq,
-                                &xs[i * nb..(i + 1) * nb],
-                                &xq[i * cols..(i + 1) * cols],
+                                [0, 1, 2, 3].map(|j| tok(i + j).0),
+                                [0, 1, 2, 3].map(|j| tok(i + j).1),
                             );
-                            unsafe { out.write(i * rows + r, y) };
+                            for (j, y) in ys.into_iter().enumerate() {
+                                unsafe { out.write((i + j) * rows + r, y) };
+                            }
+                            i += 4;
+                        }
+                        for i in i..t {
+                            let (s, q) = tok(i);
+                            unsafe { out.write(i * rows + r, dot_q4(ws, wq, s, q)) };
                         }
                     }
                 })
