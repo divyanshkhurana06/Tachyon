@@ -436,9 +436,7 @@ fn chat(a: &Args) -> Result<()> {
     // finds everything but the new user message already in the KV cache.
     let system = a.system.as_deref().or(default_system(&m.cfg.model_type));
     let mut convo = Vec::new();
-    if let Some(system) = system {
-        tpl.push(&m.tok, &mut convo, "system", system);
-    }
+    tpl.begin(&m.tok, &mut convo, system);
     let mut cache = Vec::new();
     eprintln!("chat with the model; /reset clears the conversation, Ctrl-D quits\n");
 
@@ -455,9 +453,7 @@ fn chat(a: &Args) -> Result<()> {
         }
         if line == "/reset" {
             convo.truncate(0);
-            if let Some(system) = system {
-                tpl.push(&m.tok, &mut convo, "system", system);
-            }
+            tpl.begin(&m.tok, &mut convo, system);
             eprintln!("(conversation cleared)");
             continue;
         }

@@ -17,9 +17,42 @@ pub struct Config {
     pub vocab: usize,
     pub max_positions: usize,
     pub rope_theta: f64,
+    /// Llama 3's stretch of the low RoPE frequencies for long context.
+    pub rope_scaling: Option<RopeScaling>,
     pub norm_eps: f32,
     pub tied_embeddings: bool,
     pub eos_ids: Vec<u32>,
+}
+
+/// Llama 3.1+ RoPE scaling: wavelengths shorter than the original context
+/// over `high_freq_factor` keep their frequency, those longer than it over
+/// `low_freq_factor` are slowed by `factor`, and the band between blends
+/// the two.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RopeScaling {
+    pub factor: f64,
+    pub low_freq_factor: f64,
+    pub high_freq_factor: f64,
+    pub original_max_positions: f64,
+}
+
+impl RopeScaling {
+    pub fn apply(&self, freq: f64) -> f64 {
+        let wavelen = 2.0 * std::f64::consts::PI / freq;
+        let (low, high) = (
+            self.original_max_positions / self.low_freq_factor,
+            self.original_max_positions / self.high_freq_factor,
+        );
+        if wavelen < high {
+            freq
+        } else if wavelen > low {
+            freq / self.factor
+        } else {
+            let smooth = (self.original_max_positions / wavelen - self.low_freq_factor)
+                / (self.high_freq_factor - self.low_freq_factor);
+            (1.0 - smooth) * freq / self.factor + smooth * freq
+        }
+    }
 }
 
 impl Config {
@@ -44,9 +77,23 @@ impl Config {
                 "model_type {model_type:?} is not supported (qwen2, qwen3, llama and mistral are)"
             );
         }
-        if !matches!(j.get("rope_scaling"), None | Some(Json::Null)) {
-            bail!("rope_scaling is not supported yet");
-        }
+        let rope_scaling = match j.get("rope_scaling") {
+            None | Some(Json::Null) => None,
+            Some(r) if r.get("rope_type").and_then(Json::as_str) == Some("llama3") => {
+                let f = |k: &str| {
+                    r.get(k)
+                        .and_then(Json::as_f64)
+                        .ok_or_else(|| Error(format!("config.json: rope_scaling lacks {k}")))
+                };
+                Some(RopeScaling {
+                    factor: f("factor")?,
+                    low_freq_factor: f("low_freq_factor")?,
+                    high_freq_factor: f("high_freq_factor")?,
+                    original_max_positions: f("original_max_position_embeddings")?,
+                })
+            }
+            Some(_) => bail!("only Llama 3's rope_scaling is supported"),
+        };
         if j.get("hidden_act")
             .and_then(Json::as_str)
             .is_some_and(|a| a != "silu")
@@ -98,6 +145,7 @@ impl Config {
                 .get("rope_theta")
                 .and_then(Json::as_f64)
                 .unwrap_or(10_000.0),
+            rope_scaling,
             norm_eps: j.get("rms_norm_eps").and_then(Json::as_f64).unwrap_or(1e-6) as f32,
             tied_embeddings: j
                 .get("tie_word_embeddings")

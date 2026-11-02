@@ -1,4 +1,4 @@
-//! ChatML, the prompt format Qwen2.5 was trained on:
+//! Chat prompt formats. ChatML, which Qwen was trained on:
 //!
 //! ```text
 //! <|im_start|>system
@@ -8,8 +8,24 @@
 //! <|im_start|>assistant
 //! ```
 //!
+//! and Llama 3's, whose system turn always carries the date:
+//!
+//! ```text
+//! <|begin_of_text|><|start_header_id|>system<|end_header_id|>
+//!
+//! Cutting Knowledge Date: December 2023
+//! Today Date: 26 Jul 2024
+//!
+//! <|eot_id|><|start_header_id|>user<|end_header_id|>
+//!
+//! Hi!<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+//!
+//! ```
+//!
 //! Control tokens are inserted by id; message text is encoded with added
 //! tokens disabled, so a user typing `<|im_start|>` cannot forge a turn.
+
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::json::Json;
 use crate::tokenizer::Tokenizer;
@@ -83,47 +99,125 @@ pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
     (content, calls)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Style {
+    ChatMl,
+    Llama3,
+}
+
 pub struct ChatTemplate {
-    im_start: u32,
-    im_end: u32,
-    newline: Vec<u32>,
+    style: Style,
+    /// `<|im_start|>`, or Llama 3's `<|start_header_id|>`.
+    start: u32,
+    /// Llama 3's `<|end_header_id|>` after the role.
+    end_header: u32,
+    /// `<|im_end|>`, or Llama 3's `<|eot_id|>`.
+    end: u32,
+    /// What follows `end`: a newline in ChatML.
+    after_end: Vec<u32>,
+    /// Llama 3's `<|begin_of_text|>`.
+    bos: Option<u32>,
 }
 
 impl ChatTemplate {
+    /// The format the tokenizer's control tokens belong to.
     pub fn new(tok: &Tokenizer) -> Result<ChatTemplate> {
-        let find = |s: &str| {
-            tok.added_token(s)
-                .ok_or_else(|| Error(format!("tokenizer has no {s}; use --raw")))
-        };
-        Ok(ChatTemplate {
-            im_start: find("<|im_start|>")?,
-            im_end: find("<|im_end|>")?,
-            newline: tok.encode("\n", false),
-        })
+        let id = |s: &str| tok.added_token(s);
+        if let (Some(start), Some(end)) = (id("<|im_start|>"), id("<|im_end|>")) {
+            return Ok(ChatTemplate {
+                style: Style::ChatMl,
+                start,
+                end_header: start,
+                end,
+                after_end: tok.encode("\n", false),
+                bos: None,
+            });
+        }
+        if let (Some(start), Some(end_header), Some(end)) = (
+            id("<|start_header_id|>"),
+            id("<|end_header_id|>"),
+            id("<|eot_id|>"),
+        ) {
+            return Ok(ChatTemplate {
+                style: Style::Llama3,
+                start,
+                end_header,
+                end,
+                after_end: Vec::new(),
+                bos: id("<|begin_of_text|>"),
+            });
+        }
+        Err(Error::msg(
+            "the tokenizer has no ChatML or Llama 3 chat tokens; use --raw",
+        ))
     }
 
-    pub fn im_end(&self) -> u32 {
-        self.im_end
+    /// The token that ends a turn.
+    pub fn end_of_turn(&self) -> u32 {
+        self.end
+    }
+
+    /// Whether this format has Qwen-style `<tool_call>` tool calling.
+    pub fn supports_tools(&self) -> bool {
+        self.style == Style::ChatMl
     }
 
     /// A whole conversation, ending with an open assistant turn.
     pub fn encode(&self, tok: &Tokenizer, messages: &[Message], system: Option<&str>) -> Vec<u32> {
+        let (system, rest) = match messages.first() {
+            Some(m) if m.role == "system" => (Some(m.content.as_str()), &messages[1..]),
+            _ => (system, messages),
+        };
         let mut out = Vec::new();
-        if let Some(system) = system.filter(|_| messages.first().is_none_or(|m| m.role != "system"))
-        {
-            self.push(tok, &mut out, "system", system);
-        }
-        for m in messages {
+        self.begin(tok, &mut out, system);
+        for m in rest {
             self.push(tok, &mut out, &m.role, &m.content);
         }
         self.open_assistant(tok, &mut out);
         out
     }
 
+    /// What a conversation starts with: the system turn, if any (Llama 3's
+    /// always has one, with the date).
+    pub fn begin(&self, tok: &Tokenizer, out: &mut Vec<u32>, system: Option<&str>) {
+        match self.style {
+            Style::ChatMl => {
+                if let Some(system) = system {
+                    self.push(tok, out, "system", system);
+                }
+            }
+            Style::Llama3 => {
+                out.extend(self.bos);
+                self.header(tok, out, "system");
+                let text = format!(
+                    "\n\nCutting Knowledge Date: December 2023\nToday Date: {}\n\n{}",
+                    date(today()),
+                    system.unwrap_or("").trim()
+                );
+                out.extend(tok.encode(&text, false));
+                self.close_turn(out);
+            }
+        }
+    }
+
     pub fn push(&self, tok: &Tokenizer, out: &mut Vec<u32>, role: &str, content: &str) {
-        out.push(self.im_start);
-        out.extend(tok.encode(&format!("{role}\n{content}"), false));
+        match self.style {
+            Style::ChatMl => {
+                out.push(self.start);
+                out.extend(tok.encode(&format!("{role}\n{content}"), false));
+            }
+            Style::Llama3 => {
+                self.header(tok, out, role);
+                out.extend(tok.encode(&format!("\n\n{}", content.trim()), false));
+            }
+        }
         self.close_turn(out);
+    }
+
+    fn header(&self, tok: &Tokenizer, out: &mut Vec<u32>, role: &str) {
+        out.push(self.start);
+        out.extend(tok.encode(role, false));
+        out.push(self.end_header);
     }
 
     /// A conversation with tools available, as Qwen's templates render it:
@@ -139,10 +233,11 @@ impl ChatTemplate {
         system: Option<&str>,
         tools: &[Json],
     ) -> Vec<u32> {
-        if tools.is_empty()
-            && messages
-                .iter()
-                .all(|m| m.tool_calls.is_empty() && m.role != "tool")
+        if !self.supports_tools()
+            || tools.is_empty()
+                && messages
+                    .iter()
+                    .all(|m| m.tool_calls.is_empty() && m.role != "tool")
         {
             return self.encode(tok, messages, system);
         }
@@ -154,7 +249,7 @@ impl ChatTemplate {
         let markup = |out: &mut Vec<u32>, text: &str| out.extend(tok.encode(text, true));
         let text = |out: &mut Vec<u32>, text: &str| out.extend(tok.encode(text, false));
 
-        out.push(self.im_start);
+        out.push(self.start);
         text(&mut out, "system\n");
         if let Some(s) = first_system {
             text(&mut out, s);
@@ -176,7 +271,7 @@ impl ChatTemplate {
             let m = &rest[i];
             match m.role.as_str() {
                 "assistant" if !m.tool_calls.is_empty() => {
-                    out.push(self.im_start);
+                    out.push(self.start);
                     text(&mut out, "assistant");
                     if !m.content.is_empty() {
                         text(&mut out, &format!("\n{}", m.content));
@@ -194,7 +289,7 @@ impl ChatTemplate {
                     self.close_turn(&mut out);
                 }
                 "tool" => {
-                    out.push(self.im_start);
+                    out.push(self.start);
                     text(&mut out, "user");
                     while i < rest.len() && rest[i].role == "tool" {
                         markup(&mut out, "\n<tool_response>\n");
@@ -214,8 +309,16 @@ impl ChatTemplate {
     }
 
     pub fn open_assistant(&self, tok: &Tokenizer, out: &mut Vec<u32>) {
-        out.push(self.im_start);
-        out.extend(tok.encode("assistant\n", false));
+        match self.style {
+            Style::ChatMl => {
+                out.push(self.start);
+                out.extend(tok.encode("assistant\n", false));
+            }
+            Style::Llama3 => {
+                self.header(tok, out, "assistant");
+                out.extend(tok.encode("\n\n", false));
+            }
+        }
     }
 
     /// Qwen3 thinks aloud in `<think>...</think>` before answering. Its
@@ -227,14 +330,47 @@ impl ChatTemplate {
     }
 
     pub fn close_turn(&self, out: &mut Vec<u32>) {
-        out.push(self.im_end);
-        out.extend_from_slice(&self.newline);
+        out.push(self.end);
+        out.extend_from_slice(&self.after_end);
     }
+}
+
+/// Days since 1970-01-01, UTC.
+fn today() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() / 86_400) as i64
+}
+
+/// A day number as Llama 3's template writes dates ("26 Jul 2024"), by
+/// Howard Hinnant's civil-from-days algorithm.
+fn date(days: i64) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{day:02} {} {year}", MONTHS[month as usize - 1])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dates_like_llama_templates() {
+        assert_eq!(date(0), "01 Jan 1970");
+        assert_eq!(date(11_016), "29 Feb 2000");
+        assert_eq!(date(19_930), "26 Jul 2024");
+        assert_eq!(date(20_760), "03 Nov 2026");
+    }
 
     #[test]
     fn parses_tool_calls_out_of_a_reply() {

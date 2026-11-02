@@ -27,6 +27,9 @@ pub struct Tokenizer {
     added: Vec<(String, u32)>,
     /// Llama 3 groups digits in threes; Qwen2 splits every digit.
     max_digits: usize,
+    /// Llama 3's `ignore_merges`: a chunk that is itself in the vocabulary
+    /// becomes that token, whatever the merges would have made of it.
+    whole: Option<HashMap<Vec<u8>, u32>>,
 }
 
 impl Tokenizer {
@@ -41,6 +44,10 @@ impl Tokenizer {
             bail!("only BPE tokenizers are supported");
         }
         let max_digits = if text.contains(r"\\p{N}{1,3}") { 3 } else { 1 };
+        let ignore_merges = model
+            .get("ignore_merges")
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
 
         let unbyte = byte_decoder();
         let to_bytes = |s: &str| {
@@ -133,6 +140,7 @@ impl Tokenizer {
             merges,
             added,
             max_digits,
+            whole: ignore_merges.then_some(by_bytes),
         })
     }
 
@@ -208,6 +216,10 @@ impl Tokenizer {
     }
 
     fn bpe(&self, bytes: &[u8], out: &mut Vec<u32>) {
+        if let Some(&id) = self.whole.as_ref().and_then(|w| w.get(bytes)) {
+            out.push(id);
+            return;
+        }
         let mut ids: Vec<u32> = bytes.iter().map(|&b| self.byte_ids[b as usize]).collect();
         while ids.len() > 1 {
             let mut best: Option<(u32, usize, u32)> = None;

@@ -168,6 +168,7 @@ mod tests {
             vocab: 10,
             max_positions: 16,
             rope_theta: 1e4,
+            rope_scaling: None,
             norm_eps: 1e-6,
             tied_embeddings: true,
             eos_ids: vec![],

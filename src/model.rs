@@ -226,7 +226,10 @@ fn vector(st: &SafeTensors, name: &str) -> Result<Vec<f32>> {
 pub fn rope_frequencies(c: &Config) -> Vec<f64> {
     let half = c.head_dim / 2;
     (0..half)
-        .map(|i| c.rope_theta.powf(-2.0 * i as f64 / c.head_dim as f64))
+        .map(|i| {
+            let f = c.rope_theta.powf(-2.0 * i as f64 / c.head_dim as f64);
+            c.rope_scaling.as_ref().map_or(f, |s| s.apply(f))
+        })
         .collect()
 }
 
