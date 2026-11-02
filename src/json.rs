@@ -85,6 +85,44 @@ impl Json {
     }
 }
 
+impl Json {
+    /// Serialized with a space after `:` and `,`, as Python's `json.dumps`
+    /// writes it (and so as chat templates show JSON to models).
+    pub fn to_spaced_string(&self) -> String {
+        let mut out = String::new();
+        self.write_spaced(&mut out);
+        out
+    }
+
+    fn write_spaced(&self, out: &mut String) {
+        match self {
+            Json::Arr(a) => {
+                out.push('[');
+                for (i, v) in a.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    v.write_spaced(out);
+                }
+                out.push(']');
+            }
+            Json::Obj(m) => {
+                out.push('{');
+                for (i, (k, v)) in m.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    let _ = write_escaped(out, k);
+                    out.push_str(": ");
+                    v.write_spaced(out);
+                }
+                out.push('}');
+            }
+            other => out.push_str(&other.to_string()),
+        }
+    }
+}
+
 /// Builds an object: `obj([("id", "x".into()), ("n", 3.into())])`.
 pub fn obj<const N: usize>(pairs: [(&str, Json); N]) -> Json {
     Json::Obj(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
@@ -376,6 +414,15 @@ mod tests {
         let v = Json::parse(src).unwrap();
         assert_eq!(v.get("s").unwrap().as_str(), Some("q\"\\\n\u{e9}\u{1F600}"));
         assert_eq!(Json::parse(&v.to_string()).unwrap(), v);
+    }
+
+    #[test]
+    fn spaced_matches_python_json_dumps() {
+        let v = Json::parse(r#"{"a":[1,"x",{"b":null}],"c":true}"#).unwrap();
+        assert_eq!(
+            v.to_spaced_string(),
+            r#"{"a": [1, "x", {"b": null}], "c": true}"#
+        );
     }
 
     #[test]

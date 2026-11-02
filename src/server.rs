@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::chat::{ChatTemplate, Message};
+use crate::chat::{parse_tool_calls, ChatTemplate, Message, ToolCall};
 use crate::constrain::OutputFormat;
 use crate::generate::Finish;
 use crate::json::{obj, Json};
@@ -243,6 +243,74 @@ struct ChatRequest {
     /// Qwen3's `enable_thinking` (top level, or in `chat_template_kwargs`
     /// as vLLM takes it).
     thinking: bool,
+    /// OpenAI-style tool definitions, as given.
+    tools: Vec<Json>,
+    tool_choice: ToolChoice,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ToolChoice {
+    Auto,
+    None,
+    /// Must call some tool.
+    Required,
+    /// Must call this one.
+    Named(String),
+}
+
+fn tool_name(tool: &Json) -> Option<&str> {
+    tool.get("function")
+        .and_then(|f| f.get("name"))
+        .and_then(Json::as_str)
+}
+
+/// The schema a forced call must match: `{"name": ..., "arguments": ...}`,
+/// with the named function's own parameter schema for the arguments.
+fn call_schema(tools: &[Json], choice: &ToolChoice) -> std::result::Result<Schema, String> {
+    let any_object = obj([("type", "object".into())]);
+    let (name, arguments) = match choice {
+        ToolChoice::Named(n) => {
+            let tool = tools
+                .iter()
+                .find(|t| tool_name(t) == Some(n.as_str()))
+                .ok_or(format!("tool_choice names unknown function {n:?}"))?;
+            let params = tool
+                .get("function")
+                .and_then(|f| f.get("parameters"))
+                .cloned()
+                .unwrap_or(any_object);
+            (obj([("const", n.as_str().into())]), params)
+        }
+        _ => {
+            let names = tools.iter().filter_map(tool_name).map(Json::from).collect();
+            (obj([("enum", Json::Arr(names))]), any_object)
+        }
+    };
+    let schema = obj([
+        ("type", "object".into()),
+        (
+            "properties",
+            obj([("name", name), ("arguments", arguments)]),
+        ),
+    ]);
+    Schema::parse(&schema).map_err(|e| format!("bad tool parameters: {e}"))
+}
+
+fn tool_call_json(c: &ToolCall, index: Option<usize>) -> Json {
+    let mut fields = Vec::new();
+    if let Some(i) = index {
+        fields.push(("index".to_string(), i.into()));
+    }
+    fields.push(("id".to_string(), c.id.as_str().into()));
+    fields.push(("type".to_string(), "function".into()));
+    fields.push((
+        "function".to_string(),
+        obj([
+            ("name", c.name.as_str().into()),
+            ("arguments", c.arguments.to_string().into()),
+        ]),
+    ));
+    Json::Obj(fields)
 }
 
 fn parse_chat(body: &[u8], defaults: &SamplerConfig) -> std::result::Result<ChatRequest, String> {
@@ -269,7 +337,39 @@ fn parse_chat(body: &[u8], defaults: &SamplerConfig) -> std::result::Result<Chat
             Some(Json::Null) | None => String::new(),
             Some(_) => return Err("`content` must be a string or a list of parts".into()),
         };
-        messages.push(Message::new(role, &content));
+        let mut message = Message::new(role, &content);
+        for (i, call) in m
+            .get("tool_calls")
+            .and_then(Json::as_array)
+            .unwrap_or(&[])
+            .iter()
+            .enumerate()
+        {
+            let f = call
+                .get("function")
+                .ok_or("each tool call needs a `function`")?;
+            let name = f
+                .get("name")
+                .and_then(Json::as_str)
+                .ok_or("each tool call needs a function name")?;
+            let arguments = match f.get("arguments") {
+                Some(Json::Str(a)) => {
+                    Json::parse(a).map_err(|e| format!("tool call arguments are not JSON: {e}"))?
+                }
+                Some(a) => a.clone(),
+                None => Json::Obj(Vec::new()),
+            };
+            let id = call
+                .get("id")
+                .and_then(Json::as_str)
+                .map_or(format!("call_{i}"), str::to_string);
+            message.tool_calls.push(ToolCall {
+                id,
+                name: name.to_string(),
+                arguments,
+            });
+        }
+        messages.push(message);
     }
     if messages.is_empty() {
         return Err("`messages` is empty".into());
@@ -301,23 +401,45 @@ fn parse_chat(body: &[u8], defaults: &SamplerConfig) -> std::result::Result<Chat
         _ => Vec::new(),
     };
     let rf = j.get("response_format");
-    let format =
-        match rf.and_then(|f| f.get("type")).and_then(Json::as_str) {
-            None | Some("text") => OutputFormat::Text,
-            Some("json_object") => OutputFormat::JsonObject,
-            Some("json_schema") => {
-                let schema = rf
-                    .and_then(|f| f.get("json_schema"))
-                    .and_then(|s| s.get("schema"))
-                    .ok_or("response_format json_schema needs json_schema.schema")?;
-                OutputFormat::JsonSchema(JsonSchema::new(
-                    Schema::parse(schema).map_err(|e| format!("bad schema: {e}"))?,
-                ))
-            }
-            Some(other) => return Err(format!(
+    let format = match rf.and_then(|f| f.get("type")).and_then(Json::as_str) {
+        None | Some("text") => OutputFormat::Text,
+        Some("json_object") => OutputFormat::JsonObject,
+        Some("json_schema") => {
+            let schema = rf
+                .and_then(|f| f.get("json_schema"))
+                .and_then(|s| s.get("schema"))
+                .ok_or("response_format json_schema needs json_schema.schema")?;
+            OutputFormat::JsonSchema(JsonSchema::new(
+                Schema::parse(schema).map_err(|e| format!("bad schema: {e}"))?,
+            ))
+        }
+        Some(other) => {
+            return Err(format!(
                 "response_format type {other:?} is not supported (text, json_object, json_schema)"
-            )),
-        };
+            ))
+        }
+    };
+    let tools: Vec<Json> = j
+        .get("tools")
+        .and_then(Json::as_array)
+        .unwrap_or(&[])
+        .to_vec();
+    if tools.iter().any(|t| tool_name(t).is_none()) {
+        return Err("each tool needs `function.name`".into());
+    }
+    let tool_choice = match j.get("tool_choice") {
+        None | Some(Json::Null) => ToolChoice::Auto,
+        Some(Json::Str(c)) if c == "auto" => ToolChoice::Auto,
+        Some(Json::Str(c)) if c == "none" => ToolChoice::None,
+        Some(Json::Str(c)) if c == "required" => ToolChoice::Required,
+        Some(c) => match c.get("function").and_then(|f| f.get("name")).and_then(Json::as_str) {
+            Some(n) => ToolChoice::Named(n.to_string()),
+            None => return Err("tool_choice must be auto, none, required or {\"type\": \"function\", \"function\": {\"name\": ...}}".into()),
+        },
+    };
+    if tool_choice != ToolChoice::Auto && tool_choice != ToolChoice::None && tools.is_empty() {
+        return Err("tool_choice needs `tools`".into());
+    }
     Ok(ChatRequest {
         messages,
         stream: j.get("stream").and_then(Json::as_bool).unwrap_or(false),
@@ -336,6 +458,8 @@ fn parse_chat(body: &[u8], defaults: &SamplerConfig) -> std::result::Result<Chat
                 .and_then(|k| k.get("enable_thinking")))
             .and_then(Json::as_bool)
             .unwrap_or(true),
+        tools,
+        tool_choice,
     })
 }
 
@@ -390,12 +514,32 @@ fn chat_completion(conn: &mut TcpStream, server: &Server, body: &[u8]) -> io::Re
         Ok(r) => r,
         Err(e) => return error(conn, "400 Bad Request", &e),
     };
-    let mut prompt = server
-        .template
-        .encode(&server.tok, &req.messages, server.system.as_deref());
+    let shown: &[Json] = if req.tool_choice == ToolChoice::None {
+        &[]
+    } else {
+        &req.tools
+    };
+    let mut prompt = server.template.encode_with_tools(
+        &server.tok,
+        &req.messages,
+        server.system.as_deref(),
+        shown,
+    );
     if !req.thinking {
         server.template.skip_thinking(&server.tok, &mut prompt);
     }
+    // A forced call: open the <tool_call> ourselves and constrain what
+    // follows to {"name": ..., "arguments": <the function's schema>}.
+    let forced = matches!(req.tool_choice, ToolChoice::Required | ToolChoice::Named(_));
+    let format = if forced {
+        prompt.extend(server.tok.encode("<tool_call>\n", true));
+        match call_schema(&req.tools, &req.tool_choice) {
+            Ok(schema) => OutputFormat::JsonSchema(JsonSchema::new(schema)),
+            Err(e) => return error(conn, "400 Bad Request", &e),
+        }
+    } else {
+        req.format.clone()
+    };
     let room = server.context.saturating_sub(prompt.len());
     if room == 0 {
         let msg = format!(
@@ -416,7 +560,7 @@ fn chat_completion(conn: &mut TcpStream, server: &Server, body: &[u8]) -> io::Re
         } else {
             server.stop.clone()
         },
-        constraint: req.format.constraint(),
+        constraint: format.constraint(),
         events: tx,
         cancel: cancel.clone(),
     });
@@ -461,6 +605,10 @@ fn chat_completion(conn: &mut TcpStream, server: &Server, body: &[u8]) -> io::Re
     let mut stops = StopStrings::new(req.stop);
     let mut text = String::new();
     let mut hit_stop = false;
+    // With tools, hold the reply back until it is clearly text or a call.
+    let tools_on = !shown.is_empty();
+    let mut held: Option<String> = (tools_on || forced).then(String::new);
+    let mut sent = 0; // bytes of `text` already streamed
     let summary: Summary = loop {
         match rx.recv() {
             Ok(Event::Text(piece)) if !hit_stop => {
@@ -472,13 +620,28 @@ fn chat_completion(conn: &mut TcpStream, server: &Server, body: &[u8]) -> io::Re
                 if out.is_empty() {
                     continue;
                 }
+                text.push_str(&out);
+                let mut piece = out;
+                if let Some(buf) = held.as_mut() {
+                    buf.push_str(&piece);
+                    let start = buf.trim_start();
+                    if forced
+                        || start.starts_with("<tool_call>")
+                        || "<tool_call>".starts_with(start)
+                    {
+                        continue; // a call, or still might be
+                    }
+                    piece = held.take().unwrap();
+                }
                 if req.stream {
                     send(
                         conn,
-                        &format!("data: {}\n\n", chunk(obj([("content", out.into())]), None)),
+                        &format!(
+                            "data: {}\n\n",
+                            chunk(obj([("content", piece.into())]), None)
+                        ),
                     )?;
-                } else {
-                    text.push_str(&out);
+                    sent = text.len();
                 }
             }
             Ok(Event::Text(_)) => {}
@@ -491,18 +654,58 @@ fn chat_completion(conn: &mut TcpStream, server: &Server, body: &[u8]) -> io::Re
         }
     };
     if !hit_stop {
-        let rest = stops.finish();
-        if req.stream && !rest.is_empty() {
+        text.push_str(&stops.finish());
+    }
+    let (content, mut calls) = if forced {
+        (
+            String::new(),
+            parse_tool_calls(&format!("<tool_call>{text}</tool_call>")).1,
+        )
+    } else if tools_on {
+        parse_tool_calls(&text)
+    } else {
+        (text.clone(), Vec::new())
+    };
+    for (i, c) in calls.iter_mut().enumerate() {
+        c.id = format!("call_{}_{i}", &id[9..]);
+    }
+    if req.stream {
+        // Whatever is still held back (or was never streamed) goes out now.
+        let unsent = if calls.is_empty() {
+            text[sent..].to_string()
+        } else if held.is_some() {
+            content.clone() // a call came first; its preamble was never sent
+        } else {
+            String::new()
+        };
+        if !unsent.is_empty() {
             send(
                 conn,
-                &format!("data: {}\n\n", chunk(obj([("content", rest.into())]), None)),
+                &format!(
+                    "data: {}\n\n",
+                    chunk(obj([("content", unsent.into())]), None)
+                ),
             )?;
-        } else {
-            text.push_str(&rest);
+        }
+        if !calls.is_empty() {
+            let deltas = calls
+                .iter()
+                .enumerate()
+                .map(|(i, c)| tool_call_json(c, Some(i)))
+                .collect();
+            send(
+                conn,
+                &format!(
+                    "data: {}\n\n",
+                    chunk(obj([("tool_calls", Json::Arr(deltas))]), None)
+                ),
+            )?;
         }
     }
 
-    let finish = if summary.finish == Finish::Length && !hit_stop {
+    let finish = if !calls.is_empty() {
+        "tool_calls"
+    } else if summary.finish == Finish::Length && !hit_stop {
         "length"
     } else {
         "stop"
@@ -533,7 +736,24 @@ fn chat_completion(conn: &mut TcpStream, server: &Server, body: &[u8]) -> io::Re
             &format!("data: {}\n\ndata: [DONE]\n\n", Json::Obj(last)),
         )
     } else {
-        let message = obj([("role", "assistant".into()), ("content", text.into())]);
+        let mut message = vec![
+            ("role".to_string(), Json::from("assistant")),
+            (
+                "content".to_string(),
+                if content.is_empty() && !calls.is_empty() {
+                    Json::Null
+                } else {
+                    content.into()
+                },
+            ),
+        ];
+        if !calls.is_empty() {
+            message.push((
+                "tool_calls".to_string(),
+                Json::Arr(calls.iter().map(|c| tool_call_json(c, None)).collect()),
+            ));
+        }
+        let message = Json::Obj(message);
         let body = obj([
             ("id", id.as_str().into()),
             ("object", "chat.completion".into()),
