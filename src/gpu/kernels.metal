@@ -151,24 +151,25 @@ kernel void matmul_q4(device const float *scales [[buffer(0)]], device const uch
 // quantization block), the input tile and the dequantized weight tile are
 // staged in threadgroup memory once and shared by four simdgroups, each of
 // which accumulates a 16x16 piece with simdgroup_multiply_accumulate.
+// Weights are staged as half (bf16, and 8 or 4-bit values times their
+// scale, fit in half's precision) and inputs as float, which keeps the whole
+// tile in 8 KB: the output tile reuses the same memory once the loop is done,
+// so more threadgroups fit on each core.
 constant uint GM_TOK = 32;
 constant uint TOK_BLOCKS = GM_TOK / 8;
 constant uint GM_ROWS = 64;
 constant uint GM_K = 32;
 
 // Tile loaders: 16 weights of `row` starting at column `k` (a multiple of
-// 16) into `d`, as floats.
+// 16) into `d`, as halves.
 struct TileBf16 {
     device const ushort *w;
     uint cols;
-    void operator()(threadgroup float *d, uint row, uint k) const {
+    void operator()(threadgroup half *d, uint row, uint k) const {
         device const ushort4 *s = (device const ushort4 *)(w + (ulong)row * cols + k);
         for (uint i = 0; i < 4; i++) {
             ushort4 v = s[i];
-            d[i * 4 + 0] = as_type<float>(uint(v.x) << 16);
-            d[i * 4 + 1] = as_type<float>(uint(v.y) << 16);
-            d[i * 4 + 2] = as_type<float>(uint(v.z) << 16);
-            d[i * 4 + 3] = as_type<float>(uint(v.w) << 16);
+            *(threadgroup half4 *)(d + i * 4) = half4(as_type<float4>(uint4(v) << 16));
         }
     }
 };
@@ -177,16 +178,12 @@ struct TileQ8 {
     device const float *scales;
     device const char *qs;
     uint cols;
-    void operator()(threadgroup float *d, uint row, uint k) const {
+    void operator()(threadgroup half *d, uint row, uint k) const {
         ulong e = (ulong)row * cols + k;
         float s = scales[e / 32];
         device const char4 *q = (device const char4 *)(qs + e);
         for (uint i = 0; i < 4; i++) {
-            float4 f = float4(q[i]) * s;
-            d[i * 4 + 0] = f.x;
-            d[i * 4 + 1] = f.y;
-            d[i * 4 + 2] = f.z;
-            d[i * 4 + 3] = f.w;
+            *(threadgroup half4 *)(d + i * 4) = half4(float4(q[i]) * s);
         }
     }
 };
@@ -195,7 +192,7 @@ struct TileQ4 {
     device const float *scales;
     device const uchar *qs;
     uint cols;
-    void operator()(threadgroup float *d, uint row, uint k) const {
+    void operator()(threadgroup half *d, uint row, uint k) const {
         ulong e = (ulong)row * cols + k;
         ulong block = e / 32;
         bool high = (e % 32) >= 16;
@@ -204,19 +201,18 @@ struct TileQ4 {
         for (uint i = 0; i < 4; i++) {
             uchar4 c = q[i];
             float4 f = ((high ? float4(c >> uchar4(4)) : float4(c & uchar4(0xF))) - 8.0f) * s;
-            d[i * 4 + 0] = f.x;
-            d[i * 4 + 1] = f.y;
-            d[i * 4 + 2] = f.z;
-            d[i * 4 + 3] = f.w;
+            *(threadgroup half4 *)(d + i * 4) = half4(f);
         }
     }
 };
 
 template <typename L>
 inline void gemm_impl(thread const L &tile, device const float *x, device float *y, device const float *bias,
-                      constant MatParams &p, uint2 tg, uint tid, uint sg, threadgroup float *xs, threadgroup float *ws,
-                      threadgroup float *os) {
+                      constant MatParams &p, uint2 tg, uint tid, uint sg, threadgroup float *shared) {
     uint row0 = tg.x * GM_ROWS, tok0 = tg.y * GM_TOK;
+    threadgroup float *xs = shared;
+    threadgroup half *ws = (threadgroup half *)(shared + GM_TOK * GM_K);
+    threadgroup float *os = shared;
     // Each simdgroup owns 16 output rows; one 8x8 accumulator per
     // (8-token block, 8-row block). Every dequantized weight tile is used
     // for all GM_TOK tokens before the next is loaded.
@@ -236,7 +232,7 @@ inline void gemm_impl(thread const L &tile, device const float *x, device float 
         // weights: 64 rows x 32 columns, 16 per thread
         {
             uint r = tid / 2, half_k = (tid % 2) * 16;
-            threadgroup float *d = ws + r * GM_K + half_k;
+            threadgroup half *d = ws + r * GM_K + half_k;
             if (row0 + r < p.rows) {
                 tile(d, row0 + r, k0 + half_k);
             } else {
@@ -245,7 +241,7 @@ inline void gemm_impl(thread const L &tile, device const float *x, device float 
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint kk = 0; kk < GM_K; kk += 8) {
-            simdgroup_float8x8 b0, b1;
+            simdgroup_half8x8 b0, b1;
             simdgroup_load(b0, ws + (sg * 16) * GM_K + kk, GM_K, ulong2(0, 0), true);
             simdgroup_load(b1, ws + (sg * 16 + 8) * GM_K + kk, GM_K, ulong2(0, 0), true);
             for (uint tb = 0; tb < TOK_BLOCKS; tb++) {
@@ -273,9 +269,9 @@ kernel void gemm_bf16(device const ushort *w [[buffer(0)]], device const float *
                       device float *y [[buffer(2)]], device const float *bias [[buffer(3)]],
                       constant MatParams &p [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
                       uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
-    threadgroup float xs[GM_TOK * GM_K], ws[GM_ROWS * GM_K], os[GM_TOK * GM_ROWS];
+    threadgroup float shared[GM_TOK * GM_ROWS];
     TileBf16 tile = {w, p.cols};
-    gemm_impl(tile, x, y, bias, p, tg, tid, sg, xs, ws, os);
+    gemm_impl(tile, x, y, bias, p, tg, tid, sg, shared);
 }
 
 kernel void gemm_q8(device const float *scales [[buffer(0)]], device const char *qs [[buffer(1)]],
@@ -283,9 +279,9 @@ kernel void gemm_q8(device const float *scales [[buffer(0)]], device const char 
                     device const float *bias [[buffer(4)]], constant MatParams &p [[buffer(5)]],
                     uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                     uint sg [[simdgroup_index_in_threadgroup]]) {
-    threadgroup float xs[GM_TOK * GM_K], ws[GM_ROWS * GM_K], os[GM_TOK * GM_ROWS];
+    threadgroup float shared[GM_TOK * GM_ROWS];
     TileQ8 tile = {scales, qs, p.cols};
-    gemm_impl(tile, x, y, bias, p, tg, tid, sg, xs, ws, os);
+    gemm_impl(tile, x, y, bias, p, tg, tid, sg, shared);
 }
 
 kernel void gemm_q4(device const float *scales [[buffer(0)]], device const uchar *qs [[buffer(1)]],
@@ -293,9 +289,9 @@ kernel void gemm_q4(device const float *scales [[buffer(0)]], device const uchar
                     device const float *bias [[buffer(4)]], constant MatParams &p [[buffer(5)]],
                     uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                     uint sg [[simdgroup_index_in_threadgroup]]) {
-    threadgroup float xs[GM_TOK * GM_K], ws[GM_ROWS * GM_K], os[GM_TOK * GM_ROWS];
+    threadgroup float shared[GM_TOK * GM_ROWS];
     TileQ4 tile = {scales, qs, p.cols};
-    gemm_impl(tile, x, y, bias, p, tg, tid, sg, xs, ws, os);
+    gemm_impl(tile, x, y, bias, p, tg, tid, sg, shared);
 }
 
 constant uint BLOCK = 16; // KV cache block size, as in kv.rs
