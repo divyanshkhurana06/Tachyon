@@ -419,7 +419,7 @@ kernel void attention(device const float *qkv [[buffer(0)]], device const kv_t *
                       uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
                       uint sg [[simdgroup_index_in_threadgroup]]) {
     threadgroup float red[ATT_SIMDS];
-    threadgroup float partial[ATT_THREADS];
+    threadgroup float4 partial[ATT_THREADS];
     threadgroup float4 q4[32]; // head_dim <= 128
     uint h = tg.x, i = tokens[tg.y];
     uint n = positions[i] + 1;
@@ -461,17 +461,19 @@ kernel void attention(device const float *qkv [[buffer(0)]], device const kv_t *
     float total = 0;
     for (uint j = 0; j < ATT_SIMDS; j++) total += red[j];
 
-    // 3. out[d] = sum_s p_s v[s][d], positions split into ATT_THREADS/head_dim stripes
-    uint stripes = ATT_THREADS / p.head_dim;
-    uint d = tid % p.head_dim, stripe = tid / p.head_dim;
-    float acc = 0;
-    for (uint s = stripe; s < n; s += stripes) acc += sc[s] * float(vc[cache_slot(table, s) * p.kv_dim + kv + d]);
+    // 3. out = sum_s p_s v[s]: a thread takes 4 dims of every
+    // (ATT_THREADS / d4)th position
+    uint stripes = ATT_THREADS / d4;
+    uint c = tid % d4, stripe = tid / d4;
+    float4 acc = 0;
+    for (uint s = stripe; s < n; s += stripes)
+        acc += sc[s] * float4(*(device const kv4_t *)(vc + cache_slot(table, s) * p.kv_dim + kv + c * 4));
     partial[tid] = acc;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid < p.head_dim) {
-        float r = 0;
-        for (uint j = 0; j < stripes; j++) r += partial[j * p.head_dim + tid];
-        out[(ulong)i * p.q_dim + h * p.head_dim + tid] = r / total;
+    if (tid < d4) {
+        float4 r = 0;
+        for (uint j = 0; j < stripes; j++) r += partial[j * d4 + tid];
+        *(device float4 *)(out + (ulong)i * p.q_dim + h * p.head_dim + tid * 4) = r / total;
     }
 }
 
