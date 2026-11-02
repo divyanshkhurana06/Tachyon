@@ -206,10 +206,38 @@ struct TileQ4 {
     }
 };
 
-template <typename L>
-inline void gemm_impl(thread const L &tile, device const float *x, device float *y, device const float *bias,
-                      constant MatParams &p, uint2 tg, uint tid, uint sg, threadgroup float *shared) {
-    uint row0 = tg.x * GM_ROWS, tok0 = tg.y * GM_TOK;
+// Which rows a GEMM reads and writes: a dense layer's tokens in order, or
+// the tokens routed to one expert (gathered by moe_group), whose rows of
+// the stacked expert matrices start at `base`.
+struct DenseRows {
+    device float *y;
+    device const float *bias;
+    uint t, rows, accumulate, has_bias;
+    uint count() const { return t; }
+    ulong input(uint i) const { return i; }
+    uint weight(uint r) const { return r; }
+    void store(uint i, uint r, float s) const {
+        ulong idx = (ulong)i * rows + r;
+        if (has_bias) s += bias[r];
+        y[idx] = accumulate ? y[idx] + s : s;
+    }
+};
+
+struct ExpertRows {
+    device float *y;
+    device const uint *slots; // this expert's slots, `n` of them
+    uint n, rows, base, k, per_slot;
+    uint count() const { return n; }
+    ulong input(uint i) const { return per_slot ? slots[i] : slots[i] / k; }
+    uint weight(uint r) const { return base + r; }
+    void store(uint i, uint r, float s) const { y[(ulong)slots[i] * rows + r] = s; }
+};
+
+template <typename L, typename G>
+inline void gemm_impl(thread const L &tile, thread const G &g, device const float *x, uint rows, uint cols,
+                      uint2 tg, uint tid, uint sg, threadgroup float *shared) {
+    uint row0 = tg.x * GM_ROWS, tok0 = tg.y * GM_TOK, n = g.count();
+    if (tok0 >= n) return;
     threadgroup float *xs = shared;
     threadgroup half *ws = (threadgroup half *)(shared + GM_TOK * GM_K);
     threadgroup float *os = shared;
@@ -219,11 +247,11 @@ inline void gemm_impl(thread const L &tile, device const float *x, device float 
     simdgroup_float8x8 acc[TOK_BLOCKS * 2];
     for (uint i = 0; i < TOK_BLOCKS * 2; i++) acc[i] = simdgroup_float8x8(0);
 
-    for (uint k0 = 0; k0 < p.cols; k0 += GM_K) {
+    for (uint k0 = 0; k0 < cols; k0 += GM_K) {
         // inputs: GM_TOK tokens x 32 columns
         for (uint e = tid; e < GM_TOK * GM_K / 4; e += 128) {
             uint t = e / (GM_K / 4), c = (e % (GM_K / 4)) * 4;
-            float4 v = tok0 + t < p.t ? *(device const float4 *)(x + (ulong)(tok0 + t) * p.cols + k0 + c) : float4(0);
+            float4 v = tok0 + t < n ? *(device const float4 *)(x + g.input(tok0 + t) * cols + k0 + c) : float4(0);
             xs[t * GM_K + c + 0] = v.x;
             xs[t * GM_K + c + 1] = v.y;
             xs[t * GM_K + c + 2] = v.z;
@@ -233,8 +261,8 @@ inline void gemm_impl(thread const L &tile, device const float *x, device float 
         {
             uint r = tid / 2, half_k = (tid % 2) * 16;
             threadgroup half *d = ws + r * GM_K + half_k;
-            if (row0 + r < p.rows) {
-                tile(d, row0 + r, k0 + half_k);
+            if (row0 + r < rows) {
+                tile(d, g.weight(row0 + r), k0 + half_k);
             } else {
                 for (uint i = 0; i < 16; i++) d[i] = 0;
             }
@@ -261,7 +289,7 @@ inline void gemm_impl(thread const L &tile, device const float *x, device float 
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint i = tid; i < GM_TOK * GM_ROWS; i += 128) {
         uint t = i / GM_ROWS, r = i % GM_ROWS;
-        if (tok0 + t < p.t && row0 + r < p.rows) write_out(y, bias, p, tok0 + t, row0 + r, os[i]);
+        if (tok0 + t < n && row0 + r < rows) g.store(tok0 + t, row0 + r, os[i]);
     }
 }
 
@@ -271,7 +299,8 @@ kernel void gemm_bf16(device const ushort *w [[buffer(0)]], device const float *
                       uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
     threadgroup float shared[GM_TOK * GM_ROWS];
     TileBf16 tile = {w, p.cols};
-    gemm_impl(tile, x, y, bias, p, tg, tid, sg, shared);
+    DenseRows g = {y, bias, p.t, p.rows, p.accumulate, p.has_bias};
+    gemm_impl(tile, g, x, p.rows, p.cols, tg, tid, sg, shared);
 }
 
 kernel void gemm_q8(device const float *scales [[buffer(0)]], device const char *qs [[buffer(1)]],
@@ -281,7 +310,8 @@ kernel void gemm_q8(device const float *scales [[buffer(0)]], device const char 
                     uint sg [[simdgroup_index_in_threadgroup]]) {
     threadgroup float shared[GM_TOK * GM_ROWS];
     TileQ8 tile = {scales, qs, p.cols};
-    gemm_impl(tile, x, y, bias, p, tg, tid, sg, shared);
+    DenseRows g = {y, bias, p.t, p.rows, p.accumulate, p.has_bias};
+    gemm_impl(tile, g, x, p.rows, p.cols, tg, tid, sg, shared);
 }
 
 kernel void gemm_q4(device const float *scales [[buffer(0)]], device const uchar *qs [[buffer(1)]],
@@ -291,7 +321,8 @@ kernel void gemm_q4(device const float *scales [[buffer(0)]], device const uchar
                     uint sg [[simdgroup_index_in_threadgroup]]) {
     threadgroup float shared[GM_TOK * GM_ROWS];
     TileQ4 tile = {scales, qs, p.cols};
-    gemm_impl(tile, x, y, bias, p, tg, tid, sg, shared);
+    DenseRows g = {y, bias, p.t, p.rows, p.accumulate, p.has_bias};
+    gemm_impl(tile, g, x, p.rows, p.cols, tg, tid, sg, shared);
 }
 
 constant uint BLOCK = 16; // KV cache block size, as in kv.rs
@@ -616,6 +647,134 @@ kernel void attention_prefill(device const float *qkv [[buffer(0)]], device cons
         if (q0 + r < count)
             *(device float4 *)(out + (ulong)(first + q0 + r) * p.q_dim + h * D + c) = *(threadgroup float4 *)(os + r * D + c);
     }
+}
+
+// Mixture of experts. Each token's k chosen experts give it k "slots"
+// (slot = token * k + j); the experts' matrices are stacked, expert e owning
+// rows e * rows... A slot's product reads only its expert's rows, so a token
+// costs k small matrix-vector products and the other experts are never read.
+struct MoeParams {
+    uint rows; // per expert
+    uint cols;
+    uint k;
+    uint per_slot; // inputs are one row per slot (else one per token)
+    uint t;
+    uint experts;
+};
+
+template <typename L>
+inline void moe_impl(thread const L &load, device const float *x, device float *y, device const uint *ids,
+                     constant MoeParams &p, uint2 tg, uint sg, uint lane) {
+    uint slot = tg.y, row0 = (tg.x * SIMDS + sg) * R;
+    uint base = ids[slot] * p.rows;
+    device const float *xs = x + (ulong)(p.per_slot ? slot : slot / p.k) * p.cols;
+    float acc[R] = {0, 0, 0, 0};
+    for (uint k = lane * 4; k < p.cols; k += 128) {
+        float4 xv = *(device const float4 *)(xs + k);
+        for (uint r = 0; r < R; r++) {
+            if (row0 + r < p.rows) acc[r] += dot(load(base + row0 + r, k), xv);
+        }
+    }
+    for (uint r = 0; r < R; r++) {
+        float s = simd_sum(acc[r]);
+        if (lane == 0 && row0 + r < p.rows) y[(ulong)slot * p.rows + row0 + r] = s;
+    }
+}
+
+kernel void moe_bf16(device const ushort *w [[buffer(0)]], device const float *x [[buffer(1)]],
+                     device float *y [[buffer(2)]], device const uint *ids [[buffer(3)]],
+                     constant MoeParams &p [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
+                     uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    LoadBf16 load = {w, p.cols};
+    moe_impl(load, x, y, ids, p, tg, sg, lane);
+}
+
+kernel void moe_q8(device const float *scales [[buffer(0)]], device const char *qs [[buffer(1)]],
+                   device const float *x [[buffer(2)]], device float *y [[buffer(3)]],
+                   device const uint *ids [[buffer(4)]], constant MoeParams &p [[buffer(5)]],
+                   uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                   uint lane [[thread_index_in_simdgroup]]) {
+    LoadQ8 load = {scales, qs, p.cols};
+    moe_impl(load, x, y, ids, p, tg, sg, lane);
+}
+
+kernel void moe_q4(device const float *scales [[buffer(0)]], device const uchar *qs [[buffer(1)]],
+                   device const float *x [[buffer(2)]], device float *y [[buffer(3)]],
+                   device const uint *ids [[buffer(4)]], constant MoeParams &p [[buffer(5)]],
+                   uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                   uint lane [[thread_index_in_simdgroup]]) {
+    LoadQ4 load = {scales, qs, p.cols};
+    moe_impl(load, x, y, ids, p, tg, sg, lane);
+}
+
+// Lists each expert's slots, for the expert GEMMs (prefill): a thread per
+// expert scans the batch's choices.
+kernel void moe_group(device const uint *ids [[buffer(0)]], device uint *counts [[buffer(1)]],
+                      device uint *lists [[buffer(2)]], constant MoeParams &p [[buffer(3)]],
+                      uint e [[thread_position_in_grid]]) {
+    if (e >= p.experts) return;
+    uint n = 0;
+    for (uint s = 0; s < p.t * p.k; s++) {
+        if (ids[s] == e) lists[(ulong)e * p.t + n++] = s;
+    }
+    counts[e] = n;
+}
+
+#define MOE_GEMM(NAME, TILE, ARGS, INIT)                                                                   \
+    kernel void NAME(ARGS, device const float *x [[buffer(2)]], device float *y [[buffer(3)]],             \
+                     device const uint *counts [[buffer(4)]], device const uint *lists [[buffer(5)]],       \
+                     constant MoeParams &p [[buffer(6)]], uint3 tg [[threadgroup_position_in_grid]],        \
+                     uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]]) { \
+        threadgroup float shared[GM_TOK * GM_ROWS];                                                         \
+        TILE tile = INIT;                                                                                   \
+        uint e = tg.z;                                                                                      \
+        ExpertRows g = {y, lists + (ulong)e * p.t, counts[e], p.rows, e * p.rows, p.k, p.per_slot};         \
+        gemm_impl(tile, g, x, p.rows, p.cols, tg.xy, tid, sg, shared);                                      \
+    }
+#define COMMA ,
+MOE_GEMM(moe_gemm_bf16, TileBf16, device const ushort *w [[buffer(0)]] COMMA device const float *unused [[buffer(1)]],
+         (TileBf16{w, p.cols}))
+MOE_GEMM(moe_gemm_q8, TileQ8, device const float *scales [[buffer(0)]] COMMA device const char *qs [[buffer(1)]],
+         (TileQ8{scales, qs, p.cols}))
+MOE_GEMM(moe_gemm_q4, TileQ4, device const float *scales [[buffer(0)]] COMMA device const uchar *qs [[buffer(1)]],
+         (TileQ4{scales, qs, p.cols}))
+
+// A thread per token: its k highest router scores (ties to the lower
+// expert, as on the CPU), weighted by a softmax over those k.
+kernel void moe_route(device const float *scores [[buffer(0)]], device uint *ids [[buffer(1)]],
+                      device float *gates [[buffer(2)]], constant MoeParams &p [[buffer(3)]],
+                      uint i [[thread_position_in_grid]]) {
+    if (i >= p.t) return;
+    device const float *s = scores + (ulong)i * p.experts;
+    ulong taken = 0;
+    float top[16];
+    for (uint j = 0; j < p.k; j++) {
+        float best = -INFINITY;
+        uint at = 0;
+        for (uint e = 0; e < p.experts; e++) {
+            if (!((taken >> e) & 1) && s[e] > best) {
+                best = s[e];
+                at = e;
+            }
+        }
+        taken |= 1ul << at;
+        top[j] = best;
+        ids[i * p.k + j] = at;
+    }
+    float sum = 0;
+    for (uint j = 0; j < p.k; j++) sum += exp(top[j] - top[0]);
+    for (uint j = 0; j < p.k; j++) gates[i * p.k + j] = exp(top[j] - top[0]) / sum;
+}
+
+// x[token] += sum over its slots of gate * expert output.
+kernel void moe_combine(device float *x [[buffer(0)]], device const float *out [[buffer(1)]],
+                        device const float *gates [[buffer(2)]], constant MoeParams &p [[buffer(3)]],
+                        uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.t * p.rows) return;
+    uint i = gid / p.rows, d = gid % p.rows;
+    float s = 0;
+    for (uint j = 0; j < p.k; j++) s += gates[i * p.k + j] * out[((ulong)i * p.k + j) * p.rows + d];
+    x[gid] += s;
 }
 
 struct SiluParams {

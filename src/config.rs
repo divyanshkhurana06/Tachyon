@@ -22,6 +22,19 @@ pub struct Config {
     pub norm_eps: f32,
     pub tied_embeddings: bool,
     pub eos_ids: Vec<u32>,
+    /// Granite's scalings: embeddings are multiplied by this, attention
+    /// scores use `attention_multiplier` instead of 1/sqrt(head_dim), each
+    /// block's output is multiplied by `residual_multiplier` before it is
+    /// added back, and logits are divided by `logits_scaling`. All 1 (and
+    /// `None`) for other models.
+    pub embedding_multiplier: f32,
+    pub attention_multiplier: Option<f32>,
+    pub residual_multiplier: f32,
+    pub logits_scaling: f32,
+    /// Mixture of experts: experts per layer (0 for a dense MLP), and how
+    /// many each token uses. `intermediate` is then each expert's size.
+    pub experts: usize,
+    pub experts_per_token: usize,
 }
 
 /// Llama 3.1+ RoPE scaling: wavelengths shorter than the original context
@@ -67,14 +80,18 @@ impl Config {
                 .ok_or_else(|| Error(format!("config.json: missing {k}")))
         };
 
+        let f = |k: &str| j.get(k).and_then(Json::as_f64).map(|v| v as f32);
         let model_type = j
             .get("model_type")
             .and_then(Json::as_str)
             .unwrap_or("")
             .to_string();
-        if !matches!(model_type.as_str(), "qwen2" | "qwen3" | "llama" | "mistral") {
+        if !matches!(
+            model_type.as_str(),
+            "qwen2" | "qwen3" | "llama" | "mistral" | "granite" | "granitemoe"
+        ) {
             bail!(
-                "model_type {model_type:?} is not supported (qwen2, qwen3, llama and mistral are)"
+                "model_type {model_type:?} is not supported (qwen2, qwen3, llama, mistral, granite and granitemoe are)"
             );
         }
         let rope_scaling = match j.get("rope_scaling") {
@@ -146,6 +163,18 @@ impl Config {
                 .and_then(Json::as_f64)
                 .unwrap_or(10_000.0),
             rope_scaling,
+            embedding_multiplier: f("embedding_multiplier").unwrap_or(1.0),
+            attention_multiplier: f("attention_multiplier"),
+            residual_multiplier: f("residual_multiplier").unwrap_or(1.0),
+            logits_scaling: f("logits_scaling").unwrap_or(1.0),
+            experts: j
+                .get("num_local_experts")
+                .and_then(Json::as_usize)
+                .unwrap_or(0),
+            experts_per_token: j
+                .get("num_experts_per_tok")
+                .and_then(Json::as_usize)
+                .unwrap_or(0),
             norm_eps: j.get("rms_norm_eps").and_then(Json::as_f64).unwrap_or(1e-6) as f32,
             tied_embeddings: j
                 .get("tie_word_embeddings")
@@ -153,6 +182,12 @@ impl Config {
                 .unwrap_or(false),
             eos_ids,
         })
+    }
+
+    /// The factor attention scores are scaled by.
+    pub fn attention_scale(&self) -> f32 {
+        self.attention_multiplier
+            .unwrap_or(1.0 / (self.head_dim as f32).sqrt())
     }
 
     pub fn q_dim(&self) -> usize {
@@ -166,7 +201,8 @@ impl Config {
     /// Parameter count, for display.
     pub fn params(&self) -> usize {
         let attn = self.hidden * (self.q_dim() + 2 * self.kv_dim()) + self.q_dim() * self.hidden;
-        let mlp = 3 * self.hidden * self.intermediate;
+        let mlp =
+            3 * self.hidden * self.intermediate * self.experts.max(1) + self.experts * self.hidden;
         let embed = self.vocab * self.hidden * if self.tied_embeddings { 1 } else { 2 };
         self.layers * (attn + mlp) + embed
     }

@@ -22,6 +22,9 @@
 //!
 //! ```
 //!
+//! and Granite's, `<|start_of_role|>user<|end_of_role|>Hi!<|end_of_text|>`
+//! with a newline after each turn and a default system message.
+//!
 //! Control tokens are inserted by id; message text is encoded with added
 //! tokens disabled, so a user typing `<|im_start|>` cannot forge a turn.
 
@@ -109,17 +112,20 @@ fn call_from_json(v: &Json, i: usize) -> Option<ToolCall> {
 enum Style {
     ChatMl,
     Llama3,
+    Granite,
 }
 
 pub struct ChatTemplate {
     style: Style,
-    /// `<|im_start|>`, or Llama 3's `<|start_header_id|>`.
+    /// `<|im_start|>`, Llama 3's `<|start_header_id|>` or Granite's
+    /// `<|start_of_role|>`.
     start: u32,
-    /// Llama 3's `<|end_header_id|>` after the role.
+    /// After the role: Llama 3's `<|end_header_id|>`, Granite's
+    /// `<|end_of_role|>`.
     end_header: u32,
-    /// `<|im_end|>`, or Llama 3's `<|eot_id|>`.
+    /// `<|im_end|>`, Llama 3's `<|eot_id|>` or Granite's `<|end_of_text|>`.
     end: u32,
-    /// What follows `end`: a newline in ChatML.
+    /// What follows `end`: a newline in ChatML and Granite.
     after_end: Vec<u32>,
     /// Llama 3's `<|begin_of_text|>`.
     bos: Option<u32>,
@@ -153,8 +159,22 @@ impl ChatTemplate {
                 bos: id("<|begin_of_text|>"),
             });
         }
+        if let (Some(start), Some(end_header), Some(end)) = (
+            id("<|start_of_role|>"),
+            id("<|end_of_role|>"),
+            id("<|end_of_text|>"),
+        ) {
+            return Ok(ChatTemplate {
+                style: Style::Granite,
+                start,
+                end_header,
+                end,
+                after_end: tok.encode("\n", false),
+                bos: None,
+            });
+        }
         Err(Error::msg(
-            "the tokenizer has no ChatML or Llama 3 chat tokens; use --raw",
+            "the tokenizer has no ChatML, Llama 3 or Granite chat tokens; use --raw",
         ))
     }
 
@@ -163,11 +183,17 @@ impl ChatTemplate {
         self.end
     }
 
+    /// Whether tool calling is implemented for this format (not yet for
+    /// Granite's).
+    pub fn supports_tools(&self) -> bool {
+        self.style != Style::Granite
+    }
+
     /// What a reply that calls a tool starts with: Qwen's `<tool_call>`
     /// block, or the bare JSON object Llama 3 answers with.
     pub fn call_opener(&self) -> &'static str {
         match self.style {
-            Style::ChatMl => "<tool_call>",
+            Style::ChatMl | Style::Granite => "<tool_call>",
             Style::Llama3 => "{",
         }
     }
@@ -175,7 +201,7 @@ impl ChatTemplate {
     /// The key a call's arguments go under.
     pub fn arguments_key(&self) -> &'static str {
         match self.style {
-            Style::ChatMl => "arguments",
+            Style::ChatMl | Style::Granite => "arguments",
             Style::Llama3 => "parameters",
         }
     }
@@ -197,6 +223,7 @@ impl ChatTemplate {
                 parse_tool_calls(&format!("<tool_call>{text}</tool_call>")).1,
             ),
             Style::ChatMl => parse_tool_calls(text),
+            Style::Granite => (text.to_string(), Vec::new()),
             Style::Llama3 => match Json::parse(text.trim())
                 .ok()
                 .and_then(|v| call_from_json(&v, 0))
@@ -242,6 +269,15 @@ impl ChatTemplate {
                 out.extend(tok.encode(&text, false));
                 self.close_turn(out);
             }
+            Style::Granite => {
+                // Its template's default system message, dated like it.
+                let (day, month, year) = civil(today());
+                let default = format!(
+                    "Knowledge Cutoff Date: April 2024.\nToday's Date: {} {day:02}, {year}.\nYou are Granite, developed by IBM.",
+                    MONTH_NAMES[month - 1]
+                );
+                self.push(tok, out, "system", system.unwrap_or(&default));
+            }
         }
     }
 
@@ -254,6 +290,10 @@ impl ChatTemplate {
             Style::Llama3 => {
                 self.header(tok, out, role);
                 out.extend(tok.encode(&format!("\n\n{}", content.trim()), false));
+            }
+            Style::Granite => {
+                self.header(tok, out, role);
+                out.extend(tok.encode(content, false));
             }
         }
         self.close_turn(out);
@@ -285,8 +325,10 @@ impl ChatTemplate {
         {
             return self.encode(tok, messages, system);
         }
-        if self.style == Style::Llama3 {
-            return self.encode_llama_tools(tok, messages, system, tools);
+        match self.style {
+            Style::Llama3 => return self.encode_llama_tools(tok, messages, system, tools),
+            Style::Granite => return self.encode(tok, messages, system),
+            Style::ChatMl => {}
         }
         let mut out = Vec::new();
         let (first_system, rest) = match messages.first() {
@@ -437,6 +479,7 @@ impl ChatTemplate {
                 self.header(tok, out, "assistant");
                 out.extend(tok.encode("\n\n", false));
             }
+            Style::Granite => self.header(tok, out, "assistant"),
         }
     }
 
@@ -461,12 +504,30 @@ fn today() -> i64 {
         .map_or(0, |d| d.as_secs() / 86_400) as i64
 }
 
-/// A day number as Llama 3's template writes dates ("26 Jul 2024"), by
-/// Howard Hinnant's civil-from-days algorithm.
+const MONTH_NAMES: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+
+/// A day number as Llama 3's template writes dates ("26 Jul 2024").
 fn date(days: i64) -> String {
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
+    let (day, month, year) = civil(days);
+    format!("{day:02} {} {year}", &MONTH_NAMES[month - 1][..3])
+}
+
+/// (day, month 1-12, year) of a day number, by Howard Hinnant's
+/// civil-from-days algorithm.
+fn civil(days: i64) -> (i64, usize, i64) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
@@ -476,7 +537,7 @@ fn date(days: i64) -> String {
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = yoe + era * 400 + i64::from(month <= 2);
-    format!("{day:02} {} {year}", MONTHS[month as usize - 1])
+    (day, month as usize, year)
 }
 
 #[cfg(test)]

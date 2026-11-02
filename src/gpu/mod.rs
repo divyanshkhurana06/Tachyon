@@ -33,6 +33,10 @@ const FLASH_MIN_RUN: usize = 16;
 const GEMM_TOKENS: usize = 32;
 const GEMM_ROWS: usize = 64;
 const GEMM_MIN_BATCH: usize = 4;
+/// Tokens from which a mixture-of-experts layer groups each expert's tokens
+/// and runs a GEMM per expert, instead of a matrix-vector product per
+/// (token, expert).
+const MOE_GEMM_MIN_BATCH: usize = 8;
 
 /// Most tokens one forward pass takes (prefill chunks, speculative checks).
 pub const MAX_BATCH: usize = 256;
@@ -54,9 +58,18 @@ enum Kernel {
     Attention,
     AttentionPrefill,
     SiluMul,
+    MoeBf16,
+    MoeQ8,
+    MoeQ4,
+    MoeRoute,
+    MoeCombine,
+    MoeGroup,
+    MoeGemmBf16,
+    MoeGemmQ8,
+    MoeGemmQ4,
 }
 
-const KERNELS: [&str; 12] = [
+const KERNELS: [&str; 21] = [
     "matmul_bf16",
     "matmul_q8",
     "matmul_q4",
@@ -69,6 +82,15 @@ const KERNELS: [&str; 12] = [
     "attention",
     "attention_prefill",
     "silu_mul",
+    "moe_bf16",
+    "moe_q8",
+    "moe_q4",
+    "moe_route",
+    "moe_combine",
+    "moe_group",
+    "moe_gemm_bf16",
+    "moe_gemm_q8",
+    "moe_gemm_q4",
 ];
 
 #[repr(C)]
@@ -224,6 +246,17 @@ struct GpuLayer {
     mlp_norm: Buffer,
     w_gate_up: GpuMatrix,
     w_down: GpuMatrix,
+    router: Option<GpuMatrix>,
+}
+
+#[repr(C)]
+struct MoeParams {
+    rows: u32,
+    cols: u32,
+    k: u32,
+    per_slot: u32,
+    t: u32,
+    experts: u32,
 }
 
 #[repr(C)]
@@ -298,6 +331,17 @@ struct Activations {
     rows: Buffer,
     /// Tokens for `attention`, and (first, count) tiles for `attention_prefill`.
     att_tokens: Buffer,
+    /// Mixture of experts: router scores, each slot's expert and weight, and
+    /// the slots' intermediate and output rows.
+    route: Buffer,
+    moe_ids: Buffer,
+    moe_gates: Buffer,
+    moe_gate_up: Buffer,
+    moe_hidden: Buffer,
+    moe_out: Buffer,
+    /// For the expert GEMMs: each expert's slot count and slots.
+    moe_counts: Buffer,
+    moe_lists: Buffer,
     att_tiles: Buffer,
     k_cache: Buffer,
     v_cache: Buffer,
@@ -367,6 +411,9 @@ impl GpuBackend {
             .to_string_lossy()
             .into_owned();
 
+        if cfg.experts > 64 || cfg.experts_per_token > 16 {
+            return Err(Error::msg("the GPU takes up to 64 experts, 16 per token"));
+        }
         if ![64, 128].contains(&cfg.head_dim) {
             return Err(Error(format!(
                 "the GPU attention kernel needs head_dim 64 or 128, not {}",
@@ -397,6 +444,11 @@ impl GpuBackend {
                     mlp_norm: Buffer::from_slice(&ctx, &l.mlp_norm)?,
                     w_gate_up: GpuMatrix::upload(&ctx, &l.w_gate_up)?,
                     w_down: GpuMatrix::upload(&ctx, &l.w_down)?,
+                    router: l
+                        .router
+                        .as_ref()
+                        .map(|r| GpuMatrix::upload(&ctx, r))
+                        .transpose()?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -407,6 +459,7 @@ impl GpuBackend {
         let b = MAX_BATCH;
         let qkv_dim = cfg.q_dim() + 2 * cfg.kv_dim();
         let kv_bytes = if kv_half { 2 } else { 4 };
+        let k = cfg.experts_per_token;
         let cache = cfg.layers * blocks * BLOCK * cfg.kv_dim() * kv_bytes;
         let act = Activations {
             x: Buffer::new(&ctx, b * cfg.hidden * f)?,
@@ -425,6 +478,14 @@ impl GpuBackend {
             tables: Buffer::new(&ctx, b * (max_seq.div_ceil(BLOCK) + 1) * 4)?,
             rows: Buffer::new(&ctx, b * 4)?,
             att_tokens: Buffer::new(&ctx, b * 4)?,
+            route: Buffer::new(&ctx, (b * cfg.experts * f).max(4))?,
+            moe_ids: Buffer::new(&ctx, (b * k * 4).max(4))?,
+            moe_gates: Buffer::new(&ctx, (b * k * f).max(4))?,
+            moe_gate_up: Buffer::new(&ctx, (b * k * 2 * cfg.intermediate * f).max(4))?,
+            moe_hidden: Buffer::new(&ctx, (b * k * cfg.intermediate * f).max(4))?,
+            moe_out: Buffer::new(&ctx, (b * k * cfg.hidden * f).max(4))?,
+            moe_counts: Buffer::new(&ctx, (cfg.experts * 4).max(4))?,
+            moe_lists: Buffer::new(&ctx, (cfg.experts * b * 4).max(4))?,
             att_tiles: Buffer::new(&ctx, b * 2 * 4)?,
             k_cache: Buffer::new(&ctx, cache)?,
             v_cache: Buffer::new(&ctx, cache)?,
@@ -504,6 +565,107 @@ impl GpuBackend {
                 threads[2] as u32,
             )
         };
+    }
+
+    /// The mixture-of-experts MLP: route each token of `xb` to its experts,
+    /// run each (token, expert) slot through that expert, and add the
+    /// router-weighted outputs to `x`. All on the GPU, no round trip.
+    fn moe(&self, layer: &GpuLayer, router: &GpuMatrix, t: usize) {
+        let (a, c) = (&self.act, &self.cfg);
+        let k = c.experts_per_token;
+        let params = |rows: usize, cols: usize, per_slot: bool| MoeParams {
+            rows: rows as u32,
+            cols: cols as u32,
+            k: k as u32,
+            per_slot: per_slot as u32,
+            t: t as u32,
+            experts: c.experts as u32,
+        };
+        self.matmul(router, &a.xb, &a.route, t, None, false);
+        self.dispatch(
+            Kernel::MoeRoute,
+            &[(&a.route, 0), (&a.moe_ids, 0), (&a.moe_gates, 0)],
+            &params(0, 0, false),
+            [t.div_ceil(32), 1, 1],
+            [32, 1, 1],
+        );
+        let grouped = t >= MOE_GEMM_MIN_BATCH;
+        if grouped {
+            self.dispatch(
+                Kernel::MoeGroup,
+                &[(&a.moe_ids, 0), (&a.moe_counts, 0), (&a.moe_lists, 0)],
+                &params(0, 0, false),
+                [c.experts.div_ceil(32), 1, 1],
+                [32, 1, 1],
+            );
+        }
+        let gate_up = params(2 * c.intermediate, c.hidden, false);
+        self.moe_matmul(&layer.w_gate_up, &a.xb, &a.moe_gate_up, &gate_up, grouped);
+        let silu = SiluParams {
+            inter: c.intermediate as u32,
+            n: (t * k * c.intermediate) as u32,
+        };
+        self.dispatch(
+            Kernel::SiluMul,
+            &[(&a.moe_gate_up, 0), (&a.moe_hidden, 0)],
+            &silu,
+            [(t * k * c.intermediate).div_ceil(256), 1, 1],
+            [256, 1, 1],
+        );
+        let down = params(c.hidden, c.intermediate, true);
+        self.moe_matmul(&layer.w_down, &a.moe_hidden, &a.moe_out, &down, grouped);
+        self.dispatch(
+            Kernel::MoeCombine,
+            &[(&a.x, 0), (&a.moe_out, 0), (&a.moe_gates, 0)],
+            &params(c.hidden, 0, false),
+            [(t * c.hidden).div_ceil(256), 1, 1],
+            [256, 1, 1],
+        );
+    }
+
+    /// Each slot's row of `y` = its expert's rows of `m` times its input:
+    /// a matrix-vector product per slot, or (`grouped`, after moe_group) a
+    /// GEMM per expert over the slots routed to it.
+    fn moe_matmul(&self, m: &GpuMatrix, x: &Buffer, y: &Buffer, p: &MoeParams, grouped: bool) {
+        let a = &self.act;
+        let mut args: Vec<(&Buffer, usize)> = m.bufs.iter().map(|b| (b, 0)).collect();
+        let (t, k, rows) = (p.t as usize, p.k as usize, p.rows as usize);
+        if grouped {
+            if args.len() == 1 {
+                args.push((&m.bufs[0], 0)); // bf16 has one buffer; inputs stay at index 2
+            }
+            args.extend([(x, 0), (y, 0), (&a.moe_counts, 0), (&a.moe_lists, 0)]);
+            let kernel = match m.kernel {
+                Kernel::MatBf16 => Kernel::MoeGemmBf16,
+                Kernel::MatQ8 => Kernel::MoeGemmQ8,
+                _ => Kernel::MoeGemmQ4,
+            };
+            self.dispatch(
+                kernel,
+                &args,
+                p,
+                [
+                    rows.div_ceil(GEMM_ROWS),
+                    t.div_ceil(GEMM_TOKENS),
+                    p.experts as usize,
+                ],
+                [128, 1, 1],
+            );
+        } else {
+            args.extend([(x, 0), (y, 0), (&a.moe_ids, 0)]);
+            let kernel = match m.kernel {
+                Kernel::MatBf16 => Kernel::MoeBf16,
+                Kernel::MatQ8 => Kernel::MoeQ8,
+                _ => Kernel::MoeQ4,
+            };
+            self.dispatch(
+                kernel,
+                &args,
+                p,
+                [rows.div_ceil(ROWS_PER_GROUP), t * k, 1],
+                [32 * MAT_SIMDS, 1, 1],
+            );
+        }
     }
 
     /// `y[i] (+)= m · x[i]` for `t` rows of `x`.
@@ -606,8 +768,11 @@ impl Backend for GpuBackend {
         unsafe {
             let x = a.x.floats(t * dim);
             for (i, &tok) in batch.tokens.iter().enumerate() {
-                self.embed
-                    .row_into(tok as usize, &mut x[i * dim..(i + 1) * dim]);
+                let row = &mut x[i * dim..(i + 1) * dim];
+                self.embed.row_into(tok as usize, row);
+                if c.embedding_multiplier != 1.0 {
+                    row.iter_mut().for_each(|v| *v *= c.embedding_multiplier);
+                }
             }
             let (cos, sin) = (a.cos.floats(t * half), a.sin.floats(t * half));
             for (i, &pos) in batch.positions.iter().enumerate() {
@@ -652,7 +817,7 @@ impl Backend for GpuBackend {
             q_dim: q_dim as u32,
             kv_dim: kv_dim as u32,
             max_seq: self.max_seq as u32,
-            scale: 1.0 / (hd as f32).sqrt(),
+            scale: c.attention_scale(),
         };
         let silu = SiluParams {
             inter: inter as u32,
@@ -726,6 +891,10 @@ impl Backend for GpuBackend {
             }
             self.matmul(&layer.wo, &a.att, &a.x, t, None, true);
             self.rmsnorm(&a.x, &layer.mlp_norm, &a.xb, t, false);
+            if let Some(router) = &layer.router {
+                self.moe(layer, router, t);
+                continue;
+            }
             self.matmul(&layer.w_gate_up, &a.xb, &a.gate_up, t, None, false);
             self.dispatch(
                 Kernel::SiluMul,

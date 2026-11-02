@@ -172,6 +172,12 @@ mod tests {
             norm_eps: 1e-6,
             tied_embeddings: true,
             eos_ids: vec![],
+            embedding_multiplier: 1.0,
+            attention_multiplier: None,
+            residual_multiplier: 1.0,
+            logits_scaling: 1.0,
+            experts: 0,
+            experts_per_token: 0,
         };
         let mut imp = Importance::new(&c);
         Importance::accumulate(

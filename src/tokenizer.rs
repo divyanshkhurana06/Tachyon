@@ -16,6 +16,9 @@ use std::path::Path;
 use crate::json::Json;
 use crate::{bail, Error, Result};
 
+/// Stands for a byte with no token of its own.
+const NO_TOKEN: u32 = u32::MAX;
+
 pub struct Tokenizer {
     /// id -> raw bytes (added tokens: their UTF-8 content).
     tokens: Vec<Vec<u8>>,
@@ -25,8 +28,8 @@ pub struct Tokenizer {
     merges: HashMap<(u32, u32), (u32, u32)>,
     /// Added tokens, matched literally before pre-tokenization.
     added: Vec<(String, u32)>,
-    /// Llama 3 groups digits in threes; Qwen2 splits every digit.
-    max_digits: usize,
+    /// How text is split into chunks before BPE.
+    pretok: Pretokenizer,
     /// Llama 3's `ignore_merges`: a chunk that is itself in the vocabulary
     /// becomes that token, whatever the merges would have made of it.
     whole: Option<HashMap<Vec<u8>, u32>>,
@@ -43,7 +46,19 @@ impl Tokenizer {
         if model.get("type").and_then(Json::as_str) != Some("BPE") {
             bail!("only BPE tokenizers are supported");
         }
-        let max_digits = if text.contains(r"\\p{N}{1,3}") { 3 } else { 1 };
+        // GPT-2's regex when the byte-level step splits by itself (Granite,
+        // StarCoder); otherwise GPT-4's, digits grouped in threes for Llama 3
+        // and split one by one for Qwen2.
+        let pre = j.get("pre_tokenizer");
+        let pretok = if pre.and_then(|p| p.get("type")).and_then(Json::as_str) == Some("ByteLevel")
+            && pre.and_then(|p| p.get("use_regex")).and_then(Json::as_bool) == Some(true)
+        {
+            Pretokenizer::Gpt2
+        } else if text.contains(r"\\p{N}{1,3}") {
+            Pretokenizer::Gpt4 { max_digits: 3 }
+        } else {
+            Pretokenizer::Gpt4 { max_digits: 1 }
+        };
         let ignore_merges = model
             .get("ignore_merges")
             .and_then(Json::as_bool)
@@ -83,11 +98,17 @@ impl Tokenizer {
             tokens[id] = bytes;
         }
 
-        let mut byte_ids = [0u32; 256];
+        // Some vocabularies leave out bytes that never or almost never occur
+        // in UTF-8 text (0xC0, 0xC1, 0xF1..: unassigned planes); they are
+        // dropped (NO_TOKEN), as tokenizers without an unknown token do.
+        let mut byte_ids = [NO_TOKEN; 256];
         for b in 0..=255u8 {
-            byte_ids[b as usize] = *by_bytes
-                .get(&vec![b])
-                .ok_or_else(|| Error(format!("vocab lacks byte {b}")))?;
+            if let Some(&id) = by_bytes.get(&vec![b]) {
+                byte_ids[b as usize] = id;
+            }
+        }
+        if byte_ids[..0x80].contains(&NO_TOKEN) {
+            bail!("the vocabulary lacks ASCII bytes; it is not byte-level");
         }
 
         let merge_list = model
@@ -139,7 +160,7 @@ impl Tokenizer {
             byte_ids,
             merges,
             added,
-            max_digits,
+            pretok,
             whole: ignore_merges.then_some(by_bytes),
         })
     }
@@ -178,7 +199,7 @@ impl Tokenizer {
         loop {
             let found = self.find_added(rest, allow_added);
             let plain = found.map_or(rest, |(at, _, _)| &rest[..at]);
-            for chunk in pre_tokenize(plain, self.max_digits) {
+            for chunk in pre_tokenize(plain, self.pretok) {
                 self.bpe(chunk.as_bytes(), &mut out);
             }
             match found {
@@ -236,7 +257,7 @@ impl Tokenizer {
             ids[p] = merged;
             ids.remove(p + 1);
         }
-        out.extend(ids);
+        out.extend(ids.into_iter().filter(|&id| id != NO_TOKEN));
     }
 }
 
@@ -284,23 +305,75 @@ fn is_other(c: char) -> bool {
     !c.is_whitespace() && !is_letter(c) && !is_number(c)
 }
 
-/// Splits text the way this pattern does (leftmost alternative wins):
-///
-/// ```text
-/// (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?\p{L}+ | \p{N}{1,max_digits}
-///   | ` ?[^\s\p{L}\p{N}]+[\r\n]*` | \s*[\r\n]+ | \s+(?!\S) | \s+
-/// ```
-pub fn pre_tokenize(text: &str, max_digits: usize) -> Vec<&str> {
+/// The regex a vocabulary's text is split with before BPE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pretokenizer {
+    /// GPT-4's (Qwen2, Llama 3), with digits in runs of up to `max_digits`:
+    ///
+    /// ```text
+    /// (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?\p{L}+ | \p{N}{1,max_digits}
+    ///   | ` ?[^\s\p{L}\p{N}]+[\r\n]*` | \s*[\r\n]+ | \s+(?!\S) | \s+
+    /// ```
+    Gpt4 { max_digits: usize },
+    /// GPT-2's (Granite, StarCoder):
+    ///
+    /// ```text
+    /// 's|'t|'re|'ve|'m|'ll|'d | ` ?\p{L}+` | ` ?\p{N}+` | ` ?[^\s\p{L}\p{N}]+` | \s+(?!\S) | \s+
+    /// ```
+    Gpt2,
+}
+
+/// Splits text the way the pretokenizer's pattern does (leftmost
+/// alternative wins), hand-written instead of using a regex engine.
+pub fn pre_tokenize(text: &str, p: Pretokenizer) -> Vec<&str> {
     let chars: Vec<(usize, char)> = text.char_indices().collect();
     let offset = |i: usize| chars.get(i).map_or(text.len(), |&(o, _)| o);
     let mut out = Vec::new();
     let mut i = 0;
     while i < chars.len() {
-        let end = match_at(&chars, i, max_digits);
+        let end = match p {
+            Pretokenizer::Gpt4 { max_digits } => match_at(&chars, i, max_digits),
+            Pretokenizer::Gpt2 => match_gpt2(&chars, i),
+        };
         out.push(&text[offset(i)..offset(end)]);
         i = end;
     }
     out
+}
+
+fn match_gpt2(c: &[(usize, char)], i: usize) -> usize {
+    let at = |j: usize| c.get(j).map(|&(_, ch)| ch);
+    let run = |mut j: usize, pred: fn(char) -> bool| {
+        while at(j).is_some_and(pred) {
+            j += 1;
+        }
+        j
+    };
+    let c0 = at(i).unwrap();
+    // 's 't 're 've 'm 'll 'd, lower case only
+    if c0 == '\'' {
+        match (at(i + 1), at(i + 2)) {
+            (Some('s' | 't' | 'm' | 'd'), _) => return i + 2,
+            (Some('r'), Some('e')) | (Some('v'), Some('e')) | (Some('l'), Some('l')) => {
+                return i + 3
+            }
+            _ => {}
+        }
+    }
+    // a run of letters, digits or other symbols, optionally led by a space
+    let start = if c0 == ' ' { i + 1 } else { i };
+    for class in [is_letter as fn(char) -> bool, is_number, is_other] {
+        if at(start).is_some_and(class) {
+            return run(start, class);
+        }
+    }
+    // whitespace: all but the last char if more follows (\s+(?!\S))
+    let end = run(i, char::is_whitespace);
+    if end == c.len() || end - i == 1 {
+        end
+    } else {
+        end - 1
+    }
 }
 
 fn match_at(c: &[(usize, char)], i: usize, max_digits: usize) -> usize {
@@ -428,9 +501,39 @@ mod tests {
             ("café über", &["café", " über"]),
         ];
         for (text, expected) in cases {
-            assert_eq!(&pre_tokenize(text, 1), expected, "for {text:?}");
+            assert_eq!(
+                &pre_tokenize(text, Pretokenizer::Gpt4 { max_digits: 1 }),
+                expected,
+                "for {text:?}"
+            );
         }
-        assert_eq!(pre_tokenize("12345", 3), ["123", "45"]);
+        assert_eq!(
+            pre_tokenize("12345", Pretokenizer::Gpt4 { max_digits: 3 }),
+            ["123", "45"]
+        );
+    }
+
+    #[test]
+    fn gpt2_pre_tokenizer_splits_like_its_regex() {
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "Hello world's  test",
+                &["Hello", " world", "'s", " ", " test"],
+            ),
+            ("Hello\n\nWorld", &["Hello", "\n", "\n", "World"]),
+            ("end\n\n", &["end", "\n\n"]),
+            ("I'M 2024 cats!!", &["I", "'", "M", " 2024", " cats", "!!"]),
+            ("x = f(1);", &["x", " =", " f", "(", "1", ");"]),
+            ("\tindent", &["\t", "indent"]),
+            ("café 日本", &["café", " 日本"]),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(
+                &pre_tokenize(text, Pretokenizer::Gpt2),
+                expected,
+                "for {text:?}"
+            );
+        }
     }
 
     #[test]

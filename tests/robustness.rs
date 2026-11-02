@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use tachyon::constrain::{Constraint, JsonObject};
 use tachyon::json::Json;
 use tachyon::safetensors::SafeTensors;
-use tachyon::tokenizer::pre_tokenize;
+use tachyon::tokenizer::{pre_tokenize, Pretokenizer};
 
 struct Rng(u64);
 
@@ -179,8 +179,12 @@ fn pre_tokenizer_chunks_cover_the_input_exactly() {
     ];
     for _ in 0..2000 {
         let text: String = (0..rng.below(20)).map(|_| *rng.pick(&pieces)).collect();
-        for digits in [1, 3] {
-            let chunks = pre_tokenize(&text, digits);
+        for p in [
+            Pretokenizer::Gpt4 { max_digits: 1 },
+            Pretokenizer::Gpt4 { max_digits: 3 },
+            Pretokenizer::Gpt2,
+        ] {
+            let chunks = pre_tokenize(&text, p);
             assert_eq!(chunks.concat(), text);
             assert!(chunks.iter().all(|c| !c.is_empty()));
         }

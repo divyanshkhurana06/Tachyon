@@ -198,7 +198,22 @@ impl Matrix {
     /// several tokens (prefill, speculative verification) each weight row is
     /// read from memory once and reused from cache.
     pub fn matmul(&self, pool: &Pool, x: &[f32], t: usize, out: &mut [f32]) {
-        let (rows, cols) = (self.rows(), self.cols());
+        self.matmul_rows(pool, x, t, out, 0..self.rows());
+    }
+
+    /// [`Matrix::matmul`] with only the rows in `range`: `out` is
+    /// `t x range.len()`. A mixture-of-experts layer stores its experts'
+    /// matrices stacked, and runs one expert's rows at a time.
+    pub fn matmul_rows(
+        &self,
+        pool: &Pool,
+        x: &[f32],
+        t: usize,
+        out: &mut [f32],
+        range: std::ops::Range<usize>,
+    ) {
+        let (rows, cols, row0) = (range.len(), self.cols(), range.start);
+        assert!(range.end <= self.rows());
         assert_eq!(x.len(), t * cols);
         assert_eq!(out.len(), t * rows);
         // Even, so the I8MM path's row pairs don't straddle chunks.
@@ -207,7 +222,7 @@ impl Matrix {
         match self {
             Matrix::Bf16 { data, .. } => pool.parallel_for(rows, grain, |range| {
                 for r in range {
-                    let w = &data[r * cols..(r + 1) * cols];
+                    let w = &data[(row0 + r) * cols..(row0 + r + 1) * cols];
                     for i in 0..t {
                         // SAFETY: each (i, r) is written by exactly one thread.
                         unsafe {
@@ -218,7 +233,12 @@ impl Matrix {
             }),
             Matrix::Q8 { scales, qs, .. } => int_matmul(
                 pool,
-                &Q8Rows { scales, qs, cols },
+                &Q8Rows {
+                    scales,
+                    qs,
+                    cols,
+                    row0,
+                },
                 rows,
                 cols,
                 x,
@@ -228,7 +248,12 @@ impl Matrix {
             ),
             Matrix::Q4 { scales, qs, .. } => int_matmul(
                 pool,
-                &Q4Rows { scales, qs, cols },
+                &Q4Rows {
+                    scales,
+                    qs,
+                    cols,
+                    row0,
+                },
                 rows,
                 cols,
                 x,
@@ -257,11 +282,13 @@ struct Q8Rows<'a> {
     scales: &'a [f32],
     qs: &'a [i8],
     cols: usize,
+    /// Row `r` is the matrix's row `row0 + r`.
+    row0: usize,
 }
 
 impl Q8Rows<'_> {
     fn row(&self, r: usize) -> (&[f32], &[i8]) {
-        let (nb, cols) = (self.cols / QK, self.cols);
+        let (nb, cols, r) = (self.cols / QK, self.cols, self.row0 + r);
         (
             &self.scales[r * nb..(r + 1) * nb],
             &self.qs[r * cols..(r + 1) * cols],
@@ -293,11 +320,12 @@ struct Q4Rows<'a> {
     scales: &'a [f32],
     qs: &'a [u8],
     cols: usize,
+    row0: usize,
 }
 
 impl Q4Rows<'_> {
     fn row(&self, r: usize) -> (&[f32], &[u8]) {
-        let (nb, half) = (self.cols / QK, self.cols / 2);
+        let (nb, half, r) = (self.cols / QK, self.cols / 2, self.row0 + r);
         (
             &self.scales[r * nb..(r + 1) * nb],
             &self.qs[r * half..(r + 1) * half],
