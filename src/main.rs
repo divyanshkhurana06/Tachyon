@@ -38,6 +38,7 @@ commands:
   ppl        perplexity of the model on --file
   calibrate  measure activations on --file (default bench/calib.txt) and save
              an importance matrix that improves 4-bit quantization
+  tokenize   print the token ids of --prompt, or of --file
 
 options:
   --model DIR        model folder (default models/qwen2.5-0.5b-instruct)
@@ -249,6 +250,7 @@ fn main() -> ExitCode {
         "loadtest" => loadtest(&a),
         "bench-batch" => bench_batch(&a),
         "calibrate" => calibrate(&a),
+        "tokenize" => tokenize(&a),
         "help" => {
             println!("{USAGE}");
             Ok(())
@@ -520,6 +522,24 @@ fn eval_tokens(a: &Args, tok: &Tokenizer, max: usize) -> Result<Vec<u32>> {
         bail!("{} is too short", a.file.display());
     }
     Ok(tokens)
+}
+
+/// Token ids as a list, the way `llama-tokenize --ids` prints them, so the
+/// two tokenizers can be compared on any text.
+fn tokenize(a: &Args) -> Result<()> {
+    let tok = Tokenizer::load(&a.model.join("tokenizer.json"))?;
+    let text = match &a.prompt {
+        Some(p) => p.clone(),
+        None => std::fs::read_to_string(&a.file)
+            .map_err(|e| Error(format!("cannot read {}: {e}", a.file.display())))?,
+    };
+    let ids: Vec<String> = tok
+        .encode(&text, false)
+        .iter()
+        .map(u32::to_string)
+        .collect();
+    println!("[{}]", ids.join(", "));
+    Ok(())
 }
 
 fn perplexity_cmd(a: &Args) -> Result<()> {

@@ -168,17 +168,15 @@ impl Tokenizer {
         self.tokens.get(id as usize).map_or(&[], Vec::as_slice)
     }
 
-    /// `allow_added`: treat added-token text (e.g. `<|im_start|>`) as the
-    /// control token itself. Leave it off for untrusted text.
+    /// `allow_added`: treat special added-token text (control tokens such
+    /// as `<|im_start|>`) as the token itself. Leave it off for untrusted
+    /// text. Added tokens that aren't special (Qwen's `<tool_call>`) are
+    /// always matched, as Hugging Face's tokenizers and llama.cpp do.
     pub fn encode(&self, text: &str, allow_added: bool) -> Vec<u32> {
         let mut out = Vec::new();
         let mut rest = text;
         loop {
-            let found = if allow_added {
-                self.find_added(rest)
-            } else {
-                None
-            };
+            let found = self.find_added(rest, allow_added);
             let plain = found.map_or(rest, |(at, _, _)| &rest[..at]);
             for chunk in pre_tokenize(plain, self.max_digits) {
                 self.bpe(chunk.as_bytes(), &mut out);
@@ -202,10 +200,14 @@ impl Tokenizer {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
-    /// Earliest added token in `s`: (byte offset, length, id).
-    fn find_added(&self, s: &str) -> Option<(usize, usize, u32)> {
+    /// Earliest added token in `s` (special ones only if `special_too`):
+    /// (byte offset, length, id).
+    fn find_added(&self, s: &str, special_too: bool) -> Option<(usize, usize, u32)> {
         let mut best: Option<(usize, usize, u32)> = None;
         for (content, id) in &self.added {
+            if !special_too && self.is_special(*id) {
+                continue;
+            }
             if let Some(at) = s.find(content.as_str()) {
                 if best.is_none_or(|(b, _, _)| at < b) {
                     best = Some((at, content.len(), *id));
