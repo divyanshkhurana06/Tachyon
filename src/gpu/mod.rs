@@ -10,7 +10,8 @@ use std::ffi::{c_char, c_void, CStr, CString};
 use std::mem::size_of;
 
 use crate::config::Config;
-use crate::engine::Engine;
+use crate::engine::Backend;
+use crate::kv::{Batch, Logits, BLOCK};
 use crate::model::{rope_frequencies, Weights};
 use crate::weights::Matrix;
 use crate::{Error, Result};
@@ -21,6 +22,11 @@ const SOURCE: &str = include_str!("kernels.metal");
 const MAT_SIMDS: usize = 2;
 const ROWS_PER_GROUP: usize = MAT_SIMDS * 4;
 const ATT_THREADS: u32 = 256;
+/// Output tile of the `gemm_*` kernels, and the batch size from which they
+/// beat the matrix-vector kernels.
+const GEMM_TOKENS: usize = 16;
+const GEMM_ROWS: usize = 64;
+const GEMM_MIN_BATCH: usize = 4;
 
 /// Most tokens one forward pass takes (prefill chunks, speculative checks).
 pub const MAX_BATCH: usize = 128;
@@ -31,17 +37,25 @@ enum Kernel {
     MatBf16,
     MatQ8,
     MatQ4,
+    GemmBf16,
+    GemmQ8,
+    GemmQ4,
     RmsNorm,
+    HeadNorm,
     RopeStore,
     Attention,
     SiluMul,
 }
 
-const KERNELS: [&str; 7] = [
+const KERNELS: [&str; 11] = [
     "matmul_bf16",
     "matmul_q8",
     "matmul_q4",
+    "gemm_bf16",
+    "gemm_q8",
+    "gemm_q4",
     "rmsnorm",
+    "head_norm",
     "rope_store",
     "attention",
     "silu_mul",
@@ -135,6 +149,15 @@ impl Buffer {
         assert!(n * 4 <= self.len);
         std::slice::from_raw_parts_mut(self.contents() as *mut f32, n)
     }
+
+    /// Copies `data` to the start of the buffer.
+    ///
+    /// # Safety
+    /// No GPU work may be using the buffer.
+    unsafe fn write_u32(&self, data: &[u32]) {
+        assert!(data.len() * 4 <= self.len, "GPU buffer too small");
+        std::ptr::copy_nonoverlapping(data.as_ptr(), self.contents() as *mut u32, data.len());
+    }
 }
 
 impl Drop for Buffer {
@@ -186,6 +209,7 @@ struct GpuLayer {
     attn_norm: Buffer,
     wqkv: GpuMatrix,
     bqkv: Option<Buffer>,
+    qk_norm: Option<(Buffer, Buffer)>,
     wo: GpuMatrix,
     mlp_norm: Buffer,
     w_gate_up: GpuMatrix,
@@ -205,6 +229,16 @@ struct MatParams {
 struct NormParams {
     n: u32,
     eps: f32,
+    gather: u32,
+}
+
+#[repr(C)]
+struct HeadNormParams {
+    head_dim: u32,
+    heads: u32,
+    qkv_dim: u32,
+    q_dim: u32,
+    eps: f32,
 }
 
 #[repr(C)]
@@ -215,7 +249,6 @@ struct RopeParams {
     qkv_dim: u32,
     q_dim: u32,
     kv_dim: u32,
-    pos0: u32,
 }
 
 #[repr(C)]
@@ -226,7 +259,6 @@ struct AttnParams {
     qkv_dim: u32,
     q_dim: u32,
     kv_dim: u32,
-    pos0: u32,
     max_seq: u32,
     scale: f32,
 }
@@ -237,7 +269,7 @@ struct SiluParams {
     n: u32,
 }
 
-/// Activations for up to MAX_BATCH tokens, plus the KV cache.
+/// Activations and batch layout for up to MAX_BATCH tokens, plus the KV cache.
 struct Activations {
     x: Buffer,
     xb: Buffer,
@@ -249,14 +281,20 @@ struct Activations {
     logits: Buffer,
     cos: Buffer,
     sin: Buffer,
+    positions: Buffer,
+    slots: Buffer,
+    table_of: Buffer,
+    tables: Buffer,
+    rows: Buffer,
     k_cache: Buffer,
     v_cache: Buffer,
 }
 
-pub struct GpuEngine {
+pub struct GpuBackend {
     cfg: Config,
     device: String,
-    format: &'static str,
+    format: String,
+    kv_bytes: usize,
     // Field order matters for drop: buffers before the context.
     act: Activations,
     layers: Vec<GpuLayer>,
@@ -265,18 +303,34 @@ pub struct GpuEngine {
     /// Kept on the CPU for embedding lookups.
     embed: Matrix,
     freqs: Vec<f64>,
+    blocks: usize,
     max_seq: usize,
-    pos: usize,
     ctx: Context,
 }
 
 // Metal objects may be used from any thread, one thread at a time; the
-// engine is only ever driven through `&mut self`.
-unsafe impl Send for GpuEngine {}
+// backend is only ever driven through `&mut self`.
+unsafe impl Send for GpuBackend {}
 
-impl GpuEngine {
-    pub fn new(cfg: Config, w: Weights, max_seq: usize) -> Result<GpuEngine> {
-        let source = CString::new(SOURCE).unwrap();
+impl GpuBackend {
+    /// `blocks`: KV cache size in blocks of BLOCK positions, shared by all
+    /// sequences. `max_seq`: the longest one sequence may get.
+    ///
+    /// `kv_half` stores the KV cache as f16: half the memory, so twice the
+    /// users or context fit, at a small cost in precision.
+    pub fn new(
+        cfg: Config,
+        w: Weights,
+        blocks: usize,
+        max_seq: usize,
+        kv_half: bool,
+    ) -> Result<GpuBackend> {
+        let source = if kv_half {
+            format!("#define KV_HALF\n{SOURCE}")
+        } else {
+            SOURCE.to_string()
+        };
+        let source = CString::new(source).unwrap();
         let names: Vec<CString> = KERNELS.iter().map(|k| CString::new(*k).unwrap()).collect();
         let name_ptrs: Vec<*const c_char> = names.iter().map(|n| n.as_ptr()).collect();
         let mut err = [0 as c_char; 1024];
@@ -306,11 +360,17 @@ impl GpuEngine {
                 cfg.head_dim
             )));
         }
-        let max_seq = max_seq.min(cfg.max_positions);
+        let max_seq = max_seq.min(cfg.max_positions).min(blocks * BLOCK);
         let layers = w
             .layers
             .iter()
             .map(|l| {
+                let qk_norm = match (&l.q_norm, &l.k_norm) {
+                    (Some(q), Some(k)) => {
+                        Some((Buffer::from_slice(&ctx, q)?, Buffer::from_slice(&ctx, k)?))
+                    }
+                    _ => None,
+                };
                 Ok(GpuLayer {
                     attn_norm: Buffer::from_slice(&ctx, &l.attn_norm)?,
                     wqkv: GpuMatrix::upload(&ctx, &l.wqkv)?,
@@ -319,6 +379,7 @@ impl GpuEngine {
                         .as_ref()
                         .map(|b| Buffer::from_slice(&ctx, b))
                         .transpose()?,
+                    qk_norm,
                     wo: GpuMatrix::upload(&ctx, &l.wo)?,
                     mlp_norm: Buffer::from_slice(&ctx, &l.mlp_norm)?,
                     w_gate_up: GpuMatrix::upload(&ctx, &l.w_gate_up)?,
@@ -332,7 +393,8 @@ impl GpuEngine {
         let f = size_of::<f32>();
         let b = MAX_BATCH;
         let qkv_dim = cfg.q_dim() + 2 * cfg.kv_dim();
-        let cache = cfg.layers * max_seq * cfg.kv_dim() * f;
+        let kv_bytes = if kv_half { 2 } else { 4 };
+        let cache = cfg.layers * blocks * BLOCK * cfg.kv_dim() * kv_bytes;
         let act = Activations {
             x: Buffer::new(&ctx, b * cfg.hidden * f)?,
             xb: Buffer::new(&ctx, b * cfg.hidden * f)?,
@@ -344,26 +406,56 @@ impl GpuEngine {
             logits: Buffer::new(&ctx, b * lm_head.rows * f)?,
             cos: Buffer::new(&ctx, b * cfg.head_dim / 2 * f)?,
             sin: Buffer::new(&ctx, b * cfg.head_dim / 2 * f)?,
+            positions: Buffer::new(&ctx, b * 4)?,
+            slots: Buffer::new(&ctx, b * 4)?,
+            table_of: Buffer::new(&ctx, b * 4)?,
+            tables: Buffer::new(&ctx, b * (max_seq.div_ceil(BLOCK) + 1) * 4)?,
+            rows: Buffer::new(&ctx, b * 4)?,
             k_cache: Buffer::new(&ctx, cache)?,
             v_cache: Buffer::new(&ctx, cache)?,
         };
 
-        let format = w.format.name();
+        let format = if kv_half {
+            format!("{}, f16 KV", w.format.name())
+        } else {
+            w.format.name().to_string()
+        };
         let Weights { embed, .. } = w; // everything else now lives on the GPU
-        Ok(GpuEngine {
+        let mut gpu = GpuBackend {
             freqs: rope_frequencies(&cfg),
             cfg,
             device,
             format,
+            kv_bytes,
             act,
             layers,
             norm,
             lm_head,
             embed,
+            blocks,
             max_seq,
-            pos: 0,
             ctx,
-        })
+        };
+        gpu.self_test()?;
+        Ok(gpu)
+    }
+
+    /// Runs one token through the model and checks the logits look like
+    /// logits. Some virtual Macs (CI runners) expose a Metal device that
+    /// accepts work but returns zeros; better to refuse than to generate
+    /// garbage. The cache slot it writes is overwritten before any real
+    /// sequence reads it.
+    fn self_test(&mut self) -> Result<()> {
+        let mut batch = Batch::default();
+        batch.push(&[0], 0, &[0], Logits::Last);
+        let logits = self.forward(&batch);
+        if logits.iter().all(|&v| v == 0.0) || logits.iter().any(|v| !v.is_finite()) {
+            return Err(Error(format!(
+                "the Metal device ({}) returned no usable output; virtual GPUs are not supported",
+                self.device
+            )));
+        }
+        Ok(())
     }
 
     fn dispatch<P>(
@@ -400,12 +492,11 @@ impl GpuEngine {
     }
 
     /// `y[i] (+)= m · x[i]` for `t` rows of `x`.
-    #[allow(clippy::too_many_arguments)]
     fn matmul(
         &self,
         m: &GpuMatrix,
-        x: (&Buffer, usize),
-        y: (&Buffer, usize),
+        x: &Buffer,
+        y: &Buffer,
         t: usize,
         bias: Option<&Buffer>,
         accumulate: bool,
@@ -417,26 +508,43 @@ impl GpuEngine {
             accumulate: accumulate as u32,
             has_bias: bias.is_some() as u32,
         };
-        let bias = (bias.unwrap_or(y.0), 0);
         let mut args: Vec<(&Buffer, usize)> = m.bufs.iter().map(|b| (b, 0)).collect();
-        args.extend([x, y, bias]);
-        self.dispatch(
-            m.kernel,
-            &args,
-            &p,
-            [m.rows.div_ceil(ROWS_PER_GROUP), 1, 1],
-            [32 * MAT_SIMDS, 1, 1],
-        );
+        args.extend([(x, 0), (y, 0), (bias.unwrap_or(y), 0)]);
+        if t >= GEMM_MIN_BATCH {
+            let gemm = match m.kernel {
+                Kernel::MatBf16 => Kernel::GemmBf16,
+                Kernel::MatQ8 => Kernel::GemmQ8,
+                _ => Kernel::GemmQ4,
+            };
+            self.dispatch(
+                gemm,
+                &args,
+                &p,
+                [m.rows.div_ceil(GEMM_ROWS), t.div_ceil(GEMM_TOKENS), 1],
+                [128, 1, 1],
+            );
+        } else {
+            self.dispatch(
+                m.kernel,
+                &args,
+                &p,
+                [m.rows.div_ceil(ROWS_PER_GROUP), 1, 1],
+                [32 * MAT_SIMDS, 1, 1],
+            );
+        }
     }
 
-    fn rmsnorm(&self, x: (&Buffer, usize), w: &Buffer, out: &Buffer, rows: usize) {
+    /// RMSNorm `rows` rows of `x` into `out`; with `gather`, row i of the
+    /// output comes from row `act.rows[i]` of the input.
+    fn rmsnorm(&self, x: &Buffer, w: &Buffer, out: &Buffer, rows: usize, gather: bool) {
         let p = NormParams {
             n: self.cfg.hidden as u32,
             eps: self.cfg.norm_eps,
+            gather: gather as u32,
         };
         self.dispatch(
             Kernel::RmsNorm,
-            &[x, (w, 0), (out, 0)],
+            &[(x, 0), (w, 0), (out, 0), (&self.act.rows, 0)],
             &p,
             [rows, 1, 1],
             [256, 1, 1],
@@ -444,7 +552,7 @@ impl GpuEngine {
     }
 }
 
-impl Engine for GpuEngine {
+impl Backend for GpuBackend {
     fn config(&self) -> &Config {
         &self.cfg
     }
@@ -453,47 +561,52 @@ impl Engine for GpuEngine {
         format!("metal {} ({})", self.format, self.device)
     }
 
-    fn pos(&self) -> usize {
-        self.pos
+    fn num_blocks(&self) -> usize {
+        self.blocks
     }
 
-    fn max_seq(&self) -> usize {
-        self.max_seq
+    fn max_batch(&self) -> usize {
+        MAX_BATCH
     }
 
-    fn truncate(&mut self, pos: usize) {
-        self.pos = self.pos.min(pos);
-    }
-
-    fn forward(&mut self, tokens: &[u32], all: bool) -> &[f32] {
-        let t = tokens.len();
+    fn forward(&mut self, batch: &Batch) -> &[f32] {
+        let t = batch.len();
         assert!(
             t > 0 && t <= MAX_BATCH,
-            "the GPU engine takes 1..={MAX_BATCH} tokens per call"
+            "the GPU backend takes 1..={MAX_BATCH} tokens per batch"
         );
-        assert!(self.pos + t <= self.max_seq, "context window full");
+        assert!(
+            batch.positions.iter().all(|&p| (p as usize) < self.max_seq),
+            "sequence longer than max_seq"
+        );
         let c = &self.cfg;
         let (dim, kv_dim, q_dim, inter, hd) =
             (c.hidden, c.kv_dim(), c.q_dim(), c.intermediate, c.head_dim);
         let qkv_dim = q_dim + 2 * kv_dim;
         let half = hd / 2;
         let a = &self.act;
+        let n = batch.logit_rows.len();
 
         // Inputs, written directly into GPU-visible memory.
         unsafe {
             let x = a.x.floats(t * dim);
-            for (i, &tok) in tokens.iter().enumerate() {
+            for (i, &tok) in batch.tokens.iter().enumerate() {
                 self.embed
                     .row_into(tok as usize, &mut x[i * dim..(i + 1) * dim]);
             }
             let (cos, sin) = (a.cos.floats(t * half), a.sin.floats(t * half));
-            for i in 0..t {
+            for (i, &pos) in batch.positions.iter().enumerate() {
                 for j in 0..half {
-                    let angle = (self.pos + i) as f64 * self.freqs[j];
+                    let angle = pos as f64 * self.freqs[j];
                     cos[i * half + j] = angle.cos() as f32;
                     sin[i * half + j] = angle.sin() as f32;
                 }
             }
+            a.positions.write_u32(&batch.positions);
+            a.slots.write_u32(&batch.slots);
+            a.table_of.write_u32(&batch.table_of);
+            a.tables.write_u32(&batch.tables);
+            a.rows.write_u32(&batch.logit_rows);
         }
 
         let rope = RopeParams {
@@ -503,7 +616,13 @@ impl Engine for GpuEngine {
             qkv_dim: qkv_dim as u32,
             q_dim: q_dim as u32,
             kv_dim: kv_dim as u32,
-            pos0: self.pos as u32,
+        };
+        let head_norm = HeadNormParams {
+            head_dim: hd as u32,
+            heads: c.heads as u32,
+            qkv_dim: qkv_dim as u32,
+            q_dim: q_dim as u32,
+            eps: c.norm_eps,
         };
         let attn = AttnParams {
             heads: c.heads as u32,
@@ -512,7 +631,6 @@ impl Engine for GpuEngine {
             qkv_dim: qkv_dim as u32,
             q_dim: q_dim as u32,
             kv_dim: kv_dim as u32,
-            pos0: self.pos as u32,
             max_seq: self.max_seq as u32,
             scale: 1.0 / (hd as f32).sqrt(),
         };
@@ -523,16 +641,18 @@ impl Engine for GpuEngine {
 
         unsafe { tm_begin(self.ctx.0) };
         for (l, layer) in self.layers.iter().enumerate() {
-            let cache_off = l * self.max_seq * kv_dim * 4;
-            self.rmsnorm((&a.x, 0), &layer.attn_norm, &a.xb, t);
-            self.matmul(
-                &layer.wqkv,
-                (&a.xb, 0),
-                (&a.qkv, 0),
-                t,
-                layer.bqkv.as_ref(),
-                false,
-            );
+            let cache_off = l * self.blocks * BLOCK * kv_dim * self.kv_bytes;
+            self.rmsnorm(&a.x, &layer.attn_norm, &a.xb, t, false);
+            self.matmul(&layer.wqkv, &a.xb, &a.qkv, t, layer.bqkv.as_ref(), false);
+            if let Some((qn, kn)) = &layer.qk_norm {
+                self.dispatch(
+                    Kernel::HeadNorm,
+                    &[(&a.qkv, 0), (qn, 0), (kn, 0)],
+                    &head_norm,
+                    [c.heads + c.kv_heads, t, 1],
+                    [hd, 1, 1],
+                );
+            }
             self.dispatch(
                 Kernel::RopeStore,
                 &[
@@ -541,6 +661,7 @@ impl Engine for GpuEngine {
                     (&a.v_cache, cache_off),
                     (&a.cos, 0),
                     (&a.sin, 0),
+                    (&a.slots, 0),
                 ],
                 &rope,
                 [1, c.heads + c.kv_heads, t],
@@ -554,21 +675,17 @@ impl Engine for GpuEngine {
                     (&a.v_cache, cache_off),
                     (&a.scores, 0),
                     (&a.att, 0),
+                    (&a.positions, 0),
+                    (&a.table_of, 0),
+                    (&a.tables, 0),
                 ],
                 &attn,
                 [c.heads, t, 1],
                 [ATT_THREADS as usize, 1, 1],
             );
-            self.matmul(&layer.wo, (&a.att, 0), (&a.x, 0), t, None, true);
-            self.rmsnorm((&a.x, 0), &layer.mlp_norm, &a.xb, t);
-            self.matmul(
-                &layer.w_gate_up,
-                (&a.xb, 0),
-                (&a.gate_up, 0),
-                t,
-                None,
-                false,
-            );
+            self.matmul(&layer.wo, &a.att, &a.x, t, None, true);
+            self.rmsnorm(&a.x, &layer.mlp_norm, &a.xb, t, false);
+            self.matmul(&layer.w_gate_up, &a.xb, &a.gate_up, t, None, false);
             self.dispatch(
                 Kernel::SiluMul,
                 &[(&a.gate_up, 0), (&a.hidden, 0)],
@@ -576,19 +693,18 @@ impl Engine for GpuEngine {
                 [(t * inter).div_ceil(256), 1, 1],
                 [256, 1, 1],
             );
-            self.matmul(&layer.w_down, (&a.hidden, 0), (&a.x, 0), t, None, true);
+            self.matmul(&layer.w_down, &a.hidden, &a.x, t, None, true);
         }
-        let first = if all { 0 } else { t - 1 };
-        let n = t - first;
-        self.rmsnorm((&a.x, first * dim * 4), &self.norm, &a.xb, n);
-        self.matmul(&self.lm_head, (&a.xb, 0), (&a.logits, 0), n, None, false);
+        if n > 0 {
+            self.rmsnorm(&a.x, &self.norm, &a.xb, n, true);
+            self.matmul(&self.lm_head, &a.xb, &a.logits, n, None, false);
+        }
 
         let mut err = [0 as c_char; 1024];
         if unsafe { tm_end(self.ctx.0, err.as_mut_ptr(), err.len()) } != 0 {
             let msg = unsafe { CStr::from_ptr(err.as_ptr()) }.to_string_lossy();
             panic!("GPU command buffer failed: {msg}");
         }
-        self.pos += t;
         unsafe { self.act.logits.floats(n * self.lm_head.rows) }
     }
 }

@@ -2,70 +2,75 @@
 //! HTTP/1.1 implementation.
 //!
 //! - `POST /v1/chat/completions`: chat, optionally streamed as server-sent
-//!   events, so the official `openai` clients and chat UIs work unchanged
+//!   events, so the official `openai` clients and chat UIs work unchanged.
+//!   Supports `stop` strings, `response_format: {"type": "json_object"}`
+//!   (constrained decoding: always valid JSON) and vLLM's `ignore_eos`.
 //! - `GET /v1/models`, `GET /health`, `GET /info`
 //! - `GET /`: a small chat page
 //!
-//! Requests run one at a time against a single KV cache. Consecutive
-//! requests that share a prefix (the same system prompt, the earlier turns
-//! of a chat) skip recomputing it.
+//! Each connection gets a thread that submits its request to the
+//! [`Scheduler`], which batches every in-flight request into shared forward
+//! passes, and relays tokens back as they come.
 
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::chat::{ChatTemplate, Message, DEFAULT_SYSTEM};
-use crate::engine::Engine;
-use crate::generate::{generate, Finish, GenOptions};
+use crate::chat::{ChatTemplate, Message};
+use crate::constrain::JsonObject;
+use crate::generate::Finish;
 use crate::json::{obj, Json};
 use crate::sampler::SamplerConfig;
+use crate::scheduler::{Event, Request, Scheduler, Summary};
 use crate::tokenizer::Tokenizer;
 use crate::Result;
 
 const UI: &str = include_str!("ui.html");
 const MAX_HEADER: usize = 64 * 1024;
 const MAX_BODY: usize = 8 * 1024 * 1024;
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct Server {
-    pub engine: Box<dyn Engine>,
-    pub tok: Tokenizer,
+    pub scheduler: Scheduler,
+    pub tok: Arc<Tokenizer>,
     pub template: ChatTemplate,
     pub stop: Vec<u32>,
     pub model_id: String,
+    pub backend: String,
+    pub params: usize,
+    pub context: usize,
+    /// Added when a request has no system message.
+    pub system: Option<String>,
+    pub kv_tokens: usize,
     pub defaults: SamplerConfig,
     pub max_tokens: usize,
-    cache: Vec<u32>,
 }
 
 impl Server {
-    pub fn new(
-        engine: Box<dyn Engine>,
-        tok: Tokenizer,
-        template: ChatTemplate,
-        stop: Vec<u32>,
-        model_id: String,
-    ) -> Server {
-        Server {
-            engine,
-            tok,
-            template,
-            stop,
-            model_id,
-            defaults: SamplerConfig::default(),
-            max_tokens: 1024,
-            cache: Vec::new(),
-        }
-    }
-
     fn info(&self) -> Json {
-        let c = self.engine.config();
+        let st = &self.scheduler.stats;
         obj([
             ("model", self.model_id.as_str().into()),
-            ("backend", self.engine.name().into()),
-            ("params", c.params().into()),
-            ("context", self.engine.max_seq().into()),
+            ("backend", self.backend.as_str().into()),
+            ("params", self.params.into()),
+            ("context", self.context.into()),
+            ("kv_cache_tokens", self.kv_tokens.into()),
+            ("running", st.running.load(Ordering::Relaxed).into()),
+            ("waiting", st.waiting.load(Ordering::Relaxed).into()),
+            ("steps", st.steps.load(Ordering::Relaxed).into()),
+            ("tokens_generated", st.tokens.load(Ordering::Relaxed).into()),
+            (
+                "forward_seconds",
+                (st.forward_ns.load(Ordering::Relaxed) as f64 / 1e9).into(),
+            ),
+            (
+                "step_seconds",
+                (st.step_ns.load(Ordering::Relaxed) as f64 / 1e9).into(),
+            ),
         ])
     }
 }
@@ -76,13 +81,16 @@ pub fn serve(server: Server, addr: &str) -> Result<()> {
         "serving {} on http://{addr} (chat UI at /, API at /v1)",
         server.model_id
     );
-    let shared = Arc::new(Mutex::new(server));
+    let server = Arc::new(server);
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
-        let shared = shared.clone();
+        let server = server.clone();
         thread::spawn(move || {
-            if let Err(e) = handle(conn, &shared) {
-                if e.kind() != io::ErrorKind::BrokenPipe {
+            if let Err(e) = handle(conn, &server) {
+                if !matches!(
+                    e.kind(),
+                    io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                ) {
                     eprintln!("connection error: {e}");
                 }
             }
@@ -91,7 +99,7 @@ pub fn serve(server: Server, addr: &str) -> Result<()> {
     Ok(())
 }
 
-struct Request {
+struct HttpRequest {
     method: String,
     path: String,
     body: Vec<u8>,
@@ -101,7 +109,7 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-fn read_request(conn: &mut TcpStream) -> io::Result<Option<Request>> {
+fn read_request(conn: &mut TcpStream) -> io::Result<Option<HttpRequest>> {
     conn.set_read_timeout(Some(Duration::from_secs(30)))?;
     let bad = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, msg.to_string());
     let mut buf = Vec::new();
@@ -153,7 +161,7 @@ fn read_request(conn: &mut TcpStream) -> io::Result<Option<Request>> {
         body.extend_from_slice(&chunk[..n]);
     }
     body.truncate(length);
-    Ok(Some(Request { method, path, body }))
+    Ok(Some(HttpRequest { method, path, body }))
 }
 
 const CORS: &str = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
@@ -187,14 +195,9 @@ fn error(conn: &mut TcpStream, status: &str, message: &str) -> io::Result<()> {
     respond_json(conn, status, &body)
 }
 
-fn handle(mut conn: TcpStream, shared: &Mutex<Server>) -> io::Result<()> {
+fn handle(mut conn: TcpStream, server: &Server) -> io::Result<()> {
     let Some(req) = read_request(&mut conn)? else {
         return Ok(());
-    };
-    let lock = || {
-        shared
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
     };
     match (req.method.as_str(), req.path.as_str()) {
         ("OPTIONS", _) => respond(&mut conn, "204 No Content", "text/plain", b""),
@@ -205,14 +208,10 @@ fn handle(mut conn: TcpStream, shared: &Mutex<Server>) -> io::Result<()> {
             UI.as_bytes(),
         ),
         ("GET", "/health") => respond_json(&mut conn, "200 OK", &obj([("status", "ok".into())])),
-        ("GET", "/info") => {
-            let info = lock().info();
-            respond_json(&mut conn, "200 OK", &info)
-        }
+        ("GET", "/info") => respond_json(&mut conn, "200 OK", &server.info()),
         ("GET", "/v1/models") => {
-            let id = lock().model_id.clone();
             let model = obj([
-                ("id", id.into()),
+                ("id", server.model_id.as_str().into()),
                 ("object", "model".into()),
                 ("owned_by", "tachyon".into()),
             ]);
@@ -222,7 +221,7 @@ fn handle(mut conn: TcpStream, shared: &Mutex<Server>) -> io::Result<()> {
                 &obj([("object", "list".into()), ("data", Json::Arr(vec![model]))]),
             )
         }
-        ("POST", "/v1/chat/completions") => chat_completion(&mut conn, shared, &req.body),
+        ("POST", "/v1/chat/completions") => chat_completion(&mut conn, server, &req.body),
         _ => error(
             &mut conn,
             "404 Not Found",
@@ -236,6 +235,12 @@ struct ChatRequest {
     stream: bool,
     max_tokens: Option<usize>,
     sampler: SamplerConfig,
+    stop: Vec<String>,
+    json: bool,
+    ignore_eos: bool,
+    /// Qwen3's `enable_thinking` (top level, or in `chat_template_kwargs`
+    /// as vLLM takes it).
+    thinking: bool,
 }
 
 fn parse_chat(body: &[u8], defaults: &SamplerConfig) -> std::result::Result<ChatRequest, String> {
@@ -284,6 +289,28 @@ fn parse_chat(body: &[u8], defaults: &SamplerConfig) -> std::result::Result<Chat
     if let Some(s) = j.get("seed").and_then(Json::as_u64) {
         sampler.seed = s;
     }
+    let stop = match j.get("stop") {
+        Some(Json::Str(s)) => vec![s.clone()],
+        Some(Json::Arr(a)) => a
+            .iter()
+            .filter_map(Json::as_str)
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    };
+    let json = match j
+        .get("response_format")
+        .and_then(|f| f.get("type"))
+        .and_then(Json::as_str)
+    {
+        None | Some("text") => false,
+        Some("json_object") => true,
+        Some(other) => {
+            return Err(format!(
+                "response_format type {other:?} is not supported (text, json_object)"
+            ))
+        }
+    };
     Ok(ChatRequest {
         messages,
         stream: j.get("stream").and_then(Json::as_bool).unwrap_or(false),
@@ -292,46 +319,114 @@ fn parse_chat(body: &[u8], defaults: &SamplerConfig) -> std::result::Result<Chat
             .or(j.get("max_completion_tokens"))
             .and_then(Json::as_usize),
         sampler,
+        stop: stop.into_iter().filter(|s| !s.is_empty()).collect(),
+        json,
+        ignore_eos: j.get("ignore_eos").and_then(Json::as_bool).unwrap_or(false),
+        thinking: j
+            .get("enable_thinking")
+            .or(j
+                .get("chat_template_kwargs")
+                .and_then(|k| k.get("enable_thinking")))
+            .and_then(Json::as_bool)
+            .unwrap_or(true),
     })
 }
 
-fn chat_completion(conn: &mut TcpStream, shared: &Mutex<Server>, body: &[u8]) -> io::Result<()> {
-    let mut guard = shared
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let s = &mut *guard;
-    let req = match parse_chat(body, &s.defaults) {
+/// Cuts the output at the first stop string. While streaming, holds back
+/// any tail that could still turn out to be the start of one.
+pub struct StopStrings {
+    stops: Vec<String>,
+    held: String,
+}
+
+impl StopStrings {
+    pub fn new(stops: Vec<String>) -> StopStrings {
+        StopStrings {
+            stops,
+            held: String::new(),
+        }
+    }
+
+    /// Text safe to emit now, and whether a stop string was hit.
+    pub fn push(&mut self, piece: &str) -> (String, bool) {
+        self.held.push_str(piece);
+        if let Some(at) = self
+            .stops
+            .iter()
+            .filter_map(|s| self.held.find(s.as_str()))
+            .min()
+        {
+            let out = self.held[..at].to_string();
+            self.held.clear();
+            return (out, true);
+        }
+        let keep = self
+            .stops
+            .iter()
+            .flat_map(|s| s.char_indices().skip(1).map(move |(i, _)| &s[..i]))
+            .filter(|prefix| self.held.ends_with(prefix))
+            .map(str::len)
+            .max()
+            .unwrap_or(0);
+        let out = self.held[..self.held.len() - keep].to_string();
+        self.held.drain(..self.held.len() - keep);
+        (out, false)
+    }
+
+    pub fn finish(&mut self) -> String {
+        std::mem::take(&mut self.held)
+    }
+}
+
+fn chat_completion(conn: &mut TcpStream, server: &Server, body: &[u8]) -> io::Result<()> {
+    let req = match parse_chat(body, &server.defaults) {
         Ok(r) => r,
         Err(e) => return error(conn, "400 Bad Request", &e),
     };
-    let prompt = s
+    let mut prompt = server
         .template
-        .encode(&s.tok, &req.messages, Some(DEFAULT_SYSTEM));
-    let room = s.engine.max_seq().saturating_sub(prompt.len());
+        .encode(&server.tok, &req.messages, server.system.as_deref());
+    if !req.thinking {
+        server.template.skip_thinking(&server.tok, &mut prompt);
+    }
+    let room = server.context.saturating_sub(prompt.len());
     if room == 0 {
         let msg = format!(
             "the prompt is {} tokens; the context window is {}",
             prompt.len(),
-            s.engine.max_seq()
+            server.context
         );
         return error(conn, "400 Bad Request", &msg);
     }
-    let opts = GenOptions {
-        max_tokens: req.max_tokens.unwrap_or(s.max_tokens).min(room),
+    let (tx, rx) = mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    server.scheduler.submit(Request {
+        prompt,
+        max_tokens: req.max_tokens.unwrap_or(server.max_tokens).min(room),
         sampler: req.sampler,
-        stop_tokens: s.stop.clone(),
-    };
+        stop_tokens: if req.ignore_eos {
+            Vec::new()
+        } else {
+            server.stop.clone()
+        },
+        constraint: req.json.then(|| Box::new(JsonObject::default()) as _),
+        events: tx,
+        cancel: cancel.clone(),
+    });
+
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let id = format!("chatcmpl-{created:x}{:04x}", s.cache.len() % 0xFFFF);
-    let model = s.model_id.clone();
+    let id = format!(
+        "chatcmpl-{created:x}{:06x}",
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    );
     let chunk = |delta: Json, finish: Option<&str>| {
         obj([
             ("id", id.as_str().into()),
             ("object", "chat.completion.chunk".into()),
             ("created", created.into()),
-            ("model", model.as_str().into()),
+            ("model", server.model_id.as_str().into()),
             (
                 "choices",
                 Json::Arr(vec![obj([
@@ -342,63 +437,83 @@ fn chat_completion(conn: &mut TcpStream, shared: &Mutex<Server>, body: &[u8]) ->
             ),
         ])
     };
+    // Any write error means the client left: stop generating for it.
+    let send = |conn: &mut TcpStream, data: &str| -> io::Result<()> {
+        conn.write_all(data.as_bytes())
+            .inspect_err(|_| cancel.store(true, Ordering::Relaxed))
+    };
 
-    let mut text = String::new();
-    let mut write_failed = false;
     if req.stream {
-        conn.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n{CORS}Connection: close\r\n\r\n").as_bytes())?;
+        send(conn, &format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n{CORS}Connection: close\r\n\r\n"))?;
         let first = chunk(
             obj([("role", "assistant".into()), ("content", "".into())]),
             None,
         );
-        conn.write_all(format!("data: {first}\n\n").as_bytes())?;
+        send(conn, &format!("data: {first}\n\n"))?;
     }
-    let stats = {
-        let Server {
-            engine, tok, cache, ..
-        } = s;
-        let mut emit = |piece: &str| {
-            if !req.stream {
-                text.push_str(piece);
-                return true;
+    let mut stops = StopStrings::new(req.stop);
+    let mut text = String::new();
+    let mut hit_stop = false;
+    let summary: Summary = loop {
+        match rx.recv() {
+            Ok(Event::Text(piece)) if !hit_stop => {
+                let (out, hit) = stops.push(&piece);
+                if hit {
+                    hit_stop = true;
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                if out.is_empty() {
+                    continue;
+                }
+                if req.stream {
+                    send(
+                        conn,
+                        &format!("data: {}\n\n", chunk(obj([("content", out.into())]), None)),
+                    )?;
+                } else {
+                    text.push_str(&out);
+                }
             }
-            let event = chunk(obj([("content", piece.into())]), None);
-            write_failed = conn
-                .write_all(format!("data: {event}\n\n").as_bytes())
-                .is_err();
-            !write_failed // a closed connection stops generation
-        };
-        generate(engine.as_mut(), tok, cache, &prompt, &opts, &mut emit)
-    };
-    let stats = match stats {
-        Ok(stats) => stats,
-        Err(e) if !req.stream => return error(conn, "400 Bad Request", &e.0),
-        Err(e) => {
-            return conn.write_all(format!("data: {}\n\n", obj([("error", e.0.into())])).as_bytes())
+            Ok(Event::Text(_)) => {}
+            Ok(Event::Done(s)) => break s,
+            Ok(Event::Error(e)) if req.stream => {
+                return send(conn, &format!("data: {}\n\n", obj([("error", e.into())])))
+            }
+            Ok(Event::Error(e)) => return error(conn, "400 Bad Request", &e),
+            Err(_) => return error(conn, "500 Internal Server Error", "the scheduler stopped"),
         }
     };
-    if write_failed {
-        return Ok(());
+    if !hit_stop {
+        let rest = stops.finish();
+        if req.stream && !rest.is_empty() {
+            send(
+                conn,
+                &format!("data: {}\n\n", chunk(obj([("content", rest.into())]), None)),
+            )?;
+        } else {
+            text.push_str(&rest);
+        }
     }
 
-    let finish = if stats.finish == Finish::Length {
+    let finish = if summary.finish == Finish::Length && !hit_stop {
         "length"
     } else {
         "stop"
     };
     let usage = obj([
-        ("prompt_tokens", stats.prompt_tokens.into()),
-        ("completion_tokens", stats.tokens.len().into()),
+        ("prompt_tokens", summary.prompt_tokens.into()),
+        ("completion_tokens", summary.completion_tokens.into()),
         (
             "total_tokens",
-            (stats.prompt_tokens + stats.tokens.len()).into(),
+            (summary.prompt_tokens + summary.completion_tokens).into(),
         ),
     ]);
     let timings = obj([
-        ("cached_tokens", stats.cached_tokens.into()),
-        ("prefill_tokens_per_second", stats.prefill_tps().into()),
-        ("decode_tokens_per_second", stats.decode_tps().into()),
-        ("backend", s.engine.name().into()),
+        ("cached_tokens", summary.cached_tokens.into()),
+        ("time_to_first_token", summary.ttft_secs.into()),
+        ("decode_tokens_per_second", summary.decode_tps.into()),
+        ("mean_batch", summary.mean_batch.into()),
+        ("backend", server.backend.as_str().into()),
     ]);
     if req.stream {
         let Json::Obj(mut last) = chunk(obj([]), Some(finish)) else {
@@ -406,14 +521,17 @@ fn chat_completion(conn: &mut TcpStream, shared: &Mutex<Server>, body: &[u8]) ->
         };
         last.push(("usage".into(), usage));
         last.push(("timings".into(), timings));
-        conn.write_all(format!("data: {}\n\ndata: [DONE]\n\n", Json::Obj(last)).as_bytes())
+        send(
+            conn,
+            &format!("data: {}\n\ndata: [DONE]\n\n", Json::Obj(last)),
+        )
     } else {
         let message = obj([("role", "assistant".into()), ("content", text.into())]);
         let body = obj([
             ("id", id.as_str().into()),
             ("object", "chat.completion".into()),
             ("created", created.into()),
-            ("model", s.model_id.as_str().into()),
+            ("model", server.model_id.as_str().into()),
             (
                 "choices",
                 Json::Arr(vec![obj([
@@ -426,5 +544,24 @@ fn chat_completion(conn: &mut TcpStream, shared: &Mutex<Server>, body: &[u8]) ->
             ("timings", timings),
         ]);
         respond_json(conn, "200 OK", &body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StopStrings;
+
+    #[test]
+    fn stop_strings_cut_and_hold_back() {
+        let mut s = StopStrings::new(vec!["END".into(), "\n\n".into()]);
+        assert_eq!(s.push("hello E"), ("hello ".into(), false)); // "E" might start "END"
+        assert_eq!(s.push("x"), ("Ex".into(), false));
+        assert_eq!(s.push(" fin"), (" fin".into(), false));
+        assert_eq!(s.push("al EN"), ("al ".into(), false));
+        assert_eq!(s.push("D more"), ("".into(), true));
+        let mut s = StopStrings::new(vec!["\n\n".into()]);
+        assert_eq!(s.push("a\n"), ("a".into(), false));
+        assert_eq!(s.push("b"), ("\nb".into(), false));
+        assert_eq!(s.finish(), "");
     }
 }

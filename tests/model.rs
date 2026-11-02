@@ -8,9 +8,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use tachyon::chat::{ChatTemplate, Message, DEFAULT_SYSTEM};
 use tachyon::config::Config;
-use tachyon::engine::Engine;
+use tachyon::engine::{Engine, Session};
 use tachyon::generate::{generate, GenOptions};
-use tachyon::model::{CpuEngine, Weights};
+use tachyon::model::{CpuBackend, Weights};
 use tachyon::pool::Pool;
 use tachyon::sampler::SamplerConfig;
 use tachyon::speculative::generate_speculative;
@@ -38,12 +38,8 @@ fn setup() -> Option<(MutexGuard<'static, ()>, PathBuf)> {
 fn cpu(dir: &Path, format: Format) -> Box<dyn Engine> {
     let cfg = Config::load(dir).unwrap();
     let w = Weights::load(dir, &cfg, format).unwrap();
-    Box::new(CpuEngine::new(
-        cfg,
-        w,
-        Arc::new(Pool::new(Pool::default_threads())),
-        1024,
-    ))
+    let pool = Arc::new(Pool::new(Pool::default_threads()));
+    Box::new(Session::new(Box::new(CpuBackend::new(cfg, w, pool, 64))))
 }
 
 fn prompt(tok: &Tokenizer, question: &str) -> Vec<u32> {
@@ -54,12 +50,18 @@ fn prompt(tok: &Tokenizer, question: &str) -> Vec<u32> {
     )
 }
 
-fn greedy(e: &mut dyn Engine, tok: &Tokenizer, prompt: &[u32], n: usize) -> (String, Vec<u32>) {
+fn greedy_tokens(
+    e: &mut dyn Engine,
+    tok: &Tokenizer,
+    prompt: &[u32],
+    n: usize,
+) -> (String, Vec<u32>) {
     let cfg = e.config().clone();
     let opts = GenOptions {
         max_tokens: n,
         sampler: SamplerConfig::greedy(),
         stop_tokens: cfg.eos_ids,
+        json: false,
     };
     let mut text = String::new();
     let stats = generate(e, tok, &mut Vec::new(), prompt, &opts, &mut |p| {
@@ -98,7 +100,7 @@ fn answers_a_factual_question() {
     let Some((_g, dir)) = setup() else { return };
     let tok = Tokenizer::load(&dir.join("tokenizer.json")).unwrap();
     let mut e = cpu(&dir, Format::Q8);
-    let (text, _) = greedy(
+    let (text, _) = greedy_tokens(
         e.as_mut(),
         &tok,
         &prompt(&tok, "What is the capital of France?"),
@@ -136,6 +138,7 @@ fn reusing_the_kv_cache_changes_nothing() {
         max_tokens: 20,
         sampler: SamplerConfig::greedy(),
         stop_tokens: e.config().eos_ids.clone(),
+        json: false,
     };
     let p = prompt(&tok, "List three fruits.");
 
@@ -149,26 +152,53 @@ fn reusing_the_kv_cache_changes_nothing() {
 
 #[test]
 fn speculative_decoding_matches_greedy() {
+    use tachyon::speculative::{LookupDrafter, ModelDrafter};
     let Some((_g, dir)) = setup() else { return };
     let tok = Tokenizer::load(&dir.join("tokenizer.json")).unwrap();
     let mut target = cpu(&dir, Format::Bf16);
     let mut draft = cpu(&dir, Format::Q4);
-    let p = prompt(&tok, "Explain what a hash map is in two sentences.");
-    let (_, plain) = greedy(target.as_mut(), &tok, &p, 60);
+    let greedy = SamplerConfig::greedy();
     let eos = target.config().eos_ids.clone();
+
+    let p = prompt(&tok, "Explain what a hash map is in two sentences.");
+    let (_, plain) = greedy_tokens(target.as_mut(), &tok, &p, 60);
+    let mut drafter = ModelDrafter::new(draft.as_mut(), greedy.clone(), tok.len());
     let spec = generate_speculative(
         target.as_mut(),
-        draft.as_mut(),
+        &mut drafter,
         &tok,
         &p,
         4,
         60,
         &eos,
+        &greedy,
         &mut |_| true,
     )
     .unwrap();
     assert_eq!(spec.tokens, plain);
     assert!(spec.acceptance() > 0.5, "acceptance {}", spec.acceptance());
+
+    // Prompt lookup: a prompt the reply will copy from.
+    let p = prompt(&tok, "Repeat this sentence exactly: The quick brown fox jumps over the lazy dog near the river bank.");
+    let (_, plain) = greedy_tokens(target.as_mut(), &tok, &p, 40);
+    let spec = generate_speculative(
+        target.as_mut(),
+        &mut LookupDrafter::default(),
+        &tok,
+        &p,
+        6,
+        40,
+        &eos,
+        &greedy,
+        &mut |_| true,
+    )
+    .unwrap();
+    assert_eq!(spec.tokens, plain);
+    assert!(
+        spec.tokens_per_pass() > 1.5,
+        "lookup accepted too little: {}",
+        spec.tokens_per_pass()
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -178,12 +208,184 @@ fn gpu_matches_cpu() {
     let tok = Tokenizer::load(&dir.join("tokenizer.json")).unwrap();
     let cfg = Config::load(&dir).unwrap();
     let w = Weights::load(&dir, &cfg, Format::Bf16).unwrap();
-    let mut gpu: Box<dyn Engine> = match tachyon::gpu::GpuEngine::new(cfg, w, 1024) {
-        Ok(g) => Box::new(g),
+    let mut gpu: Box<dyn Engine> = match tachyon::gpu::GpuBackend::new(cfg, w, 64, 1024, false) {
+        Ok(g) => Box::new(Session::new(Box::new(g))),
         Err(e) => return eprintln!("skipping: {e}"),
     };
     let p = prompt(&tok, "Give me one tip for writing clean code.");
-    let (_, on_gpu) = greedy(gpu.as_mut(), &tok, &p, 40);
-    let (_, on_cpu) = greedy(cpu(&dir, Format::Bf16).as_mut(), &tok, &p, 40);
+    let (_, on_gpu) = greedy_tokens(gpu.as_mut(), &tok, &p, 40);
+    let (_, on_cpu) = greedy_tokens(cpu(&dir, Format::Bf16).as_mut(), &tok, &p, 40);
     assert_eq!(on_gpu, on_cpu);
+}
+
+/// Greedy tokens with no stop token, through the single-sequence API.
+fn greedy_raw(e: &mut dyn Engine, prompt: &[u32], n: usize) -> Vec<u32> {
+    let vocab = e.config().vocab;
+    e.truncate(0);
+    let mut next = tachyon::sampler::argmax(&e.forward(prompt, false)[..vocab]);
+    let mut out = vec![next];
+    while out.len() < n {
+        next = tachyon::sampler::argmax(&e.forward(&[next], false)[..vocab]);
+        out.push(next);
+    }
+    out
+}
+
+/// Decodes several prompts in lockstep, all in one batch per step, through
+/// the paged cache, and checks each matches decoding it alone.
+fn check_batched_matches_alone(
+    mut backend: Box<dyn tachyon::engine::Backend>,
+    alone: &mut dyn Engine,
+    tok: &Tokenizer,
+) {
+    use tachyon::kv::{Batch, BlockPool, Logits};
+    let prompts: Vec<Vec<u32>> = [
+        "Name a planet.",
+        "Write one word that rhymes with cat, then explain.",
+        "2+2=",
+    ]
+    .iter()
+    .map(|q| prompt(tok, q))
+    .collect();
+    let n = 12;
+    let expected: Vec<Vec<u32>> = prompts.iter().map(|p| greedy_raw(alone, p, n)).collect();
+
+    let vocab = backend.config().vocab;
+    let mut pool = BlockPool::new(backend.num_blocks());
+    let mut seqs: Vec<_> = prompts.iter().map(|p| pool.start(p)).collect();
+    let mut outs: Vec<Vec<u32>> = vec![Vec::new(); prompts.len()];
+    let mut batch = Batch::default();
+    for step in 0..n {
+        batch.clear();
+        for (i, seq) in seqs.iter_mut().enumerate() {
+            let new: Vec<u32> = if step == 0 {
+                prompts[i][seq.len..].to_vec()
+            } else {
+                vec![*outs[i].last().unwrap()]
+            };
+            assert!(pool.reserve(seq, seq.len + new.len()));
+            batch.push(&seq.blocks, seq.len, &new, Logits::Last);
+            seq.len += new.len();
+        }
+        let logits = backend.forward(&batch).to_vec();
+        for (i, row) in logits.chunks_exact(vocab).enumerate() {
+            outs[i].push(tachyon::sampler::argmax(&row[..tok.len()]));
+        }
+    }
+    assert_eq!(outs, expected);
+}
+
+#[test]
+fn batched_sequences_match_running_alone() {
+    let Some((_g, dir)) = setup() else { return };
+    let tok = Tokenizer::load(&dir.join("tokenizer.json")).unwrap();
+    let cfg = Config::load(&dir).unwrap();
+    let pool = Arc::new(Pool::new(Pool::default_threads()));
+    let backend = CpuBackend::new(
+        cfg.clone(),
+        Weights::load(&dir, &cfg, Format::Q8).unwrap(),
+        pool,
+        64,
+    );
+    check_batched_matches_alone(Box::new(backend), cpu(&dir, Format::Q8).as_mut(), &tok);
+
+    #[cfg(target_os = "macos")]
+    if let Ok(g) = tachyon::gpu::GpuBackend::new(
+        cfg.clone(),
+        Weights::load(&dir, &cfg, Format::Q8).unwrap(),
+        64,
+        1024,
+        false,
+    ) {
+        let alone = tachyon::gpu::GpuBackend::new(
+            cfg.clone(),
+            Weights::load(&dir, &cfg, Format::Q8).unwrap(),
+            64,
+            1024,
+            false,
+        )
+        .unwrap();
+        check_batched_matches_alone(Box::new(g), &mut Session::new(Box::new(alone)), &tok);
+    }
+}
+
+#[test]
+fn json_mode_always_parses() {
+    let Some((_g, dir)) = setup() else { return };
+    let tok = Tokenizer::load(&dir.join("tokenizer.json")).unwrap();
+    let mut e = cpu(&dir, Format::Q8);
+    // Prompts that don't ask for JSON: the constraint alone must force it.
+    for (i, q) in [
+        "Tell me a joke.",
+        "What is 2 + 2?",
+        "Write a haiku about rain.",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let opts = GenOptions {
+            max_tokens: 120,
+            sampler: SamplerConfig {
+                temperature: 1.0,
+                seed: i as u64 + 1,
+                ..SamplerConfig::default()
+            },
+            stop_tokens: e.config().eos_ids.clone(),
+            json: true,
+        };
+        let mut text = String::new();
+        let stats = generate(
+            e.as_mut(),
+            &tok,
+            &mut Vec::new(),
+            &prompt(&tok, q),
+            &opts,
+            &mut |p| {
+                text.push_str(p);
+                true
+            },
+        )
+        .unwrap();
+        if stats.finish == tachyon::generate::Finish::Stop {
+            assert!(
+                tachyon::json::Json::parse(&text).is_ok(),
+                "invalid JSON for {q:?}: {text}"
+            );
+        }
+        assert!(text.trim_start().starts_with('{'), "{text}");
+    }
+}
+
+/// Qwen3 adds per-head q/k RMSNorm; check it on both backends.
+/// Needs models/qwen3-0.6b; skipped without it.
+#[test]
+fn qwen3_runs_and_backends_agree() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("models/qwen3-0.6b");
+    if !dir.join("model.safetensors").exists() {
+        return eprintln!("skipping: {} not found", dir.display());
+    }
+    let tok = Tokenizer::load(&dir.join("tokenizer.json")).unwrap();
+    let tpl = ChatTemplate::new(&tok).unwrap();
+    let mut p = tpl.encode(
+        &tok,
+        &[Message::new(
+            "user",
+            "What is the capital of France? Answer briefly.",
+        )],
+        None,
+    );
+    tpl.skip_thinking(&tok, &mut p);
+
+    let (text, on_cpu) = greedy_tokens(cpu(&dir, Format::Bf16).as_mut(), &tok, &p, 20);
+    assert!(text.contains("Paris"), "{text}");
+    #[cfg(target_os = "macos")]
+    {
+        let cfg = Config::load(&dir).unwrap();
+        let w = Weights::load(&dir, &cfg, Format::Bf16).unwrap();
+        if let Ok(g) = tachyon::gpu::GpuBackend::new(cfg, w, 64, 1024, false) {
+            let (_, on_gpu) = greedy_tokens(&mut Session::new(Box::new(g)), &tok, &p, 20);
+            assert_eq!(on_gpu, on_cpu);
+        }
+    }
 }

@@ -8,8 +8,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::config::Config;
-use crate::engine::Engine;
+use crate::engine::Backend;
 use crate::kernels::{axpy, dot_f32, rmsnorm, silu};
+use crate::kv::{slot, Batch, BLOCK};
 use crate::pool::{Pool, SyncPtr};
 use crate::safetensors::SafeTensors;
 use crate::weights::{Format, Matrix};
@@ -21,6 +22,9 @@ pub struct LayerWeights {
     /// input instead of three.
     pub wqkv: Matrix,
     pub bqkv: Option<Vec<f32>>,
+    /// Per-head RMSNorm weights for q and k, applied before RoPE (Qwen3).
+    pub q_norm: Option<Vec<f32>>,
+    pub k_norm: Option<Vec<f32>>,
     pub wo: Matrix,
     pub mlp_norm: Vec<f32>,
     /// gate and up projections, stacked the same way.
@@ -47,11 +51,7 @@ impl Weights {
         // The output layer is the most sensitive matrix to quantize, so
         // 4-bit models keep it (and the embedding it may share) at 8 bits,
         // as llama.cpp does.
-        let outer = if format == Format::Q4 {
-            Format::Q8
-        } else {
-            format
-        };
+        let outer = format.for_matrix("output");
 
         // The embedding (the single biggest matrix) loads alongside the layers.
         let embed = thread::scope(|s| {
@@ -124,6 +124,7 @@ fn load_layer(st: &SafeTensors, c: &Config, l: usize, format: Format) -> Result<
     } else {
         None
     };
+    let fmt = |name: &str| format.for_matrix(name);
     let layer = LayerWeights {
         attn_norm: vector(st, &n("input_layernorm.weight"))?,
         wqkv: matrix(
@@ -133,17 +134,19 @@ fn load_layer(st: &SafeTensors, c: &Config, l: usize, format: Format) -> Result<
                 &n("self_attn.k_proj.weight"),
                 &n("self_attn.v_proj.weight"),
             ],
-            format,
+            fmt("qkv"),
         )?,
         bqkv,
-        wo: matrix(st, &[&n("self_attn.o_proj.weight")], format)?,
+        q_norm: optional(st, &n("self_attn.q_norm.weight")),
+        k_norm: optional(st, &n("self_attn.k_norm.weight")),
+        wo: matrix(st, &[&n("self_attn.o_proj.weight")], fmt("o"))?,
         mlp_norm: vector(st, &n("post_attention_layernorm.weight"))?,
         w_gate_up: matrix(
             st,
             &[&n("mlp.gate_proj.weight"), &n("mlp.up_proj.weight")],
-            format,
+            fmt("gate_up"),
         )?,
-        w_down: matrix(st, &[&n("mlp.down_proj.weight")], format)?,
+        w_down: matrix(st, &[&n("mlp.down_proj.weight")], fmt("down"))?,
     };
     let qkv = c.q_dim() + 2 * c.kv_dim();
     let shapes = [
@@ -183,6 +186,10 @@ fn matrix(st: &SafeTensors, names: &[&str], format: Format) -> Result<Matrix> {
     Ok(Matrix::from_f32(&data, rows, cols.unwrap_or(0), format))
 }
 
+fn optional(st: &SafeTensors, name: &str) -> Option<Vec<f32>> {
+    st.tensor(name).ok().map(|t| t.to_f32())
+}
+
 fn vector(st: &SafeTensors, name: &str) -> Result<Vec<f32>> {
     Ok(st.tensor(name)?.to_f32())
 }
@@ -219,6 +226,8 @@ struct Scratch {
     gate_up: Vec<f32>,
     hidden: Vec<f32>,
     logits: Vec<f32>,
+    cos: Vec<f32>,
+    sin: Vec<f32>,
 }
 
 fn zeroed(v: &mut Vec<f32>, n: usize) {
@@ -226,52 +235,55 @@ fn zeroed(v: &mut Vec<f32>, n: usize) {
     v.resize(n, 0.0);
 }
 
-pub struct CpuEngine {
+/// RMSNorm each `head_dim`-sized head of `v` in place.
+fn head_norm(v: &mut [f32], head_dim: usize, w: &[f32], eps: f32) {
+    for head in v.chunks_exact_mut(head_dim) {
+        let ss = dot_f32(head, head) / head_dim as f32;
+        let inv = 1.0 / (ss + eps).sqrt();
+        head.iter_mut().zip(w).for_each(|(x, g)| *x *= inv * g);
+    }
+}
+
+pub struct CpuBackend {
     cfg: Config,
     w: Weights,
     pool: Arc<Pool>,
     freqs: Vec<f64>,
-    max_seq: usize,
-    pos: usize,
-    /// `[layer][position][kv_dim]`
+    blocks: usize,
+    /// `[layer][slot][kv_dim]`, slot = block * BLOCK + offset
     k_cache: Vec<f32>,
     v_cache: Vec<f32>,
     s: Scratch,
 }
 
-impl CpuEngine {
-    pub fn new(cfg: Config, w: Weights, pool: Arc<Pool>, max_seq: usize) -> CpuEngine {
-        let max_seq = max_seq.min(cfg.max_positions);
-        let cache = cfg.layers * max_seq * cfg.kv_dim();
-        CpuEngine {
+impl CpuBackend {
+    /// `blocks` sets the KV cache size: `blocks * BLOCK` token positions,
+    /// shared by every sequence.
+    pub fn new(cfg: Config, w: Weights, pool: Arc<Pool>, blocks: usize) -> CpuBackend {
+        let cache = cfg.layers * blocks * BLOCK * cfg.kv_dim();
+        CpuBackend {
             freqs: rope_frequencies(&cfg),
             k_cache: vec![0.0; cache],
             v_cache: vec![0.0; cache],
             cfg,
             w,
             pool,
-            max_seq,
-            pos: 0,
+            blocks,
             s: Scratch::default(),
         }
     }
-
-    pub fn weights(&self) -> &Weights {
-        &self.w
-    }
 }
 
-/// Causal attention for `t` new tokens of one layer: token `i` attends to
-/// every cached position up to and including its own. One task per
-/// (token, head); heads in a group share the same K/V head.
-#[allow(clippy::too_many_arguments)]
+/// Causal attention for every row of one layer: each token attends to its
+/// own sequence's positions up to and including its own, found through the
+/// sequence's block table. One task per (token, head); heads in a group
+/// share a K/V head.
 fn attention(
     c: &Config,
     pool: &Pool,
     k_cache: &[f32],
     v_cache: &[f32],
-    pos0: usize,
-    t: usize,
+    b: &Batch,
     qkv: &[f32],
     att: &mut Vec<f32>,
 ) {
@@ -279,6 +291,7 @@ fn attention(
     let group = heads / c.kv_heads;
     let qkv_dim = q_dim + 2 * kv_dim;
     let scale = 1.0 / (hd as f32).sqrt();
+    let t = b.len();
     zeroed(att, t * q_dim);
     let out = SyncPtr::new(att);
 
@@ -288,10 +301,13 @@ fn attention(
             let (i, h) = (task / heads, task % heads);
             let q = &qkv[i * qkv_dim + h * hd..][..hd];
             let kv = (h / group) * hd;
-            let n = pos0 + i + 1;
+            let table = &b.tables[b.table_of[i] as usize..];
+            let n = b.positions[i] as usize + 1;
 
             scores.clear();
-            scores.extend((0..n).map(|p| dot_f32(q, &k_cache[p * kv_dim + kv..][..hd]) * scale));
+            scores.extend(
+                (0..n).map(|p| dot_f32(q, &k_cache[slot(table, p) * kv_dim + kv..][..hd]) * scale),
+            );
             let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let mut sum = 0.0;
             for s in scores.iter_mut() {
@@ -301,13 +317,13 @@ fn attention(
             // SAFETY: each (token, head) owns its own slice of `att`.
             let o = unsafe { out.slice(i * q_dim + h * hd, hd) };
             for (p, &s) in scores.iter().enumerate() {
-                axpy(o, s / sum, &v_cache[p * kv_dim + kv..][..hd]);
+                axpy(o, s / sum, &v_cache[slot(table, p) * kv_dim + kv..][..hd]);
             }
         }
     });
 }
 
-impl Engine for CpuEngine {
+impl Backend for CpuBackend {
     fn config(&self) -> &Config {
         &self.cfg
     }
@@ -316,37 +332,32 @@ impl Engine for CpuEngine {
         format!("cpu {} x{}", self.w.format.name(), self.pool.threads())
     }
 
-    fn pos(&self) -> usize {
-        self.pos
+    fn num_blocks(&self) -> usize {
+        self.blocks
     }
 
-    fn max_seq(&self) -> usize {
-        self.max_seq
+    fn max_batch(&self) -> usize {
+        256
     }
 
-    fn truncate(&mut self, pos: usize) {
-        self.pos = self.pos.min(pos);
-    }
-
-    fn forward(&mut self, tokens: &[u32], all: bool) -> &[f32] {
-        let CpuEngine {
+    fn forward(&mut self, b: &Batch) -> &[f32] {
+        let CpuBackend {
             cfg: c,
             w,
             pool,
             freqs,
-            max_seq,
-            pos,
             k_cache,
             v_cache,
             s,
+            ..
         } = self;
-        let t = tokens.len();
-        assert!(t > 0, "forward needs at least one token");
-        assert!(*pos + t <= *max_seq, "context window full");
+        let t = b.len();
+        assert!(t > 0, "empty batch");
         let (dim, kv_dim, q_dim, inter, hd) =
             (c.hidden, c.kv_dim(), c.q_dim(), c.intermediate, c.head_dim);
         let qkv_dim = q_dim + 2 * kv_dim;
         let half = hd / 2;
+        let layer_cache = self.blocks * BLOCK * kv_dim;
 
         zeroed(&mut s.x, t * dim);
         zeroed(&mut s.xb, t * dim);
@@ -354,19 +365,19 @@ impl Engine for CpuEngine {
         zeroed(&mut s.proj, t * dim);
         zeroed(&mut s.gate_up, t * 2 * inter);
         zeroed(&mut s.hidden, t * inter);
-        for (i, &tok) in tokens.iter().enumerate() {
+        for (i, &tok) in b.tokens.iter().enumerate() {
             w.embed
                 .row_into(tok as usize, &mut s.x[i * dim..(i + 1) * dim]);
         }
 
-        // Rotation angles for each new position, shared by every layer.
-        let mut cos = vec![0f32; t * half];
-        let mut sin = vec![0f32; t * half];
-        for i in 0..t {
-            for j in 0..half {
-                let angle = (*pos + i) as f64 * freqs[j];
-                cos[i * half + j] = angle.cos() as f32;
-                sin[i * half + j] = angle.sin() as f32;
+        // Rotation angles for each token's position, shared by every layer.
+        zeroed(&mut s.cos, t * half);
+        zeroed(&mut s.sin, t * half);
+        for (i, &pos) in b.positions.iter().enumerate() {
+            for (j, f) in freqs.iter().enumerate() {
+                let angle = pos as f64 * f;
+                s.cos[i * half + j] = angle.cos() as f32;
+                s.sin[i * half + j] = angle.sin() as f32;
             }
         }
 
@@ -381,35 +392,32 @@ impl Engine for CpuEngine {
                 );
             }
             layer.wqkv.matmul(pool, &s.xb, t, &mut s.qkv);
-            let base = l * *max_seq * kv_dim;
+            let (kc, vc) = (
+                &mut k_cache[l * layer_cache..(l + 1) * layer_cache],
+                &mut v_cache[l * layer_cache..(l + 1) * layer_cache],
+            );
             for i in 0..t {
                 let row = &mut s.qkv[i * qkv_dim..(i + 1) * qkv_dim];
-                if let Some(b) = &layer.bqkv {
-                    row.iter_mut().zip(b).for_each(|(v, b)| *v += b);
+                if let Some(bias) = &layer.bqkv {
+                    row.iter_mut().zip(bias).for_each(|(v, b)| *v += b);
                 }
                 let (cs, sn) = (
-                    &cos[i * half..(i + 1) * half],
-                    &sin[i * half..(i + 1) * half],
+                    &s.cos[i * half..(i + 1) * half],
+                    &s.sin[i * half..(i + 1) * half],
                 );
                 let (q, kv) = row.split_at_mut(q_dim);
                 let (k, v) = kv.split_at_mut(kv_dim);
+                if let (Some(qn), Some(kn)) = (&layer.q_norm, &layer.k_norm) {
+                    head_norm(q, hd, qn, c.norm_eps);
+                    head_norm(k, hd, kn, c.norm_eps);
+                }
                 rope(q, hd, cs, sn);
                 rope(k, hd, cs, sn);
-                let at = base + (*pos + i) * kv_dim;
-                k_cache[at..at + kv_dim].copy_from_slice(k);
-                v_cache[at..at + kv_dim].copy_from_slice(v);
+                let at = b.slots[i] as usize * kv_dim;
+                kc[at..at + kv_dim].copy_from_slice(k);
+                vc[at..at + kv_dim].copy_from_slice(v);
             }
-            let layer_cache = base..base + *max_seq * kv_dim;
-            attention(
-                c,
-                pool,
-                &k_cache[layer_cache.clone()],
-                &v_cache[layer_cache],
-                *pos,
-                t,
-                &s.qkv,
-                &mut s.att,
-            );
+            attention(c, pool, kc, vc, b, &s.qkv, &mut s.att);
             layer.wo.matmul(pool, &s.att, t, &mut s.proj);
             s.x.iter_mut().zip(&s.proj).for_each(|(x, p)| *x += p);
 
@@ -435,13 +443,11 @@ impl Engine for CpuEngine {
             layer.w_down.matmul(pool, &s.hidden, t, &mut s.proj);
             s.x.iter_mut().zip(&s.proj).for_each(|(x, p)| *x += p);
         }
-        *pos += t;
 
         // Only rows we return logits for go through the (large) output layer.
-        let first = if all { 0 } else { t - 1 };
-        let n = t - first;
-        for i in 0..n {
-            let src = (first + i) * dim;
+        let n = b.logit_rows.len();
+        for (i, &row) in b.logit_rows.iter().enumerate() {
+            let src = row as usize * dim;
             rmsnorm(
                 &mut s.xb[i * dim..(i + 1) * dim],
                 &s.x[src..src + dim],
@@ -451,7 +457,9 @@ impl Engine for CpuEngine {
         }
         let head = w.lm_head();
         zeroed(&mut s.logits, n * head.rows());
-        head.matmul(pool, &s.xb[..n * dim], n, &mut s.logits);
+        if n > 0 {
+            head.matmul(pool, &s.xb[..n * dim], n, &mut s.logits);
+        }
         &s.logits
     }
 }

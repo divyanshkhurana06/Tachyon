@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-14 # Apple Silicon
+    steps:
+      - uses: actions/checkout@v5
+
+      # Pinned so new lints in a newer clippy can't fail a build that passed locally.
+      - name: Toolchain
+        run: |
+          rustup toolchain install 1.87.0 --profile minimal --component clippy,rustfmt
+          rustup default 1.87.0
+          rustc --version
+
+      - name: Cache the test model
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: qwen2.5-0.5b-instruct-v1
+
+      - name: Download the test model
+        run: |
+          mkdir -p models/qwen2.5-0.5b-instruct && cd models/qwen2.5-0.5b-instruct
+          for f in config.json generation_config.json tokenizer.json model.safetensors; do
+            [ -f "$f" ] || curl -sSfLO "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/$f"
+          done
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy --release --all-targets -- -D warnings
+
+      # Failures are also raised as annotations, which show on the run page.
+      - name: Test
+        run: |
+          set -o pipefail
+          cargo test --release 2>&1 | tee test.log || {
+            grep -E "panicked|FAILED|left:|right:|error" test.log | head -20 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            exit 1
+          }

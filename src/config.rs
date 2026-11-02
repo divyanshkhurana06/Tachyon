@@ -39,8 +39,10 @@ impl Config {
             .and_then(Json::as_str)
             .unwrap_or("")
             .to_string();
-        if !matches!(model_type.as_str(), "qwen2" | "llama" | "mistral") {
-            bail!("model_type {model_type:?} is not supported (qwen2, llama and mistral are)");
+        if !matches!(model_type.as_str(), "qwen2" | "qwen3" | "llama" | "mistral") {
+            bail!(
+                "model_type {model_type:?} is not supported (qwen2, qwen3, llama and mistral are)"
+            );
         }
         if !matches!(j.get("rope_scaling"), None | Some(Json::Null)) {
             bail!("rope_scaling is not supported yet");

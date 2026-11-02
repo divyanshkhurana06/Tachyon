@@ -2,6 +2,7 @@
 
 use std::time::{Duration, Instant};
 
+use crate::constrain::{Constraint, JsonObject};
 use crate::engine::Engine;
 use crate::sampler::{Sampler, SamplerConfig};
 use crate::tokenizer::{Tokenizer, Utf8Stream};
@@ -15,6 +16,8 @@ pub struct GenOptions {
     pub max_tokens: usize,
     pub sampler: SamplerConfig,
     pub stop_tokens: Vec<u32>,
+    /// Constrain the output to a JSON object.
+    pub json: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +103,12 @@ pub fn generate(
 
     let vocab = tok.len();
     let mut sampler = Sampler::new(opts.sampler.clone());
+    let mut constraint = opts.json.then(JsonObject::default);
+    let pick =
+        |sampler: &mut Sampler, logits: &[f32], recent: &[u32], c: &Option<JsonObject>| match c {
+            Some(c) => sampler.sample_with(logits, vocab, recent, &|t| c.allows(tok, t)),
+            None => sampler.sample(logits, vocab, recent),
+        };
     let started = Instant::now();
     let pending = &prompt[reuse..];
     let chunks = pending.chunks(PREFILL_CHUNK).count();
@@ -107,7 +116,7 @@ pub fn generate(
     for (i, chunk) in pending.chunks(PREFILL_CHUNK).enumerate() {
         let logits = engine.forward(chunk, false);
         if i + 1 == chunks {
-            next = sampler.sample(logits, vocab, &[]);
+            next = pick(&mut sampler, logits, &[], &constraint);
         }
     }
     cache.extend_from_slice(pending);
@@ -117,10 +126,14 @@ pub fn generate(
     let mut tokens = Vec::new();
     let mut text = Utf8Stream::default();
     let finish = loop {
-        if opts.stop_tokens.contains(&next) {
+        if opts.stop_tokens.contains(&next) || constraint.as_ref().is_some_and(|c| c.is_complete())
+        {
             break Finish::Stop;
         }
         tokens.push(next);
+        if let Some(c) = &mut constraint {
+            c.advance(tok.token_bytes(next));
+        }
         if !tok.is_special(next) {
             let piece = text.push(tok.token_bytes(next));
             if !piece.is_empty() && !emit(&piece) {
@@ -133,7 +146,7 @@ pub fn generate(
         let logits = engine.forward(&[next], false);
         cache.push(next);
         let recent = &tokens[tokens.len().saturating_sub(64)..];
-        next = sampler.sample(logits, vocab, recent);
+        next = pick(&mut sampler, logits, recent, &constraint);
     };
     let rest = text.finish();
     if !rest.is_empty() {

@@ -1,24 +1,33 @@
 //! Tachyon: an LLM inference engine written from scratch.
 //!
-//! Loads Hugging Face checkpoints (Qwen2 / Llama-style transformers) straight
-//! from `.safetensors`, tokenizes with its own byte-level BPE, and runs the
-//! model on the CPU (NEON + a spin-then-park thread pool) or on Apple GPUs
-//! (Metal compute shaders), in bf16 or quantized to 8 or 4 bits.
+//! Loads Hugging Face checkpoints (Qwen2.5, Qwen3 and Llama-style
+//! transformers) straight from `.safetensors`, tokenizes with its own
+//! byte-level BPE, and runs the model on the CPU (NEON + a spin-then-park
+//! thread pool) or on Apple GPUs (Metal compute shaders, with the matrix
+//! units for batches), in bf16 or quantized to 8 or 4 bits.
+//!
+//! Serving is vLLM-style: a paged KV cache with prefix sharing and a
+//! continuous-batching scheduler, behind an OpenAI-compatible API, with
+//! constrained JSON output and speculative decoding (draft model or prompt
+//! lookup, greedy or sampled).
 
 use std::fmt;
 
 pub mod chat;
 pub mod config;
+pub mod constrain;
 pub mod engine;
 pub mod generate;
 #[cfg(target_os = "macos")]
 pub mod gpu;
 pub mod json;
 pub mod kernels;
+pub mod kv;
 pub mod model;
 pub mod pool;
 pub mod safetensors;
 pub mod sampler;
+pub mod scheduler;
 pub mod server;
 pub mod speculative;
 pub mod tokenizer;
