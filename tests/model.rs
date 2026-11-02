@@ -208,7 +208,7 @@ fn gpu_matches_cpu() {
     let tok = Tokenizer::load(&dir.join("tokenizer.json")).unwrap();
     let cfg = Config::load(&dir).unwrap();
     let w = Weights::load(&dir, &cfg, Format::Bf16).unwrap();
-    let mut gpu: Box<dyn Engine> = match tachyon::gpu::GpuBackend::new(cfg, w, 64, 1024) {
+    let mut gpu: Box<dyn Engine> = match tachyon::gpu::GpuBackend::new(cfg, w, 64, 1024, false) {
         Ok(g) => Box::new(Session::new(Box::new(g))),
         Err(e) => return eprintln!("skipping: {e}"),
     };
@@ -295,12 +295,14 @@ fn batched_sequences_match_running_alone() {
         Weights::load(&dir, &cfg, Format::Q8).unwrap(),
         64,
         1024,
+        false,
     ) {
         let alone = tachyon::gpu::GpuBackend::new(
             cfg.clone(),
             Weights::load(&dir, &cfg, Format::Q8).unwrap(),
             64,
             1024,
+            false,
         )
         .unwrap();
         check_batched_matches_alone(Box::new(g), &mut Session::new(Box::new(alone)), &tok);

@@ -5,6 +5,15 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// KV cache element type: the host prepends `#define KV_HALF` to store keys
+// and values as f16 (half the memory and attention bandwidth).
+#ifdef KV_HALF
+typedef half kv_t;
+#else
+typedef float kv_t;
+#endif
+typedef vec<kv_t, 4> kv4_t;
+
 // Matrix multiply. Each simdgroup (32 lanes) computes R output rows: a lane
 // loads 4 input values once and reuses them from registers for all R rows,
 // so input reads don't swamp the weight reads (for 4-bit weights the input
@@ -350,7 +359,7 @@ struct RopeParams {
 
 // Rotates q in place, and writes rotated k and plain v into this layer's KV
 // cache at each token's slot. Grid: (head_dim/2, heads + kv_heads, tokens).
-kernel void rope_store(device float *qkv [[buffer(0)]], device float *kc [[buffer(1)]], device float *vc [[buffer(2)]],
+kernel void rope_store(device float *qkv [[buffer(0)]], device kv_t *kc [[buffer(1)]], device kv_t *vc [[buffer(2)]],
                        device const float *cosb [[buffer(3)]], device const float *sinb [[buffer(4)]],
                        device const uint *slots [[buffer(5)]], constant RopeParams &p [[buffer(6)]],
                        uint3 gid [[thread_position_in_grid]]) {
@@ -370,10 +379,10 @@ kernel void rope_store(device float *qkv [[buffer(0)]], device float *kc [[buffe
         device const float *v = row + p.q_dim + p.kv_dim + kh * p.head_dim;
         ulong at = (ulong)slots[i] * p.kv_dim + kh * p.head_dim;
         float a = k[d], b = k[d + half_dim];
-        kc[at + d] = a * c - b * s;
-        kc[at + d + half_dim] = b * c + a * s;
-        vc[at + d] = v[d];
-        vc[at + d + half_dim] = v[d + half_dim];
+        kc[at + d] = kv_t(a * c - b * s);
+        kc[at + d + half_dim] = kv_t(b * c + a * s);
+        vc[at + d] = kv_t(v[d]);
+        vc[at + d + half_dim] = kv_t(v[d + half_dim]);
     }
 }
 
@@ -399,8 +408,8 @@ inline ulong cache_slot(device const uint *table, uint s) {
 // sequence's positions 0..=pos, found through the sequence's block table.
 // Scores go to a scratch buffer so any context length fits; three passes:
 // q·k (a thread per position), softmax, weighted sum of v.
-kernel void attention(device const float *qkv [[buffer(0)]], device const float *kc [[buffer(1)]],
-                      device const float *vc [[buffer(2)]], device float *scores [[buffer(3)]],
+kernel void attention(device const float *qkv [[buffer(0)]], device const kv_t *kc [[buffer(1)]],
+                      device const kv_t *vc [[buffer(2)]], device float *scores [[buffer(3)]],
                       device float *out [[buffer(4)]], device const uint *positions [[buffer(5)]],
                       device const uint *table_of [[buffer(6)]], device const uint *tables [[buffer(7)]],
                       constant AttnParams &p [[buffer(8)]], uint2 tg [[threadgroup_position_in_grid]],
@@ -422,9 +431,9 @@ kernel void attention(device const float *qkv [[buffer(0)]], device const float 
     // 1. scores: one thread per cached position, a full q·k each
     float local_max = -INFINITY;
     for (uint s = tid; s < n; s += ATT_THREADS) {
-        device const float4 *k = (device const float4 *)(kc + cache_slot(table, s) * p.kv_dim + kv);
+        device const kv4_t *k = (device const kv4_t *)(kc + cache_slot(table, s) * p.kv_dim + kv);
         float d = 0;
-        for (uint e = 0; e < d4; e++) d += dot(q4[e], k[e]);
+        for (uint e = 0; e < d4; e++) d += dot(q4[e], float4(k[e]));
         d *= p.scale;
         sc[s] = d;
         local_max = max(local_max, d);
@@ -453,7 +462,7 @@ kernel void attention(device const float *qkv [[buffer(0)]], device const float 
     uint stripes = ATT_THREADS / p.head_dim;
     uint d = tid % p.head_dim, stripe = tid / p.head_dim;
     float acc = 0;
-    for (uint s = stripe; s < n; s += stripes) acc += sc[s] * vc[cache_slot(table, s) * p.kv_dim + kv + d];
+    for (uint s = stripe; s < n; s += stripes) acc += sc[s] * float(vc[cache_slot(table, s) * p.kv_dim + kv + d]);
     partial[tid] = acc;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid < p.head_dim) {

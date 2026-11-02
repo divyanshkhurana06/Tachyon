@@ -293,7 +293,8 @@ struct Activations {
 pub struct GpuBackend {
     cfg: Config,
     device: String,
-    format: &'static str,
+    format: String,
+    kv_bytes: usize,
     // Field order matters for drop: buffers before the context.
     act: Activations,
     layers: Vec<GpuLayer>,
@@ -314,8 +315,22 @@ unsafe impl Send for GpuBackend {}
 impl GpuBackend {
     /// `blocks`: KV cache size in blocks of BLOCK positions, shared by all
     /// sequences. `max_seq`: the longest one sequence may get.
-    pub fn new(cfg: Config, w: Weights, blocks: usize, max_seq: usize) -> Result<GpuBackend> {
-        let source = CString::new(SOURCE).unwrap();
+    ///
+    /// `kv_half` stores the KV cache as f16: half the memory, so twice the
+    /// users or context fit, at a small cost in precision.
+    pub fn new(
+        cfg: Config,
+        w: Weights,
+        blocks: usize,
+        max_seq: usize,
+        kv_half: bool,
+    ) -> Result<GpuBackend> {
+        let source = if kv_half {
+            format!("#define KV_HALF\n{SOURCE}")
+        } else {
+            SOURCE.to_string()
+        };
+        let source = CString::new(source).unwrap();
         let names: Vec<CString> = KERNELS.iter().map(|k| CString::new(*k).unwrap()).collect();
         let name_ptrs: Vec<*const c_char> = names.iter().map(|n| n.as_ptr()).collect();
         let mut err = [0 as c_char; 1024];
@@ -378,7 +393,8 @@ impl GpuBackend {
         let f = size_of::<f32>();
         let b = MAX_BATCH;
         let qkv_dim = cfg.q_dim() + 2 * cfg.kv_dim();
-        let cache = cfg.layers * blocks * BLOCK * cfg.kv_dim() * f;
+        let kv_bytes = if kv_half { 2 } else { 4 };
+        let cache = cfg.layers * blocks * BLOCK * cfg.kv_dim() * kv_bytes;
         let act = Activations {
             x: Buffer::new(&ctx, b * cfg.hidden * f)?,
             xb: Buffer::new(&ctx, b * cfg.hidden * f)?,
@@ -399,13 +415,18 @@ impl GpuBackend {
             v_cache: Buffer::new(&ctx, cache)?,
         };
 
-        let format = w.format.name();
+        let format = if kv_half {
+            format!("{}, f16 KV", w.format.name())
+        } else {
+            w.format.name().to_string()
+        };
         let Weights { embed, .. } = w; // everything else now lives on the GPU
         Ok(GpuBackend {
             freqs: rope_frequencies(&cfg),
             cfg,
             device,
             format,
+            kv_bytes,
             act,
             layers,
             norm,
@@ -600,7 +621,7 @@ impl Backend for GpuBackend {
 
         unsafe { tm_begin(self.ctx.0) };
         for (l, layer) in self.layers.iter().enumerate() {
-            let cache_off = l * self.blocks * BLOCK * kv_dim * 4;
+            let cache_off = l * self.blocks * BLOCK * kv_dim * self.kv_bytes;
             self.rmsnorm(&a.x, &layer.attn_norm, &a.xb, t, false);
             self.matmul(&layer.wqkv, &a.xb, &a.qkv, t, layer.bqkv.as_ref(), false);
             if let Some((qn, kn)) = &layer.qk_norm {

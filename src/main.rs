@@ -63,6 +63,7 @@ options:
   --kv-tokens N      KV cache size for `serve`, shared by all users (default 16384)
   --max-seqs N       most requests `serve` runs at once (default 16)
   --json             constrain the reply to a JSON object
+  --kv-f16           store the GPU KV cache as f16 (half the memory)
   --url URL          server for `loadtest` (default http://127.0.0.1:8080)
   --clients LIST     concurrency levels for `loadtest` (default 1,4,16)
   --requests N       requests per level for `loadtest` (default 32)";
@@ -95,6 +96,7 @@ struct Args {
     requests: usize,
     lookup: bool,
     temp_set: bool,
+    kv_f16: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -132,6 +134,7 @@ fn parse_args() -> Result<Args> {
         requests: 32,
         lookup: false,
         temp_set: false,
+        kv_f16: false,
     };
     while let Some(flag) = it.next() {
         let mut value = || {
@@ -158,6 +161,7 @@ fn parse_args() -> Result<Args> {
                 a.temp_set = true;
             }
             "--lookup" => a.lookup = true,
+            "--kv-f16" => a.kv_f16 = true,
             "--top-k" => a.sampler.top_k = num(&flag, value()?)?,
             "--top-p" => a.sampler.top_p = num(&flag, value()?)?,
             "--repeat-penalty" => a.sampler.repetition_penalty = num(&flag, value()?)?,
@@ -262,7 +266,7 @@ fn load_backend(
     let weights = Weights::load(dir, &cfg, format)?;
     let bytes = weights.bytes();
     let backend: Box<dyn Backend> = if gpu {
-        gpu_backend(cfg.clone(), weights, blocks, a.ctx)?
+        gpu_backend(cfg.clone(), weights, blocks, a.ctx, a.kv_f16)?
     } else {
         Box::new(CpuBackend::new(cfg.clone(), weights, pool.clone(), blocks))
     };
@@ -307,14 +311,15 @@ fn gpu_backend(
     weights: Weights,
     blocks: usize,
     max_seq: usize,
+    kv_f16: bool,
 ) -> Result<Box<dyn Backend>> {
     Ok(Box::new(tachyon::gpu::GpuBackend::new(
-        cfg, weights, blocks, max_seq,
+        cfg, weights, blocks, max_seq, kv_f16,
     )?))
 }
 
 #[cfg(not(target_os = "macos"))]
-fn gpu_backend(_: Config, _: Weights, _: usize, _: usize) -> Result<Box<dyn Backend>> {
+fn gpu_backend(_: Config, _: Weights, _: usize, _: usize, _: bool) -> Result<Box<dyn Backend>> {
     bail!("the GPU backend needs macOS (Metal)")
 }
 
