@@ -253,7 +253,8 @@ impl JsonObject {
         }
     }
 
-    fn accepts(&self, bytes: &[u8]) -> bool {
+    /// Whether these bytes may come next.
+    pub fn accepts_bytes(&self, bytes: &[u8]) -> bool {
         let mut probe = self.clone();
         bytes.iter().all(|&b| probe.step(b))
     }
@@ -262,7 +263,7 @@ impl JsonObject {
 impl Constraint for JsonObject {
     fn allows(&self, tok: &Tokenizer, token: u32) -> bool {
         let bytes = tok.token_bytes(token);
-        !tok.is_special(token) && !bytes.is_empty() && self.accepts(bytes)
+        !tok.is_special(token) && !bytes.is_empty() && self.accepts_bytes(bytes)
     }
 
     fn advance(&mut self, bytes: &[u8]) {
@@ -282,7 +283,7 @@ mod tests {
 
     fn check(text: &str) -> (bool, bool) {
         let mut j = JsonObject::default();
-        let ok = j.accepts(text.as_bytes());
+        let ok = j.accepts_bytes(text.as_bytes());
         j.advance(text.as_bytes());
         (ok, j.is_complete())
     }
