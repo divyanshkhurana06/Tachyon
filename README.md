@@ -1,5 +1,7 @@
 # Tachyon
 
+[![CI](https://github.com/divyanshkhurana06/Tachyon/actions/workflows/ci.yml/badge.svg)](https://github.com/divyanshkhurana06/Tachyon/actions/workflows/ci.yml)
+
 **An LLM inference engine and serving stack written from scratch in Rust, with hand-written ARM NEON and Metal GPU kernels, and zero dependencies.**
 
 Tachyon runs real Hugging Face checkpoints (Qwen2.5, Qwen3) on a MacBook's CPU or GPU, and serves many users at once the way vLLM does: a paged KV cache with prefix sharing, continuous batching, and an OpenAI-compatible API. It quantizes to 8 and 4 bits, decodes speculatively (with a draft model or with no model at all), and can force output to be valid JSON. Everything between the weights file and the HTTP response is in this repository, including the JSON parser, safetensors reader, BPE tokenizer, thread pool, SIMD kernels, GPU shaders, scheduler and web server. `Cargo.toml` has no dependencies.
@@ -117,7 +119,7 @@ With `response_format: {"type": "json_object"}`, a pushdown automaton for JSON r
 
 ### How it's verified
 
-`cargo test --release` runs 38 tests, in CI on Apple Silicon. Beyond unit tests of every kernel against a scalar reference, they check against the real model that:
+`cargo test --release` runs 38 tests, in CI on Apple Silicon. GitHub's virtual Macs expose a GPU that returns zeros, so the engine self-tests the GPU at startup and refuses a broken one; there the GPU comparisons skip, and they run on real hardware. Beyond unit tests of every kernel against a scalar reference, the tests check against the real model that:
 
 - several sequences batched together produce exactly the tokens each produces alone, on CPU and GPU;
 - the GPU produces exactly the same greedy tokens as the CPU, for Qwen2.5 and Qwen3;
