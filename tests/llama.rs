@@ -162,7 +162,7 @@ fn calls_tools_in_llama_format() {
     assert_eq!(args.get("city").and_then(Json::as_str), Some("Tokyo"));
 
     let schema = Json::parse(&format!(
-        r#"{{"type":"object","properties":{{"name":{{"const":"get_weather"}},"parameters":{params}}}}}"#
+        r#"{{"type":"object","properties":{{"name":{{"const":"get_weather"}},"parameters":{params}}},"required":["name","parameters"]}}"#
     ))
     .unwrap();
     for seed in 1..=3 {

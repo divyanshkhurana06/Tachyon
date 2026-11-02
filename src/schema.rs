@@ -8,8 +8,8 @@
 //! has the requested shape.
 //!
 //! Supported: `type` (object, array, string, integer, number, boolean,
-//! null, or a list of them), `properties` (all required, written in schema
-//! order, as in OpenAI's strict mode), `items`, `minItems`, `maxItems`,
+//! null, or a list of them), `properties` (written in schema order; those
+//! not listed in `required` may be left out), `items`, `minItems`, `maxItems`,
 //! `enum`, `const`, `anyOf`/`oneOf`, and `$ref` into `$defs`. Alternatives
 //! in a union are told apart by their first byte, so "string or null"
 //! works but "integer or number" commits to the first.
@@ -27,8 +27,9 @@ enum Node {
     Any,
     /// An object with any keys and any values.
     AnyObject,
-    /// Keys (JSON-encoded, with quotes) and their value nodes, in order.
-    Object(Vec<(Vec<u8>, usize)>),
+    /// Fields in order: key (JSON-encoded, with quotes), value node, and
+    /// whether it is required.
+    Object(Vec<(Vec<u8>, usize, bool)>),
     Array {
         items: usize,
         min: usize,
@@ -152,10 +153,18 @@ impl Builder<'_> {
         let node = match t {
             "object" => match s.get("properties").and_then(Json::as_object) {
                 Some(props) if !props.is_empty() => {
+                    let required: Vec<&str> = s
+                        .get("required")
+                        .and_then(Json::as_array)
+                        .unwrap_or(&[])
+                        .iter()
+                        .filter_map(Json::as_str)
+                        .collect();
                     let mut fields = Vec::with_capacity(props.len());
                     for (key, value) in props {
                         let id = self.node(value, depth + 1)?;
-                        fields.push((Json::Str(key.clone()).to_string().into_bytes(), id));
+                        let key_json = Json::Str(key.clone()).to_string().into_bytes();
+                        fields.push((key_json, id, required.contains(&key.as_str())));
                     }
                     Node::Object(fields)
                 }
@@ -188,6 +197,8 @@ impl Builder<'_> {
 enum Stage {
     Open,
     Key,
+    /// Inside a key, `pos` bytes in (objects with a schema only).
+    InKey,
     Colon,
     After,
 }
@@ -210,8 +221,13 @@ enum Frame {
     Value(usize),
     Object {
         node: usize,
-        field: usize,
+        /// The first field that may still be written.
+        next: usize,
         stage: Stage,
+        /// While a key is written: the fields it may still be, and how
+        /// many of its bytes have been seen.
+        keys: Vec<usize>,
+        pos: usize,
     },
     AnyObject {
         stage: Stage,
@@ -299,8 +315,10 @@ impl JsonSchema {
                 b == b'{'
                     && self.push(Frame::Object {
                         node,
-                        field: 0,
+                        next: 0,
                         stage: Stage::Open,
+                        keys: Vec::new(),
+                        pos: 0,
                     })
             }
             Node::Array { .. } => {
@@ -365,11 +383,32 @@ impl JsonSchema {
     /// Feeds one byte; false if it cannot appear here.
     fn step(&mut self, b: u8) -> bool {
         let ws = matches!(b, b' ' | b'\t' | b'\n' | b'\r');
+        let schema = self.schema.clone();
         loop {
             let Some(top) = self.stack.last_mut() else {
                 return false;
             };
             match top {
+                Frame::Object {
+                    node,
+                    next,
+                    stage: stage @ Stage::InKey,
+                    keys,
+                    pos,
+                } => {
+                    // Keys are whole JSON strings, so none is a prefix of
+                    // another: the first to end is the one written.
+                    let Node::Object(fields) = &schema.nodes[*node] else {
+                        unreachable!()
+                    };
+                    keys.retain(|&f| fields[f].0.get(*pos) == Some(&b));
+                    *pos += 1;
+                    if let Some(&f) = keys.iter().find(|&&f| fields[f].0.len() == *pos) {
+                        *next = f + 1;
+                        *stage = Stage::Colon;
+                    }
+                    return !keys.is_empty();
+                }
                 Frame::Str { escape, hex } => {
                     return match (*escape, *hex) {
                         (_, n) if n > 0 => {
@@ -457,7 +496,6 @@ impl JsonSchema {
                 return self.whitespace <= MAX_WHITESPACE;
             }
             self.whitespace = 0;
-            let schema = self.schema.clone();
             let top = self.stack.last_mut().unwrap();
             return match top {
                 Frame::Value(node) => {
@@ -465,28 +503,43 @@ impl JsonSchema {
                     self.pop();
                     self.start(node, b)
                 }
-                Frame::Object { node, field, stage } => {
+                Frame::Object {
+                    node,
+                    next,
+                    stage,
+                    keys,
+                    pos,
+                } => {
                     let Node::Object(fields) = &schema.nodes[*node] else {
                         unreachable!()
                     };
+                    let rest_optional = fields[*next..].iter().all(|f| !f.2);
                     match (*stage, b) {
                         (Stage::Open | Stage::Key, b'"') => {
-                            let key = fields[*field].0.clone();
-                            *stage = Stage::Colon;
-                            self.start_literals(vec![key], b)
+                            // The next field, or a later one past optional ones.
+                            let mut can = Vec::new();
+                            for (f, field) in fields.iter().enumerate().skip(*next) {
+                                can.push(f);
+                                if field.2 {
+                                    break;
+                                }
+                            }
+                            *keys = can;
+                            *pos = 1;
+                            *stage = Stage::InKey;
+                            !keys.is_empty()
+                        }
+                        (Stage::Open | Stage::After, b'}') if rest_optional => {
+                            self.pop();
+                            true
                         }
                         (Stage::Colon, b':') => {
-                            let value = fields[*field].1;
+                            let value = fields[*next - 1].1;
                             *stage = Stage::After;
                             self.push(Frame::Value(value))
                         }
-                        (Stage::After, b',') if *field + 1 < fields.len() => {
-                            *field += 1;
+                        (Stage::After, b',') if *next < fields.len() => {
                             *stage = Stage::Key;
-                            true
-                        }
-                        (Stage::After, b'}') if *field + 1 == fields.len() => {
-                            self.pop();
                             true
                         }
                         _ => false,
@@ -587,7 +640,8 @@ mod tests {
             "manager": {"type": ["string", "null"]},
             "address": {"$ref": "#/$defs/address"}
         },
-        "$defs": {"address": {"type": "object", "properties": {"city": {"type": "string"}, "zip": {"type": "number"}}}}
+        "required": ["name", "age", "role", "tags", "manager", "address"],
+        "$defs": {"address": {"type": "object", "properties": {"city": {"type": "string"}, "zip": {"type": "number"}}, "required": ["city", "zip"]}}
     }"##;
 
     #[test]
@@ -615,6 +669,35 @@ mod tests {
         ] {
             assert!(!check(&m, text).0, "accepted {text}");
         }
+    }
+
+    #[test]
+    fn optional_properties_may_be_left_out_in_order() {
+        let m = matcher(
+            r#"{"type":"object","properties":{"a":{"type":"integer"},"ab":{"type":"integer"},"b":{"type":"string"},"c":{"type":"boolean"}},"required":["b"]}"#,
+        );
+        for text in [
+            r#"{"b":"x"}"#,
+            r#"{"a":1,"b":"x"}"#,
+            r#"{"ab":2,"b":"x","c":true}"#,
+            r#"{"a":1,"ab":2,"b":"x","c":false}"#,
+            r#"{ "b" : "x" , "c" : true }"#,
+        ] {
+            assert_eq!(check(&m, text), (true, true), "{text}");
+        }
+        for text in [
+            r#"{}"#,                 // b is required
+            r#"{"a":1}"#,            // b is required
+            r#"{"b":"x","a":1}"#,    // out of order
+            r#"{"c":true}"#,         // can't skip the required b
+            r#"{"b":"x","c":true,"#, // nothing may follow c
+            r#"{"a":1,"a":2"#,       // no repeats
+        ] {
+            assert!(!check(&m, text).0 || !check(&m, text).1, "accepted {text}");
+        }
+        let all_optional = matcher(r#"{"type":"object","properties":{"k v":{"type":"null"}}}"#);
+        assert_eq!(check(&all_optional, "{}"), (true, true));
+        assert_eq!(check(&all_optional, r#"{"k v":null}"#), (true, true));
     }
 
     #[test]

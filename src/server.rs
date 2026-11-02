@@ -300,6 +300,7 @@ fn call_schema(
             "properties",
             Json::Obj(vec![("name".into(), name), (key.into(), arguments)]),
         ),
+        ("required", Json::Arr(vec!["name".into(), key.into()])),
     ]);
     Schema::parse(&schema).map_err(|e| format!("bad tool parameters: {e}"))
 }

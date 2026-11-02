@@ -445,7 +445,7 @@ fn json_schema_output_has_the_requested_shape() {
     let tok = Tokenizer::load(&dir.join("tokenizer.json")).unwrap();
     let mut e = cpu(&dir, Format::Q8);
     let schema = Json::parse(
-        r#"{"type":"object","properties":{"city":{"type":"string"},"population":{"type":"integer"},"coastal":{"type":"boolean"},"landmarks":{"type":"array","items":{"type":"string"},"maxItems":2}}}"#,
+        r#"{"type":"object","properties":{"city":{"type":"string"},"population":{"type":"integer"},"coastal":{"type":"boolean"},"landmarks":{"type":"array","items":{"type":"string"},"maxItems":2}},"required":["city","population","coastal","landmarks"]}"#,
     )
     .unwrap();
     let format = OutputFormat::JsonSchema(JsonSchema::new(Schema::parse(&schema).unwrap()));
@@ -516,7 +516,7 @@ fn forced_tool_calls_fit_the_function_schema() {
         r#"{{"type":"function","function":{{"name":"get_weather","parameters":{params}}}}}"#
     ))
     .unwrap();
-    let schema = Json::parse(&format!(r#"{{"type":"object","properties":{{"name":{{"const":"get_weather"}},"arguments":{params}}}}}"#)).unwrap();
+    let schema = Json::parse(&format!(r#"{{"type":"object","properties":{{"name":{{"const":"get_weather"}},"arguments":{params}}},"required":["name","arguments"]}}"#)).unwrap();
 
     let mut p = tpl.encode_with_tools(
         &tok,
