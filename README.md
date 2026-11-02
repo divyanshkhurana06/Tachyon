@@ -4,7 +4,7 @@
 
 **An LLM inference engine and serving stack written from scratch in Rust, with hand-written ARM NEON and Metal GPU kernels, and zero dependencies.**
 
-Tachyon runs real Hugging Face checkpoints (Qwen2.5, Qwen3) on a MacBook's CPU or GPU, and serves many users at once the way vLLM does: a paged KV cache with prefix sharing, continuous batching, and an OpenAI-compatible API. It quantizes to 8 and 4 bits (with activation-aware calibration), decodes speculatively (with a draft model or with no model at all), and supports the API features agents rely on: structured output that matches a JSON Schema, tool calling and logprobs. Everything between the weights file and the HTTP response is in this repository, including the JSON parser, safetensors reader, BPE tokenizer, thread pool, SIMD kernels, GPU shaders, scheduler and web server. `Cargo.toml` has no dependencies.
+Tachyon runs real Hugging Face checkpoints (Llama 3.2, Qwen2.5, Qwen3) on a MacBook's CPU or GPU, and serves many users at once the way vLLM does: a paged KV cache with prefix sharing, continuous batching, and an OpenAI-compatible API. It quantizes to 8 and 4 bits (with activation-aware calibration), decodes speculatively (with a draft model or with no model at all), and supports the API features agents rely on: structured output that matches a JSON Schema, tool calling and logprobs. Everything between the weights file and the HTTP response is in this repository, including the JSON parser, safetensors reader, BPE tokenizer, thread pool, SIMD kernels, GPU shaders, scheduler and web server. `Cargo.toml` has no dependencies.
 
 ![Chat page served by Tachyon](docs/chat-ui.jpg)
 
@@ -27,14 +27,14 @@ Decoding one sequence reads every weight once per token, so it is limited by mem
 
 | batch | GPU step time | GPU throughput | CPU throughput |
 |---:|---:|---:|---:|
-| 1 | 7.6 ms | 132 tok/s | 135 tok/s |
-| 4 | 13.6 ms | 294 tok/s | 184 tok/s |
-| 8 | 14.9 ms | 536 tok/s | 189 tok/s |
-| 16 | 20.3 ms | 790 tok/s | 193 tok/s |
-| 32 | 31.9 ms | 1,002 tok/s | 188 tok/s |
-| 64 | 62.9 ms | 1,017 tok/s | 168 tok/s |
+| 1 | 7.6 ms | 132 tok/s | 150 tok/s |
+| 4 | 13.6 ms | 294 tok/s | 404 tok/s |
+| 8 | 14.9 ms | 536 tok/s | 342 tok/s |
+| 16 | 20.3 ms | 790 tok/s | 366 tok/s |
+| 32 | 27.6 ms | 1,157 tok/s | 354 tok/s |
+| 64 | 48.3 ms | 1,324 tok/s | 321 tok/s |
 
-The CPU can't do this. At batch 4 it is already limited by arithmetic, not memory, so extra sequences just take turns. From `tachyon bench-batch`, 8-bit weights.
+The CPU gets 2.7x from its first four sequences, which share each weight load in its int8 dot products, and is then limited by arithmetic, not memory, so extra sequences just take turns. From `tachyon bench-batch`, 8-bit weights.
 
 95% of the server's step time is the forward pass; sampling, streaming and scheduling are the other 5%.
 
@@ -44,26 +44,28 @@ Qwen2.5-0.5B-Instruct, one sequence at a time:
 
 | backend | format | weights | prefill | decode | perplexity |
 |---|---|---:|---:|---:|---:|
-| GPU | bf16 | 988 MB | 1,615 tok/s | 69.5 tok/s | 17.94 |
-| GPU | 8-bit | 556 MB | 1,759 tok/s | 105.9 tok/s | 17.99 |
-| GPU | `q4m` (mixed 4/8-bit) | 441 MB | 1,691 tok/s | 113.7 tok/s | 19.32 |
-| GPU | `q4` (mostly 4-bit) | 389 MB | 1,683 tok/s | 112.7 tok/s | 19.97 |
+| GPU | bf16 | 988 MB | 2,500 tok/s | 78.0 tok/s | 17.95 |
+| GPU | 8-bit | 556 MB | 2,512 tok/s | 126.0 tok/s | 17.99 |
+| GPU | `q4m` (mixed 4/8-bit) | 441 MB | 2,454 tok/s | 127.8 tok/s | 19.32 |
+| GPU | `q4` (mostly 4-bit) | 389 MB | 2,325 tok/s | 126.7 tok/s | 19.97 |
 | GPU | `q4` + importance matrix | 389 MB | | | **19.48** |
 | GPU | `q4m` + importance matrix | 441 MB | | | **19.11** |
-| CPU | bf16 | 988 MB | 179 tok/s | 68.2 tok/s | 17.94 |
-| CPU | 8-bit | 556 MB | 244 tok/s | 94.4 tok/s | 18.08 |
-| CPU | `q4m` | 441 MB | 226 tok/s | 87.4 tok/s | 19.50 |
-| CPU | `q4` | 389 MB | 213 tok/s | 61.9 tok/s | 20.04 |
+| CPU | bf16 | 988 MB | 139 tok/s | 77.0 tok/s | 17.94 |
+| CPU | 8-bit | 556 MB | 387 tok/s | 111.9 tok/s | 18.03 |
+| CPU | `q4m` | 441 MB | 397 tok/s | 121.6 tok/s | 19.38 |
+| CPU | `q4` | 389 MB | 374 tok/s | 111.5 tok/s | 20.02 |
 
-From `tachyon bench`: best of 3 runs, prefill 256 tokens, decode 128, perplexity over 979 tokens of [`bench/eval.txt`](bench/eval.txt). Speeds move by ±20% with background load, CPU decode most of all: the same `q4` CPU benchmark measured 130 tok/s in a quieter moment.
+From `tachyon bench`: best of 3 runs, prefill 256 tokens, decode 128, perplexity over 979 tokens of [`bench/eval.txt`](bench/eval.txt). Speeds move by ±20% with background load, CPU decode most of all.
 
 - **Decode** is one token at a time, which is how chat replies are generated. Smaller weights mean fewer bytes per token, so faster decoding.
-- **Prefill** is processing the prompt. The GPU does it on its matrix units (`simdgroup_matrix`), 3x faster than its matrix-vector path.
-- **Perplexity** measures how surprised the model is by a held-out text (lower is better), and shows what each format costs. CPU and GPU agree in bf16 because they compute the same function. `q4` and `q4m` are mixed precision: the matrices that measurably matter most stay at 8 bits (see below).
+- **Prefill** is processing the prompt. The GPU does it on its matrix units (`simdgroup_matrix`), for the matrix multiplies and for attention; the CPU with ARM's int8 dot-product instructions, four tokens per weight load.
+- **Perplexity** measures how surprised the model is by a held-out text (lower is better), and shows what each format costs. CPU and GPU agree in bf16 (to 0.002) because they compute the same function. `q4` and `q4m` are mixed precision: the matrices that measurably matter most stay at 8 bits (see below).
 
 The **importance matrix** (`tachyon calibrate`, then `--imatrix`) runs calibration text through the model, records how large each linear layer's inputs are per channel, and fits each 4-bit block's scale to minimize error weighted by those activations (llama.cpp's imatrix, in the spirit of AWQ). It cuts 4-bit's quality loss against bf16 from 11% to 8.5%, at no cost in size or speed. The calibration text ([`bench/calib.txt`](bench/calib.txt)) is separate from the evaluation text.
 
 Qwen3-0.6B on the GPU: 55 tok/s in bf16, 86 tok/s in 8-bit.
+
+**Llama 3.2 1B Instruct** (Llama 3's scaled RoPE, tokenizer and chat format): on the GPU in 8-bit, 1,140 tok/s prefill and 55 tok/s decode; perplexity 16.64 in 8-bit against 16.66 in bf16, where CPU and GPU agree exactly.
 
 ### Against llama.cpp
 
@@ -71,13 +73,14 @@ Same model (Qwen2.5-0.5B-Instruct, 8-bit: Tachyon's `q8` against Qwen's official
 
 | | llama.cpp | Tachyon | Tachyon vs llama.cpp |
 |---|---:|---:|---:|
-| GPU decode, 256-token context | 127 tok/s | 131 tok/s | **on par** |
-| GPU decode, 2,048-token context | 119 tok/s | 108 tok/s | 91% |
-| GPU prefill, 256 tokens | 2,770–3,040 tok/s | 1,845 tok/s | ~64% |
-| CPU decode, 6 threads | 93–108 tok/s | 99–116 tok/s | **on par** |
-| CPU prefill | 945–1,054 tok/s | 160–264 tok/s | ~20% |
+| GPU prefill, 256 tokens | 2,540–3,315 tok/s | 2,670 tok/s | **on par** |
+| GPU prefill, 2,048 tokens | 2,905–3,077 tok/s | 1,934 tok/s | 65% |
+| GPU decode, 256-token context | 137–141 tok/s | 129–131 tok/s | 93% |
+| GPU decode, 2,048-token context | 134 tok/s | 116 tok/s | 87% |
+| CPU prefill, 6 threads | 979–1,076 tok/s | 406–445 tok/s | 42% |
+| CPU decode, 6 threads | 148–150 tok/s | 129 tok/s | 87% |
 
-Decoding, where a chat reply spends its time, is on par. Prefill is the gap: llama.cpp's GPU matrix multiply uses larger half-precision tiles, and its CPU prefill goes through Apple's Accelerate framework to the AMX matrix units, while Tachyon's CPU path is plain NEON with no dependencies.
+Short prompts and chat-length decoding are close to llama.cpp, a mature engine with years of Apple-specific tuning, from code with no dependencies. The remaining gaps are long contexts, where attention dominates, and CPU prefill, which llama.cpp sends through Apple's Accelerate framework to the AMX matrix units while Tachyon uses ARM's SDOT instructions. In this release GPU prefill went from 64% to on par and CPU prefill from 20% to 42%.
 
 ### Speculative decoding: up to 2.2x faster
 
@@ -123,13 +126,14 @@ Property tests check the matchers against the JSON parser on tens of thousands o
 | [`kv.rs`](src/kv.rs) | Paged KV cache: block allocator, per-sequence block tables, prefix cache with LRU eviction |
 | [`scheduler.rs`](src/scheduler.rs) | Continuous batching, chunked prefill, preemption by recompute, parallel sampling |
 | [`server.rs`](src/server.rs) | HTTP/1.1 on `std::net`: `/v1/chat/completions` (streaming, `stop`, `response_format`, `ignore_eos`), `/v1/models`, `/info`, chat page |
-| [`model.rs`](src/model.rs) | CPU forward pass over a batch: RMSNorm, grouped-query attention through block tables, RoPE, SiLU MLP, Qwen3's q/k norm |
-| [`gpu/`](src/gpu) | Metal backend: [`kernels.metal`](src/gpu/kernels.metal) (matrix-vector kernels for decode, `simdgroup_matrix` GEMM for batches, paged attention, RoPE, norms) and an [Objective-C bridge](src/gpu/shim.m) compiled by `build.rs` |
-| [`kernels.rs`](src/kernels.rs) | NEON dot products for bf16, int8×int8 and int4×int8, plus the quantizers |
+| [`model.rs`](src/model.rs) | CPU forward pass over a batch: RMSNorm, grouped-query attention through block tables, RoPE (with Llama 3's scaling), SiLU MLP, Qwen3's q/k norm |
+| [`gpu/`](src/gpu) | Metal backend: [`kernels.metal`](src/gpu/kernels.metal) (matrix-vector kernels for decode, `simdgroup_matrix` GEMM for batches, FlashAttention-style prefill attention and paged decode attention, RoPE, norms) and an [Objective-C bridge](src/gpu/shim.m) compiled by `build.rs` |
+| [`kernels.rs`](src/kernels.rs) | NEON dot products for bf16, int8×int8 and int4×int8 (SDOT, four tokens per weight load), plus the quantizers |
 | [`speculative.rs`](src/speculative.rs) | Speculative decoding and sampling, model and prompt-lookup drafters |
 | [`constrain.rs`](src/constrain.rs) | JSON pushdown automaton for constrained decoding |
 | [`sampler.rs`](src/sampler.rs) | Temperature, top-k (single pass), top-p, repetition penalty, constraint masks |
 | [`tokenizer.rs`](src/tokenizer.rs) | Byte-level BPE from `tokenizer.json`, with the pre-tokenizer regex reimplemented by hand |
+| [`chat.rs`](src/chat.rs) | ChatML and Llama 3 chat formats, Qwen's tool-call format |
 | [`safetensors.rs`](src/safetensors.rs), [`json.rs`](src/json.rs), [`pool.rs`](src/pool.rs) | mmap'd weights, JSON, a spin-then-park thread pool |
 
 ### Design notes
@@ -137,20 +141,24 @@ Property tests check the matchers against the JSON parser on tens of thousands o
 - **Decode is a memory-bandwidth problem.** A 0.5B model in bf16 is ~1 GB, all of it read for every token: at ~100 GB/s the ceiling is ~100 tok/s whatever the arithmetic. Hence quantization for one user, and batching for many.
 - **Paged KV cache.** Sequences grow 16 positions at a time instead of reserving their maximum length, so the cache holds as many conversations as actually fit. Full blocks are registered under a hash of the entire token prefix up to them; a new request whose prompt starts the same way takes those blocks instead of recomputing them.
 - **The matrix units changed the batching story.** The first batched GPU kernel reused each weight for 8 tokens and read 8 bytes of activations per byte of weights; 4 tokens cost twice as much as 1. A tiled GEMM on `simdgroup_matrix` (16 tokens × 64 rows per threadgroup, tiles staged in threadgroup memory) made batch 32 run at 1,300 tok/s instead of 410, and prefill 3x faster.
+- **Then attention was.** With the matrix multiplies on the matrix units, attention took 30% of prefill: it ran one 1,024-thread threadgroup per head per token, mostly idle at short contexts, each rereading the same keys. Runs of a sequence's consecutive tokens now go to a FlashAttention-style kernel: one threadgroup takes 32 queries of a head, walks the cache 32 positions at a time with those positions' keys and values staged once in threadgroup memory, computes scores and outputs on the 8x8 matrix units, and keeps the softmax exact with a running max and sum, rescaling the output through a diagonal matrix multiply. Prefill went from 2,000 to 2,670 tok/s on a 256-token prompt and from 950 to 1,930 on a 2,048-token one; decode steps keep the per-token kernel, which suits one query.
 - **Then the scheduler was the bottleneck.** With a fast engine, 25% of each step went to sampling: copying 600 KB of logits per sequence and partially sorting 150k entries. A single-pass top-k (insert only what beats the current k-th best) and parallel sampling brought that to 5%, taking 32 users from 695 to 1,014 tok/s.
 - **Quantization by measurement.** Keeping each matrix type at 8 bits in turn showed q/k/v buys 0.6 perplexity for 3% more memory and the down projection 0.5 for 14%; `q4` and `q4m` are built from that. Fitting 4-bit scales by least squares lowered weight error but made perplexity *worse*: what matters is error times the input it meets. Weighting the fit by measured activations (the importance matrix) is what finally helped.
 - **Constrained decoding is a matcher plus a sampler filter.** JSON mode, JSON Schema and forced tool calls are all the same mechanism: a byte-level automaton that says whether a token's bytes can come next, and a sampler that ranks the likely tokens first and asks about those, so the check costs a few hundred probes per token, not 150,000.
+- **The CPU's int8 path is SDOT.** One `sdot` instruction multiplies 16 pairs of int8 values and adds them into four int32 lanes, against four instructions for the widening multiply-adds it replaced (written as inline assembly, since Rust's intrinsic for it is unstable). Each weight block is also loaded once for four tokens. Prefill went from about 300 to 490 tok/s and batch-4 decoding from about 200 to 400 tok/s.
 - **The thread pool.** With one spinning worker per core, any background process preempts one and every matmul waits for it. Leaving two efficiency cores free doubled CPU decode speed.
-- **Measure under identical conditions, or not at all.** GPU speed on a laptop moves with power source, Low Power Mode and background load (one run measured 105 tok/s, the same code later 131). Every optimization here was decided by building both versions and alternating them in the same session. That process kept two changes and rejected two:
-  - kept: **1,024 threads per attention head** (+26% decode at 2,048 tokens of context) and **32-token GEMM tiles fed 128-token prefill chunks** (+15-18% prefill), plus an **f16 KV cache** by default (lossless here, and llama.cpp's default too);
-  - rejected: **fusing RMSNorm and SiLU into the matmuls** (no faster: launches inside one command buffer are cheap) and **grouped-query flash-decoding attention** (reads each key once instead of 7 times, but with only 2 KV heads it left most of the GPU idle, and the extra combine pass cost more than the reads it saved).
+- **Measure under identical conditions, or not at all.** GPU speed on a laptop moves with power source, Low Power Mode and background load (one run measured 105 tok/s, the same code later 131). Every optimization here was decided by building both versions and alternating them in the same session. Kept and rejected so far:
+  - kept: **1,024 threads per attention head** for decode (+26% at 2,048 tokens of context), with **4 value dims per thread** in its last pass (+11% more); **32-token GEMM tiles fed 128-token prefill chunks** (+15-18% prefill), with **weights staged as half precision** (+11-14%, and the tile's threadgroup memory down from 20 KB to 8 KB); the **FlashAttention-style prefill kernel** (+30% at 256 tokens, 2x at 2,048); **SDOT with four tokens per weight load** (1.7x CPU prefill); an **f16 KV cache** by default (lossless here, and llama.cpp's default too);
+  - rejected: **fusing RMSNorm and SiLU into the matmuls** (no faster: launches inside one command buffer are cheap); **grouped-query flash-decoding attention** (reads each key once instead of 7 times, but with only 2 KV heads it left most of the GPU idle); **64-token GEMM tiles**, **half-precision activation tiles** and **256-token prefill chunks** (no faster); **sizing attention threadgroups to the context** (+15% on short prompts, slower on long ones: the per-token kernel was the wrong shape, which the prefill kernel fixed); **splitting each key across lanes** in decode attention (no faster).
 
 ### How it's verified
 
-`cargo test --release` runs 51 tests, in CI on Apple Silicon. GitHub's virtual Macs expose a GPU that returns zeros, so the engine self-tests the GPU at startup and refuses a broken one; there the GPU comparisons skip, and they run on real hardware. Beyond unit tests of every kernel against a scalar reference, the tests check against the real model that:
+`cargo test --release` runs 56 tests, in CI on Apple Silicon. GitHub's virtual Macs expose a GPU that returns zeros, so the engine self-tests the GPU at startup and refuses a broken one; there the GPU comparisons skip, and they run on real hardware. Beyond unit tests of every kernel against a scalar reference, the tests check against the real model that:
 
 - several sequences batched together produce exactly the tokens each produces alone, on CPU and GPU;
-- the GPU produces exactly the same greedy tokens as the CPU, for Qwen2.5 and Qwen3;
+- the GPU produces exactly the same greedy tokens as the CPU, for Qwen2.5, Qwen3 and Llama 3.2;
+- the prefill attention kernel, fed a whole prompt through a scrambled block table, gives the same logits as the per-token kernel (largest difference 0.009);
+- Llama 3.2's tokenizer and chat format give the known token ids of Llama 3's prompt header and assistant turn;
 - speculative decoding (model or prompt-lookup drafter) is identical to plain greedy decoding, and speculative sampling reproduces the target distribution (200,000 trials);
 - reusing the KV cache gives the same output as recomputing it;
 - JSON mode always parses, schema-constrained output has the requested shape, and forced tool calls fit the function's schema;
@@ -173,10 +181,12 @@ cd ../..
 cargo build --release
 ```
 
+For Llama 3.2 1B, download the same four files from [meta-llama/Llama-3.2-1B-Instruct](https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct) (gated: accept Meta's license on Hugging Face first) into `models/llama-3.2-1b-instruct`, and pass `--model models/llama-3.2-1b-instruct`.
+
 ```bash
 ./target/release/tachyon run --gpu --prompt "Explain recursion to a five-year-old."
 ./target/release/tachyon chat --quant q4m                 # multi-turn chat in the terminal
-./target/release/tachyon serve --gpu --kv-f16             # many users; chat page at http://localhost:8080
+./target/release/tachyon serve --gpu                      # many users; chat page at http://localhost:8080
 ./target/release/tachyon loadtest --clients 1,16,32       # against a running server
 ./target/release/tachyon bench                            # speed and perplexity per format
 ./target/release/tachyon bench --context 2048             # decode speed at a long context
@@ -219,12 +229,12 @@ Run `tachyon help` for every option.
 
 - Apple Silicon for the GPU path; the CPU path is portable but only has NEON kernels (other CPUs fall back to scalar code).
 - JSON Schema support covers what structured output needs (objects with all properties required and in order, arrays, enums, unions told apart by their first character, `$ref`), not string `pattern`s or numeric ranges.
-- No Llama 3.1+ yet (`rope_scaling` isn't implemented) and no mixture-of-experts models.
+- No mixture-of-experts models yet, and tool calling only in Qwen's format (Llama's chat format works, its tool format doesn't).
 - The tokenizer skips NFC normalization and treats Unicode letters slightly more broadly than `\p{L}`; this matters only for some scripts with combining marks.
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md): closing the prefill gap with llama.cpp, k-quants, MoE models, CUDA and WebGPU backends.
+See [ROADMAP.md](ROADMAP.md): long-context attention, I8MM for CPU prefill, k-quants, MoE models, CUDA and WebGPU backends.
 
 ## License
 
