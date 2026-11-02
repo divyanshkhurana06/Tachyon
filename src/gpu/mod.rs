@@ -21,15 +21,17 @@ const SOURCE: &str = include_str!("kernels.metal");
 /// Must match `SIMDS`, `R` and `ATT_THREADS` in kernels.metal.
 const MAT_SIMDS: usize = 2;
 const ROWS_PER_GROUP: usize = MAT_SIMDS * 4;
-const ATT_THREADS: u32 = 256;
+const ATT_THREADS: u32 = 1024;
 /// Output tile of the `gemm_*` kernels, and the batch size from which they
 /// beat the matrix-vector kernels.
-const GEMM_TOKENS: usize = 16;
+const GEMM_TOKENS: usize = 32;
 const GEMM_ROWS: usize = 64;
 const GEMM_MIN_BATCH: usize = 4;
 
 /// Most tokens one forward pass takes (prefill chunks, speculative checks).
-pub const MAX_BATCH: usize = 128;
+pub const MAX_BATCH: usize = 256;
+/// Most rows of logits one forward pass returns (they are 150k floats each).
+pub const MAX_LOGIT_ROWS: usize = 128;
 
 #[derive(Clone, Copy)]
 #[repr(u32)]
@@ -403,7 +405,7 @@ impl GpuBackend {
             gate_up: Buffer::new(&ctx, b * 2 * cfg.intermediate * f)?,
             hidden: Buffer::new(&ctx, b * cfg.intermediate * f)?,
             scores: Buffer::new(&ctx, b * cfg.heads * max_seq * f)?,
-            logits: Buffer::new(&ctx, b * lm_head.rows * f)?,
+            logits: Buffer::new(&ctx, MAX_LOGIT_ROWS * lm_head.rows * f)?,
             cos: Buffer::new(&ctx, b * cfg.head_dim / 2 * f)?,
             sin: Buffer::new(&ctx, b * cfg.head_dim / 2 * f)?,
             positions: Buffer::new(&ctx, b * 4)?,
@@ -572,8 +574,8 @@ impl Backend for GpuBackend {
     fn forward(&mut self, batch: &Batch) -> &[f32] {
         let t = batch.len();
         assert!(
-            t > 0 && t <= MAX_BATCH,
-            "the GPU backend takes 1..={MAX_BATCH} tokens per batch"
+            t > 0 && t <= MAX_BATCH && batch.logit_rows.len() <= MAX_LOGIT_ROWS,
+            "the GPU backend takes 1..={MAX_BATCH} tokens and {MAX_LOGIT_ROWS} rows of logits per batch"
         );
         assert!(
             batch.positions.iter().all(|&p| (p as usize) < self.max_seq),
