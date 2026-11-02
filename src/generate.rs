@@ -9,7 +9,7 @@ use crate::tokenizer::{Tokenizer, Utf8Stream};
 use crate::{bail, Result};
 
 /// Prompt tokens per forward pass during prefill.
-pub const PREFILL_CHUNK: usize = 64;
+pub const PREFILL_CHUNK: usize = 128;
 
 #[derive(Debug, Clone)]
 pub struct GenOptions {

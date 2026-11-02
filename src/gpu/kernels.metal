@@ -151,7 +151,8 @@ kernel void matmul_q4(device const float *scales [[buffer(0)]], device const uch
 // quantization block), the input tile and the dequantized weight tile are
 // staged in threadgroup memory once and shared by four simdgroups, each of
 // which accumulates a 16x16 piece with simdgroup_multiply_accumulate.
-constant uint GM_TOK = 16;
+constant uint GM_TOK = 32;
+constant uint TOK_BLOCKS = GM_TOK / 8;
 constant uint GM_ROWS = 64;
 constant uint GM_K = 32;
 
@@ -216,12 +217,16 @@ inline void gemm_impl(thread const L &tile, device const float *x, device float 
                       constant MatParams &p, uint2 tg, uint tid, uint sg, threadgroup float *xs, threadgroup float *ws,
                       threadgroup float *os) {
     uint row0 = tg.x * GM_ROWS, tok0 = tg.y * GM_TOK;
-    simdgroup_float8x8 c00(0), c01(0), c10(0), c11(0);
+    // Each simdgroup owns 16 output rows; one 8x8 accumulator per
+    // (8-token block, 8-row block). Every dequantized weight tile is used
+    // for all GM_TOK tokens before the next is loaded.
+    simdgroup_float8x8 acc[TOK_BLOCKS * 2];
+    for (uint i = 0; i < TOK_BLOCKS * 2; i++) acc[i] = simdgroup_float8x8(0);
 
     for (uint k0 = 0; k0 < p.cols; k0 += GM_K) {
-        // inputs: 16 tokens x 32 columns, a float4 per thread
-        {
-            uint t = tid / 8, c = (tid % 8) * 4;
+        // inputs: GM_TOK tokens x 32 columns
+        for (uint e = tid; e < GM_TOK * GM_K / 4; e += 128) {
+            uint t = e / (GM_K / 4), c = (e % (GM_K / 4)) * 4;
             float4 v = tok0 + t < p.t ? *(device const float4 *)(x + (ulong)(tok0 + t) * p.cols + k0 + c) : float4(0);
             xs[t * GM_K + c + 0] = v.x;
             xs[t * GM_K + c + 1] = v.y;
@@ -240,23 +245,23 @@ inline void gemm_impl(thread const L &tile, device const float *x, device float 
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint kk = 0; kk < GM_K; kk += 8) {
-            simdgroup_float8x8 a0, a1, b0, b1;
-            simdgroup_load(a0, xs + kk, GM_K);
-            simdgroup_load(a1, xs + 8 * GM_K + kk, GM_K);
+            simdgroup_float8x8 b0, b1;
             simdgroup_load(b0, ws + (sg * 16) * GM_K + kk, GM_K, ulong2(0, 0), true);
             simdgroup_load(b1, ws + (sg * 16 + 8) * GM_K + kk, GM_K, ulong2(0, 0), true);
-            simdgroup_multiply_accumulate(c00, a0, b0, c00);
-            simdgroup_multiply_accumulate(c01, a0, b1, c01);
-            simdgroup_multiply_accumulate(c10, a1, b0, c10);
-            simdgroup_multiply_accumulate(c11, a1, b1, c11);
+            for (uint tb = 0; tb < TOK_BLOCKS; tb++) {
+                simdgroup_float8x8 a;
+                simdgroup_load(a, xs + tb * 8 * GM_K + kk, GM_K);
+                simdgroup_multiply_accumulate(acc[tb * 2], a, b0, acc[tb * 2]);
+                simdgroup_multiply_accumulate(acc[tb * 2 + 1], a, b1, acc[tb * 2 + 1]);
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    simdgroup_store(c00, os + sg * 16, GM_ROWS);
-    simdgroup_store(c01, os + sg * 16 + 8, GM_ROWS);
-    simdgroup_store(c10, os + 8 * GM_ROWS + sg * 16, GM_ROWS);
-    simdgroup_store(c11, os + 8 * GM_ROWS + sg * 16 + 8, GM_ROWS);
+    for (uint tb = 0; tb < TOK_BLOCKS; tb++) {
+        simdgroup_store(acc[tb * 2], os + tb * 8 * GM_ROWS + sg * 16, GM_ROWS);
+        simdgroup_store(acc[tb * 2 + 1], os + tb * 8 * GM_ROWS + sg * 16 + 8, GM_ROWS);
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint i = tid; i < GM_TOK * GM_ROWS; i += 128) {
         uint t = i / GM_ROWS, r = i % GM_ROWS;

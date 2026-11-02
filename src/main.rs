@@ -68,7 +68,8 @@ options:
   --max-seqs N       most requests `serve` runs at once (default 16)
   --json             constrain the reply to a JSON object
   --schema FILE      constrain the reply to JSON matching this JSON Schema
-  --kv-f16           store the GPU KV cache as f16 (half the memory)
+  --kv-f32           keep the GPU KV cache in f32 (the default, f16, uses half
+                     the memory and measured lossless)
   --no-think         Qwen3: answer directly, without a <think> block
   --imatrix FILE     fit 4-bit weights to this importance matrix (from `calibrate`)
   --out FILE         where `calibrate` writes (default <model>/imatrix.bin)
@@ -149,7 +150,7 @@ fn parse_args() -> Result<Args> {
         requests: 32,
         lookup: false,
         temp_set: false,
-        kv_f16: false,
+        kv_f16: true,
         context: None,
         no_think: false,
         imatrix: None,
@@ -182,6 +183,7 @@ fn parse_args() -> Result<Args> {
             }
             "--lookup" => a.lookup = true,
             "--kv-f16" => a.kv_f16 = true,
+            "--kv-f32" => a.kv_f16 = false,
             "--context" => a.context = Some(num(&flag, value()?)?),
             "--no-think" => a.no_think = true,
             "--imatrix" => a.imatrix = Some(value()?.into()),
@@ -742,7 +744,7 @@ fn serve(a: &Args) -> Result<()> {
         m.backend,
         tok.clone(),
         SchedulerOptions {
-            max_seqs: a.max_seqs,
+            max_seqs: a.max_seqs.min(128),
             max_seq_len: a.ctx,
         },
     );
