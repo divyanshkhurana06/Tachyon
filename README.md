@@ -4,7 +4,7 @@
 
 **An LLM inference engine and serving stack written from scratch in Rust, with hand-written ARM NEON and Metal GPU kernels, and zero dependencies.**
 
-Tachyon runs real Hugging Face checkpoints (Qwen2.5, Qwen3) on a MacBook's CPU or GPU, and serves many users at once the way vLLM does: a paged KV cache with prefix sharing, continuous batching, and an OpenAI-compatible API. It quantizes to 8 and 4 bits, decodes speculatively (with a draft model or with no model at all), and can force output to be valid JSON. Everything between the weights file and the HTTP response is in this repository, including the JSON parser, safetensors reader, BPE tokenizer, thread pool, SIMD kernels, GPU shaders, scheduler and web server. `Cargo.toml` has no dependencies.
+Tachyon runs real Hugging Face checkpoints (Qwen2.5, Qwen3) on a MacBook's CPU or GPU, and serves many users at once the way vLLM does: a paged KV cache with prefix sharing, continuous batching, and an OpenAI-compatible API. It quantizes to 8 and 4 bits (with activation-aware calibration), decodes speculatively (with a draft model or with no model at all), and supports the API features agents rely on: structured output that matches a JSON Schema, tool calling and logprobs. Everything between the weights file and the HTTP response is in this repository, including the JSON parser, safetensors reader, BPE tokenizer, thread pool, SIMD kernels, GPU shaders, scheduler and web server. `Cargo.toml` has no dependencies.
 
 ![Chat page served by Tachyon](docs/chat-ui.jpg)
 
@@ -48,6 +48,8 @@ Qwen2.5-0.5B-Instruct, one sequence at a time:
 | GPU | 8-bit | 556 MB | 1,759 tok/s | 105.9 tok/s | 17.99 |
 | GPU | `q4m` (mixed 4/8-bit) | 441 MB | 1,691 tok/s | 113.7 tok/s | 19.32 |
 | GPU | `q4` (mostly 4-bit) | 389 MB | 1,683 tok/s | 112.7 tok/s | 19.97 |
+| GPU | `q4` + importance matrix | 389 MB | | | **19.48** |
+| GPU | `q4m` + importance matrix | 441 MB | | | **19.11** |
 | CPU | bf16 | 988 MB | 179 tok/s | 68.2 tok/s | 17.94 |
 | CPU | 8-bit | 556 MB | 244 tok/s | 94.4 tok/s | 18.08 |
 | CPU | `q4m` | 441 MB | 226 tok/s | 87.4 tok/s | 19.50 |
@@ -58,6 +60,8 @@ From `tachyon bench`: best of 3 runs, prefill 256 tokens, decode 128, perplexity
 - **Decode** is one token at a time, which is how chat replies are generated. Smaller weights mean fewer bytes per token, so faster decoding.
 - **Prefill** is processing the prompt. The GPU does it on its matrix units (`simdgroup_matrix`), 3x faster than its matrix-vector path.
 - **Perplexity** measures how surprised the model is by a held-out text (lower is better), and shows what each format costs. CPU and GPU agree in bf16 because they compute the same function. `q4` and `q4m` are mixed precision: the matrices that measurably matter most stay at 8 bits (see below).
+
+The **importance matrix** (`tachyon calibrate`, then `--imatrix`) runs calibration text through the model, records how large each linear layer's inputs are per channel, and fits each 4-bit block's scale to minimize error weighted by those activations (llama.cpp's imatrix, in the spirit of AWQ). It cuts 4-bit's quality loss against bf16 from 11% to 8.5%, at no cost in size or speed. The calibration text ([`bench/calib.txt`](bench/calib.txt)) is separate from the evaluation text.
 
 Qwen3-0.6B on the GPU: 55 tok/s in bf16, 86 tok/s in 8-bit.
 
@@ -76,9 +80,15 @@ A drafter guesses several tokens; the big model checks them all in one batched p
 
 Prompt lookup drafts by finding the last few tokens earlier in the context and proposing what followed them, which is ideal when the reply copies from the prompt (edits, summaries, answering over a document). On the CPU, speculation doesn't pay: checking 5 tokens costs 5x the arithmetic, and the CPU runs out of compute before bandwidth.
 
-### JSON mode always produces valid JSON
+### Structured output, tool calling and logprobs
 
-With `response_format: {"type": "json_object"}`, a pushdown automaton for JSON runs over the bytes of each candidate token, and the sampler only picks tokens that keep the output a valid prefix. At temperature 1.0, 5 of 5 requests returned parseable JSON, and a test forces JSON on prompts that never ask for it. A property test checks the automaton against the JSON parser on 20,000 random inputs.
+**JSON Schema.** With `response_format: {"type": "json_schema", ...}`, the schema is compiled to a pushdown matcher that runs over the bytes of each candidate token, and the sampler only picks tokens that keep the output a valid prefix of a matching document. Objects get exactly the declared keys in order, integers are integers, enums are enum values, arrays respect `minItems`/`maxItems`; `anyOf`, nullable types and `$ref` work. Asked at temperature 1.0 to invent a movie as `{title, year, genres (1-3 from a list), rating, sequel (string or null)}`, 3 of 3 replies matched exactly. `json_object` mode (any valid object) works the same way.
+
+**Tool calling.** OpenAI's `tools` / `tool_choice` / `tool_calls` / `role: "tool"` round trip, rendered with Qwen's own chat template. With `tool_choice: "auto"` the model decides and the server parses its `<tool_call>` blocks (streamed as `tool_calls` deltas). With `"required"` or a named function, the reply is pre-filled with `<tool_call>` and its arguments are constrained to that function's parameter schema, so they always fit it.
+
+**Logprobs.** `logprobs` and `top_logprobs` (up to 20) report each generated token's log-probability under the model and the most likely alternatives, streamed or not.
+
+Property tests check the matchers against the JSON parser on tens of thousands of random inputs, and end-to-end tests check the real model's constrained output.
 
 ## Architecture
 
@@ -114,19 +124,21 @@ With `response_format: {"type": "json_object"}`, a pushdown automaton for JSON r
 - **Paged KV cache.** Sequences grow 16 positions at a time instead of reserving their maximum length, so the cache holds as many conversations as actually fit. Full blocks are registered under a hash of the entire token prefix up to them; a new request whose prompt starts the same way takes those blocks instead of recomputing them.
 - **The matrix units changed the batching story.** The first batched GPU kernel reused each weight for 8 tokens and read 8 bytes of activations per byte of weights; 4 tokens cost twice as much as 1. A tiled GEMM on `simdgroup_matrix` (16 tokens × 64 rows per threadgroup, tiles staged in threadgroup memory) made batch 32 run at 1,300 tok/s instead of 410, and prefill 3x faster.
 - **Then the scheduler was the bottleneck.** With a fast engine, 25% of each step went to sampling: copying 600 KB of logits per sequence and partially sorting 150k entries. A single-pass top-k (insert only what beats the current k-th best) and parallel sampling brought that to 5%, taking 32 users from 695 to 1,014 tok/s.
-- **Quantization by measurement.** Keeping each matrix type at 8 bits in turn showed q/k/v buys 0.6 perplexity for 3% more memory and the down projection 0.5 for 14%; `q4` and `q4m` are built from that. Fitting 4-bit scales by least squares lowered weight error but made perplexity worse, a reminder to measure the thing you care about.
+- **Quantization by measurement.** Keeping each matrix type at 8 bits in turn showed q/k/v buys 0.6 perplexity for 3% more memory and the down projection 0.5 for 14%; `q4` and `q4m` are built from that. Fitting 4-bit scales by least squares lowered weight error but made perplexity *worse*: what matters is error times the input it meets. Weighting the fit by measured activations (the importance matrix) is what finally helped.
+- **Constrained decoding is a matcher plus a sampler filter.** JSON mode, JSON Schema and forced tool calls are all the same mechanism: a byte-level automaton that says whether a token's bytes can come next, and a sampler that ranks the likely tokens first and asks about those, so the check costs a few hundred probes per token, not 150,000.
 - **The thread pool.** With one spinning worker per core, any background process preempts one and every matmul waits for it. Leaving two efficiency cores free doubled CPU decode speed.
 
 ### How it's verified
 
-`cargo test --release` runs 38 tests, in CI on Apple Silicon. GitHub's virtual Macs expose a GPU that returns zeros, so the engine self-tests the GPU at startup and refuses a broken one; there the GPU comparisons skip, and they run on real hardware. Beyond unit tests of every kernel against a scalar reference, the tests check against the real model that:
+`cargo test --release` runs 51 tests, in CI on Apple Silicon. GitHub's virtual Macs expose a GPU that returns zeros, so the engine self-tests the GPU at startup and refuses a broken one; there the GPU comparisons skip, and they run on real hardware. Beyond unit tests of every kernel against a scalar reference, the tests check against the real model that:
 
 - several sequences batched together produce exactly the tokens each produces alone, on CPU and GPU;
 - the GPU produces exactly the same greedy tokens as the CPU, for Qwen2.5 and Qwen3;
 - speculative decoding (model or prompt-lookup drafter) is identical to plain greedy decoding, and speculative sampling reproduces the target distribution (200,000 trials);
 - reusing the KV cache gives the same output as recomputing it;
-- JSON mode always parses; the tokenizer round-trips code, Unicode and emoji and won't let user text forge control tokens;
-- the JSON parser, safetensors reader and pre-tokenizer survive thousands of random and corrupted inputs.
+- JSON mode always parses, schema-constrained output has the requested shape, and forced tool calls fit the function's schema;
+- the tokenizer round-trips code, Unicode and emoji and won't let user text forge control tokens;
+- the JSON parser, safetensors reader and pre-tokenizer survive thousands of random and corrupted inputs, and the JSON and JSON Schema matchers never accept anything the parser rejects.
 
 ## Try it
 
@@ -152,6 +164,9 @@ cargo build --release
 ./target/release/tachyon bench                            # speed and perplexity per format
 ./target/release/tachyon bench-batch                      # throughput vs batch size
 ./target/release/tachyon speculate --gpu --lookup --prompt "Add type hints to this code: ..."
+./target/release/tachyon calibrate && ./target/release/tachyon run --quant q4 \
+    --imatrix models/qwen2.5-0.5b-instruct/imatrix.bin --prompt "..."  # better 4-bit
+./target/release/tachyon run --schema movie.schema.json --prompt "Invent a movie."
 ```
 
 Any OpenAI client works against `serve`:
@@ -166,6 +181,18 @@ reply = client.chat.completions.create(
     response_format={"type": "json_object"},
 )
 print(reply.choices[0].message.content)
+
+# Tool calling
+tools = [{"type": "function", "function": {
+    "name": "get_weather",
+    "parameters": {"type": "object", "properties": {
+        "city": {"type": "string"}, "unit": {"enum": ["celsius", "fahrenheit"]}}}}}]
+reply = client.chat.completions.create(
+    model="qwen2.5-0.5b-instruct",
+    messages=[{"role": "user", "content": "What's the weather in Tokyo?"}],
+    tools=tools,
+)
+print(reply.choices[0].message.tool_calls)  # get_weather(city="Tokyo", unit=...)
 ```
 
 Run `tachyon help` for every option.
@@ -173,13 +200,13 @@ Run `tachyon help` for every option.
 ## Limitations
 
 - Apple Silicon for the GPU path; the CPU path is portable but only has NEON kernels (other CPUs fall back to scalar code).
-- JSON mode guarantees valid JSON, not a particular schema.
+- JSON Schema support covers what structured output needs (objects with all properties required and in order, arrays, enums, unions told apart by their first character, `$ref`), not string `pattern`s or numeric ranges.
 - No Llama 3.1+ yet (`rope_scaling` isn't implemented) and no mixture-of-experts models.
 - The tokenizer skips NFC normalization and treats Unicode letters slightly more broadly than `\p{L}`; this matters only for some scripts with combining marks.
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md): GPU kernel fusion and flash-decoding attention, importance-weighted 4-bit quantization, JSON Schema output, MoE models, CUDA and WebGPU backends.
+See [ROADMAP.md](ROADMAP.md): GPU kernel fusion and flash-decoding attention, k-quants, MoE models, CUDA and WebGPU backends.
 
 ## License
 

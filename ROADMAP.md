@@ -31,6 +31,13 @@ finished; every one should end with a number in the README.
 - [x] **Qwen3** support (per-head q/k norm), checked on both backends
 - [x] Property tests on hostile input; CI on Apple Silicon
 
+### v0.3: agents and quality
+
+- [x] **Importance matrix** (`calibrate`, `--imatrix`): activation-weighted 4-bit scale fitting; 4-bit quality loss vs bf16 down from 11% to 8.5%
+- [x] **JSON Schema structured output**: a schema-compiled pushdown matcher (objects, arrays, enums, unions, `$ref`)
+- [x] **Tool calling**: OpenAI `tools` / `tool_choice` / `tool_calls`, with schema-constrained forced calls
+- [x] **Logprobs** and `top_logprobs`, streamed or not
+
 ## Next
 
 ### GPU: fewer, fatter kernels
@@ -48,23 +55,18 @@ Single-sequence decode moves ~65 GB/s of the M3's ~100.
 
 ### Better 4-bit
 
-Tried and measured: fitting each block's scale by least squares (plain or
-weighted by the weight's square) lowers weight error but made perplexity
-*worse* on Qwen2.5-0.5B (20.6 to 20.8 and 21.1). Weight error isn't the
-right target without activation statistics.
+Least-squares scale fitting without activation statistics made perplexity
+worse; with the importance matrix, `q4` is 8.5% behind bf16 (it was 11%).
 
-- **Importance-weighted quantization:** run calibration text, record each
-  input channel's mean squared activation, and weight the scale fit by it
-  (llama.cpp's imatrix, AWQ).
-- **k-quants:** 256-weight super-blocks with 6-bit sub-block scales.
+- **k-quants:** 256-weight super-blocks with 6-bit sub-block scales and minimums.
+- A bigger, more varied calibration set, and per-layer format choices driven by it.
 
-*Done when:* `q4` perplexity is within 5% of bf16 (now 12%).
+*Done when:* `q4` perplexity is within 5% of bf16.
 
 ### Serving
 
 - Swap-to-CPU preemption instead of recompute, and request priorities.
-- `logprobs` / `top_logprobs` in the API.
-- **JSON Schema** constrained output (not just "some JSON object"), and tool calling.
+- JSON Schema `pattern`, numeric ranges, and optional properties.
 - Multiple LoRA adapters served from one base model.
 
 ### Models
