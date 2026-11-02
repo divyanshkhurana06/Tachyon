@@ -31,6 +31,7 @@ commands:
   serve      OpenAI-compatible API and chat page, batching all users together
   loadtest   many concurrent clients against a running `serve`
   speculate  plain vs speculative decoding of --prompt, side by side
+             (greedy and checked identical, or sampled with --temp)
   bench      speed and quality of each weight format
   bench-batch  decode throughput at batch sizes 1 to 64 (the engine alone)
   ppl        perplexity of the model on --file
@@ -56,6 +57,7 @@ options:
   --draft F          speculative decoding with a draft model in format F
   --draft-model DIR  draft model folder (default: the same model)
   --draft-k K        tokens drafted per step (default 4)
+  --lookup           `speculate` with prompt-lookup drafting instead of a model
   --port P           port for `serve` (default 8080)
   --host H           address for `serve` (default 127.0.0.1)
   --kv-tokens N      KV cache size for `serve`, shared by all users (default 16384)
@@ -91,6 +93,8 @@ struct Args {
     url: String,
     clients: Vec<usize>,
     requests: usize,
+    lookup: bool,
+    temp_set: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -126,6 +130,8 @@ fn parse_args() -> Result<Args> {
         url: "http://127.0.0.1:8080".into(),
         clients: vec![1, 4, 16],
         requests: 32,
+        lookup: false,
+        temp_set: false,
     };
     while let Some(flag) = it.next() {
         let mut value = || {
@@ -146,7 +152,11 @@ fn parse_args() -> Result<Args> {
             "--system" => a.system = Some(value()?),
             "--raw" => a.raw = true,
             "--max-tokens" | "-n" => a.max_tokens = num(&flag, value()?)?,
-            "--temp" => a.sampler.temperature = num(&flag, value()?)?,
+            "--temp" => {
+                a.sampler.temperature = num(&flag, value()?)?;
+                a.temp_set = true;
+            }
+            "--lookup" => a.lookup = true,
             "--top-k" => a.sampler.top_k = num(&flag, value()?)?,
             "--top-p" => a.sampler.top_p = num(&flag, value()?)?,
             "--repeat-penalty" => a.sampler.repetition_penalty = num(&flag, value()?)?,
@@ -579,24 +589,36 @@ fn chat_prompt(a: &Args, tok: &Tokenizer, prompt: &str) -> Result<Vec<u32>> {
 /// Runs the same greedy generation plainly and speculatively, checks the
 /// outputs match, and reports the speedup.
 fn speculate(a: &Args) -> Result<()> {
+    use tachyon::speculative::{generate_speculative, Drafter, LookupDrafter, ModelDrafter};
     let prompt = a
         .prompt
         .as_deref()
         .ok_or_else(|| Error::msg("speculate needs --prompt"))?;
     let pool = Arc::new(Pool::new(a.threads));
     let mut target = load(a, a.format, a.gpu, &pool)?;
-    let draft_dir = a.draft_model.clone().unwrap_or_else(|| a.model.clone());
-    let mut draft = load_from(a, &draft_dir, a.draft.unwrap_or(Format::Q4), a.gpu, &pool)?;
     let tokens = chat_prompt(a, &target.tok, prompt)?;
     let stop = stop_tokens(&target.cfg, &target.tok);
+    // Greedy unless a temperature was asked for: then the outputs can be
+    // compared token for token.
+    let sampling = if a.temp_set {
+        a.sampler.clone()
+    } else {
+        SamplerConfig::greedy()
+    };
+    let greedy = sampling.temperature <= 0.0;
     let opts = GenOptions {
         max_tokens: a.max_tokens,
-        sampler: SamplerConfig::greedy(),
+        sampler: sampling.clone(),
         stop_tokens: stop.clone(),
         json: false,
     };
 
-    eprintln!("\n--- plain greedy decoding on {}", target.engine.name());
+    let mode = if greedy {
+        "greedy".into()
+    } else {
+        format!("sampled at temperature {}", sampling.temperature)
+    };
+    eprintln!("\n--- plain decoding, {mode}, on {}", target.engine.name());
     let plain = generate(
         target.engine.as_mut(),
         &target.tok,
@@ -608,32 +630,55 @@ fn speculate(a: &Args) -> Result<()> {
     println!();
     print_stats(&plain);
 
+    let mut draft_model;
+    let mut lookup = LookupDrafter::default();
+    let mut model_drafter;
+    let drafter: &mut dyn Drafter = if a.lookup {
+        &mut lookup
+    } else {
+        let draft_dir = a.draft_model.clone().unwrap_or_else(|| a.model.clone());
+        draft_model = load_from(a, &draft_dir, a.draft.unwrap_or(Format::Q4), a.gpu, &pool)?;
+        model_drafter = ModelDrafter::new(
+            draft_model.engine.as_mut(),
+            sampling.clone(),
+            target.tok.len(),
+        );
+        &mut model_drafter
+    };
     eprintln!(
-        "\n--- speculative: {} drafts {} tokens per step",
-        draft.engine.name(),
+        "\n--- speculative: {} drafts up to {} tokens per step",
+        drafter.name(),
         a.draft_k
     );
-    let spec = tachyon::speculative::generate_speculative(
+    let spec = generate_speculative(
         target.engine.as_mut(),
-        draft.engine.as_mut(),
+        drafter,
         &target.tok,
         &tokens,
         a.draft_k,
         a.max_tokens,
         &stop,
-        &mut |_| true,
+        &sampling,
+        &mut |p| if greedy { true } else { print_piece(p) },
     )?;
+    if !greedy {
+        println!();
+    }
     let same = spec.tokens == plain.tokens;
     eprintln!(
-        "{} tokens at {:.1} tok/s ({:.2}x) · {:.0}% of drafts accepted · {:.2} tokens per target pass · output {}",
+        "{} tokens at {:.1} tok/s ({:.2}x) · {:.0}% of drafts accepted · {:.2} tokens per target pass{}",
         spec.tokens.len(),
         spec.decode_tps(),
         spec.decode_tps() / plain.decode_tps(),
         spec.acceptance() * 100.0,
         spec.tokens_per_pass(),
-        if same { "identical to plain decoding" } else { "DIFFERS from plain decoding" }
+        match (greedy, same) {
+            (true, true) => " · output identical to plain decoding",
+            (true, false) => " · output DIFFERS from plain decoding",
+            (false, _) => " · sampled, so outputs differ by design",
+        }
     );
-    if !same {
+    if greedy && !same {
         bail!("speculative output differs from plain greedy output");
     }
     Ok(())

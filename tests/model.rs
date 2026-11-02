@@ -50,7 +50,12 @@ fn prompt(tok: &Tokenizer, question: &str) -> Vec<u32> {
     )
 }
 
-fn greedy(e: &mut dyn Engine, tok: &Tokenizer, prompt: &[u32], n: usize) -> (String, Vec<u32>) {
+fn greedy_tokens(
+    e: &mut dyn Engine,
+    tok: &Tokenizer,
+    prompt: &[u32],
+    n: usize,
+) -> (String, Vec<u32>) {
     let cfg = e.config().clone();
     let opts = GenOptions {
         max_tokens: n,
@@ -95,7 +100,7 @@ fn answers_a_factual_question() {
     let Some((_g, dir)) = setup() else { return };
     let tok = Tokenizer::load(&dir.join("tokenizer.json")).unwrap();
     let mut e = cpu(&dir, Format::Q8);
-    let (text, _) = greedy(
+    let (text, _) = greedy_tokens(
         e.as_mut(),
         &tok,
         &prompt(&tok, "What is the capital of France?"),
@@ -147,26 +152,53 @@ fn reusing_the_kv_cache_changes_nothing() {
 
 #[test]
 fn speculative_decoding_matches_greedy() {
+    use tachyon::speculative::{LookupDrafter, ModelDrafter};
     let Some((_g, dir)) = setup() else { return };
     let tok = Tokenizer::load(&dir.join("tokenizer.json")).unwrap();
     let mut target = cpu(&dir, Format::Bf16);
     let mut draft = cpu(&dir, Format::Q4);
-    let p = prompt(&tok, "Explain what a hash map is in two sentences.");
-    let (_, plain) = greedy(target.as_mut(), &tok, &p, 60);
+    let greedy = SamplerConfig::greedy();
     let eos = target.config().eos_ids.clone();
+
+    let p = prompt(&tok, "Explain what a hash map is in two sentences.");
+    let (_, plain) = greedy_tokens(target.as_mut(), &tok, &p, 60);
+    let mut drafter = ModelDrafter::new(draft.as_mut(), greedy.clone(), tok.len());
     let spec = generate_speculative(
         target.as_mut(),
-        draft.as_mut(),
+        &mut drafter,
         &tok,
         &p,
         4,
         60,
         &eos,
+        &greedy,
         &mut |_| true,
     )
     .unwrap();
     assert_eq!(spec.tokens, plain);
     assert!(spec.acceptance() > 0.5, "acceptance {}", spec.acceptance());
+
+    // Prompt lookup: a prompt the reply will copy from.
+    let p = prompt(&tok, "Repeat this sentence exactly: The quick brown fox jumps over the lazy dog near the river bank.");
+    let (_, plain) = greedy_tokens(target.as_mut(), &tok, &p, 40);
+    let spec = generate_speculative(
+        target.as_mut(),
+        &mut LookupDrafter::default(),
+        &tok,
+        &p,
+        6,
+        40,
+        &eos,
+        &greedy,
+        &mut |_| true,
+    )
+    .unwrap();
+    assert_eq!(spec.tokens, plain);
+    assert!(
+        spec.tokens_per_pass() > 1.5,
+        "lookup accepted too little: {}",
+        spec.tokens_per_pass()
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -181,8 +213,8 @@ fn gpu_matches_cpu() {
         Err(e) => return eprintln!("skipping: {e}"),
     };
     let p = prompt(&tok, "Give me one tip for writing clean code.");
-    let (_, on_gpu) = greedy(gpu.as_mut(), &tok, &p, 40);
-    let (_, on_cpu) = greedy(cpu(&dir, Format::Bf16).as_mut(), &tok, &p, 40);
+    let (_, on_gpu) = greedy_tokens(gpu.as_mut(), &tok, &p, 40);
+    let (_, on_cpu) = greedy_tokens(cpu(&dir, Format::Bf16).as_mut(), &tok, &p, 40);
     assert_eq!(on_gpu, on_cpu);
 }
 

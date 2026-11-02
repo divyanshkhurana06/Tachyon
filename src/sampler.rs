@@ -243,6 +243,11 @@ impl Sampler {
         self.probs.len()
     }
 
+    /// A uniform random number in [0, 1).
+    pub fn uniform(&mut self) -> f32 {
+        self.next_f32()
+    }
+
     /// xorshift64*: fast, and plenty random for picking tokens.
     fn next_f32(&mut self) -> f32 {
         self.rng ^= self.rng >> 12;
