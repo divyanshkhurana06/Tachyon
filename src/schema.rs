@@ -104,43 +104,68 @@ impl Bounds {
     }
 
     /// Whether a number written so far as `text` (in state `state`) can
-    /// still end inside the range: the magnitudes its completions can take
-    /// are intervals, checked against the range (taking ends as closed).
+    /// still end inside the range, so the matcher never lets a number start
+    /// down a path with no valid end (`4.9` toward an exclusive 5 is fine,
+    /// `5.0` is not). In magnitude, a number's completions reach a value `a`
+    /// and the values just above it up to `z`.
     fn reachable(&self, text: &[u8], state: Num, integer: bool) -> bool {
         let neg = text.first() == Some(&b'-');
-        let (lo, hi) = if neg {
-            ((-self.hi).max(0.0), -self.lo)
+        // The range in magnitudes, for this sign.
+        let m = if neg {
+            Bounds {
+                lo: (-self.hi).max(0.0),
+                lo_open: self.hi_open && self.hi <= 0.0,
+                hi: -self.lo,
+                hi_open: self.lo_open,
+            }
         } else {
-            (self.lo.max(0.0), self.hi)
+            Bounds {
+                lo: self.lo.max(0.0),
+                lo_open: self.lo_open && self.lo >= 0.0,
+                ..*self
+            }
         };
-        if lo > hi {
+        if m.lo > m.hi || (m.lo == m.hi && (m.lo_open || m.hi_open)) {
             return false;
         }
+        // `a` itself, or something in the open interval (a, z).
+        let dense = |a: f64, z: f64| {
+            let (l, h) = (a.max(m.lo), z.min(m.hi));
+            m.contains(a) || l < h || (l == h && l > a && l < z && m.contains(l))
+        };
+        // An integer in [a, z).
+        let whole = |a: f64, z: f64| {
+            let least = if m.lo_open {
+                m.lo.floor() + 1.0
+            } else {
+                m.lo.ceil()
+            };
+            let n = a.max(least);
+            n < z && m.contains(n)
+        };
         let digits = std::str::from_utf8(&text[neg as usize..]).unwrap_or("");
         let (int, frac) = digits.split_once('.').unwrap_or((digits, ""));
         let d: f64 = int.parse().unwrap_or(0.0);
-        // Completions span [a, z): open at z unless integer.
-        let meets = |a: f64, z: f64| a <= hi && (z > lo || a >= lo);
         match state {
             Num::Minus => true,
-            Num::Zero if integer => lo <= 0.0,
-            Num::Zero => meets(0.0, 1.0),
+            Num::Zero if integer => m.contains(0.0),
+            Num::Zero => dense(0.0, 1.0),
             Num::Int => {
-                // More integer digits: [d * 10^j, (d + 1) * 10^j) for each j.
+                // More integer digits reach [d * 10^j, (d + 1) * 10^j).
                 let mut p = 1.0;
-                while d * p <= hi && p < 1e40 {
-                    let z = (d + 1.0) * p;
-                    if if integer { z - 1.0 >= lo } else { z > lo } {
+                while d * p <= m.hi && p < 1e40 {
+                    let (a, z) = (d * p, (d + 1.0) * p);
+                    if if integer { whole(a, z) } else { dense(a, z) } {
                         return true;
                     }
                     p *= 10.0;
                 }
                 false
             }
-            Num::Dot => meets(d, d + 1.0),
+            Num::Dot => dense(d, d + 1.0),
             Num::Frac => {
                 let v: f64 = format!("{int}.{frac}").parse().unwrap_or(0.0);
-                meets(v, v + 10f64.powi(-(frac.len() as i32)))
+                dense(v, v + 10f64.powi(-(frac.len() as i32)))
             }
             _ => true,
         }
@@ -610,6 +635,13 @@ impl JsonSchema {
                         };
                         ck.code = ck.code * 16 + d;
                         *hex -= 1;
+                        // Surrogates (UTF-16 halves, D800 to DFFF) are
+                        // refused as soon as every completion would be one.
+                        let span = 1u32 << (4 * *hex as u32);
+                        let first = ck.code * span;
+                        if first >= 0xD800 && first + span - 1 <= 0xDFFF {
+                            return false;
+                        }
                         return *hex > 0 || feed(ck, char::from_u32(ck.code));
                     }
                     if *escape {
@@ -1020,10 +1052,12 @@ mod tests {
         // Escapes and multi-byte characters count as one character each.
         let m = matcher(r#"{"type":"string","maxLength":3,"pattern":"[^x]*"}"#);
         assert_eq!(check(&m, r#""a\né""#), (true, true));
-        assert_eq!(check(&m, r#""é\"b""#), (true, true));
+        assert_eq!(check(&m, r#""\u00e9\"b""#), (true, true));
         assert!(!check(&m, r#""abcd"#).0);
-        assert!(!check(&m, r#""x"#).0); // an escaped x is still x
-                                        // An ASCII-only pattern refuses a multi-byte character at its first byte.
+        assert!(!check(&m, r#""\u0078"#).0); // an escaped x is still x
+        assert!(!m.accepts_bytes(br#""\ud8"#)); // only surrogates could follow
+        assert!(m.accepts_bytes(br#""\ud7"#));
+        // An ASCII-only pattern refuses a multi-byte character at its first byte.
         let m = matcher(r#"{"type":"string","pattern":"[a-z]+"}"#);
         assert!(!m.accepts_bytes("\"\u{e9}".as_bytes()[..2].as_ref()));
     }
@@ -1056,6 +1090,29 @@ mod tests {
         ] {
             assert!(!check(&m, bad).0, "{bad}");
         }
+        // Nothing that can only end at an exclusive bound gets started.
+        let m = matcher(
+            r#"{"type":"object","properties":{"x":{"type":"number","exclusiveMinimum":0,"exclusiveMaximum":5}},"required":["x"]}"#,
+        );
+        for dead in [
+            r#"{"x":5"#,
+            r#"{"x":0,"#,
+            r#"{"x":0.0,"#,
+            r#"{"x":-"#,
+            r#"{"x":4.9e"#,
+        ] {
+            assert!(!m.accepts_bytes(dead.as_bytes()), "{dead}");
+        }
+        for live in [r#"{"x":4.99"#, r#"{"x":0.0"#, r#"{"x":0.000001}"#] {
+            assert!(m.accepts_bytes(live.as_bytes()), "{live}");
+        }
+        let m = matcher(
+            r#"{"type":"object","properties":{"n":{"type":"integer","exclusiveMaximum":10,"minimum":-3}},"required":["n"]}"#,
+        );
+        assert!(!m.accepts_bytes(br#"{"n":10"#) && !m.accepts_bytes(br#"{"n":-4"#));
+        assert!(
+            check(&m, r#"{"n":-3}"#).1 && check(&m, r#"{"n":9}"#).1 && check(&m, r#"{"n":-0}"#).1
+        );
         // Prefixes that can still reach the range are allowed.
         let m = matcher(
             r#"{"type":"object","properties":{"n":{"type":"integer","minimum":500,"maximum":600}},"required":["n"]}"#,
