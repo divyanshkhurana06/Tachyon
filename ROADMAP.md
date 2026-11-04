@@ -71,6 +71,14 @@ finished; every one should end with a number in the README.
 - [x] **Tokenizer checked against llama.cpp** (`tachyon tokenize`, `bench/compare_tokenizer.sh`): 118,401 tokens identical after fixing non-special added tokens
 - [x] **JSON Schema optional properties** (`required`), GPT-2 style pre-tokenization, Granite's chat format and scalings
 
+### v0.8: many adapters, memory pressure, stricter output, x86
+
+- [x] **Multi-LoRA serving**: PEFT adapters loaded beside the base model, chosen per request by `model`; batches mix adapters, with tokens grouped by adapter so each adapter is read once per step (SGMV-style kernels on the GPU, f16; bf16 on the CPU). Four rank-16 adapters on every projection keep 89-92% of base throughput on the GPU; checked against merged weights
+- [x] **Swap-out preemption and priorities**: a preempted sequence's cache goes to host memory and comes back through the prefix cache; requests carry vLLM's `priority`. Same throughput as recompute under the load test, lower median time to first token
+- [x] **JSON Schema patterns, formats, lengths and number ranges**: a regex engine (Thompson NFA over characters) inside the schema matcher; bounded numbers checked digit by digit for a reachable value
+- [x] **Granite tool calling** in its own format, and its template's default system message fixed
+- [x] **AVX2 kernels** for x86-64, picked at run time, and a Linux CI job that runs every test on them
+
 ## Next
 
 ### Long context
@@ -97,10 +105,9 @@ With per-block offsets `q4m` is 3.2% from bf16, but each 32 weights now carry 8 
 
 ### Serving
 
-- Swap-to-CPU preemption instead of recompute, and request priorities.
-- JSON Schema `pattern`, numeric ranges, string lengths.
-- Tool calling in Granite's format (`<|tool_call|>` and a JSON list).
-- Multiple LoRA adapters served from one base model.
+- Priority preemption: an urgent request preempts running ones instead of waiting for a free slot.
+- LoRA: load and unload adapters while serving, and adapters on mixture-of-experts MLPs.
+- Fewer LoRA dispatches at batch 1 (8 per layer now; launches are most of the remaining 10%).
 
 ### Models
 
@@ -111,7 +118,7 @@ With per-block offsets `q4m` is 3.2% from bf16, but each 32 weights now carry 8 
 
 - **CUDA backend** (the same kernels in CUDA C, through the driver API).
 - **WebGPU** for the browser build (it runs on the CPU today), and threads through shared memory where the page is cross-origin isolated.
-- **x86 SIMD:** AVX2 versions of the four dot-product kernels.
+- **x86:** AVX-512 VNNI kernels, and a pair-of-tokens path like I8MM's.
 
 ### Always on
 

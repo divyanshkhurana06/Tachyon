@@ -4,7 +4,7 @@
 
 **An LLM inference engine and serving stack written from scratch in Rust, with hand-written ARM NEON and Metal GPU kernels, and zero dependencies.**
 
-Tachyon runs real Hugging Face checkpoints (Llama 3.2, Qwen2.5, Qwen3, and IBM's Granite mixture of experts) on a MacBook's CPU or GPU, or in a browser tab compiled to WebAssembly, and serves many users at once the way vLLM does: a paged KV cache with prefix sharing, continuous batching, and an OpenAI-compatible API. It quantizes to 8 and 4 bits (with activation-aware calibration), decodes speculatively (with a draft model or with no model at all), and supports the API features agents rely on: structured output that matches a JSON Schema, tool calling and logprobs. Everything between the weights file and the HTTP response is in this repository, including the JSON parser, safetensors reader, BPE tokenizer, thread pool, SIMD kernels, GPU shaders, scheduler and web server. `Cargo.toml` has no dependencies.
+Tachyon runs real Hugging Face checkpoints (Llama 3.2, Qwen2.5, Qwen3, and IBM's Granite mixture of experts) on a MacBook's CPU or GPU, on x86 with AVX2, or in a browser tab compiled to WebAssembly, and serves many users at once the way vLLM does: a paged KV cache with prefix sharing, continuous batching with priorities and swap-out preemption, many LoRA fine-tunes served from one base model, and an OpenAI-compatible API. It quantizes to 8 and 4 bits (with activation-aware calibration), decodes speculatively (with a draft model or with no model at all), and supports the API features agents rely on: structured output that matches a JSON Schema (patterns and ranges included), tool calling in each model's own format, and logprobs. Everything between the weights file and the HTTP response is in this repository, including the JSON parser, safetensors reader, BPE tokenizer, thread pool, SIMD kernels, GPU shaders, scheduler and web server. `Cargo.toml` has no dependencies.
 
 ![Chat page served by Tachyon](docs/chat-ui.jpg)
 
@@ -37,6 +37,23 @@ Decoding one sequence reads every weight once per token, so it is limited by mem
 The CPU gets 3.3x by batch 16, with sequences sharing each weight load in its int8 matrix instructions, and is then limited by arithmetic, not memory, so extra sequences just take turns. From `tachyon bench-batch`, 8-bit weights.
 
 95% of the server's step time is the forward pass; sampling, streaming and scheduling are the other 5%.
+
+### Many fine-tunes from one model: multi-LoRA serving
+
+`tachyon serve --lora support=adapters/support --lora sql=adapters/sql` loads LoRA adapters (PEFT's format) beside the base model, and a request picks one by naming it as its `model`, as with vLLM. Requests for different adapters, and for none, share every forward pass: each token's update `B (A x)` is added beside the base matmul, with the batch's tokens grouped by adapter so each adapter's weights are read once per step (Punica's SGMV). Throughput with four rank-16 adapters on every projection (q, k, v, o, gate, up, down: 1.8% of the model's parameters each, the heavy end), every step mixing all four, against the base model alone:
+
+| batch | GPU, base | GPU, 4 adapters mixed | | CPU, base | CPU, 4 adapters mixed | |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 137 tok/s | 124 tok/s | 90% | 147 tok/s | 135 tok/s | 92% |
+| 4 | 219 tok/s | 202 tok/s | 92% | 439 tok/s | 337 tok/s | 77% |
+| 16 | 776 tok/s | 709 tok/s | 91% | 625 tok/s | 462 tok/s | 74% |
+| 64 | 1,690 tok/s | 1,502 tok/s | 89% | 540 tok/s | 440 tok/s | 81% |
+
+From `tachyon bench-batch --lora ...` (8-bit base). A test checks the adapters against the same updates merged into the weights, and the GPU's against the CPU's (to 0.0001 in logits).
+
+### Under memory pressure: swap-out preemption and priorities
+
+When the KV cache fills, the least urgent sequence (by `priority`, then arrival) is preempted. With swap space (`--swap-tokens`, on by default) its keys and values are copied out to host memory and back in when it resumes; blocks still in the prefix cache are taken from there rather than copied. With 32 users in a 2,048-token cache (about 150 preemptions per run), swapping matched recomputing in throughput (953 against 951–953 tok/s): the prefix cache already keeps most of a preempted sequence's work. It lowered the median time to first token to 0.09–0.10 s, from 0.10–0.18 s. Tests check that preempted requests, swapped or recomputed, produce exactly the text they produce alone, and that queued requests start in priority order.
 
 ### Single-sequence speed and quality
 
@@ -115,9 +132,9 @@ Prompt lookup drafts by finding the last few tokens earlier in the context and p
 
 ### Structured output, tool calling and logprobs
 
-**JSON Schema.** With `response_format: {"type": "json_schema", ...}`, the schema is compiled to a pushdown matcher that runs over the bytes of each candidate token, and the sampler only picks tokens that keep the output a valid prefix of a matching document. Objects get exactly the declared keys in order, integers are integers, enums are enum values, arrays respect `minItems`/`maxItems`; `anyOf`, nullable types and `$ref` work. Asked at temperature 1.0 to invent a movie as `{title, year, genres (1-3 from a list), rating, sequel (string or null)}`, 3 of 3 replies matched exactly. `json_object` mode (any valid object) works the same way.
+**JSON Schema.** With `response_format: {"type": "json_schema", ...}`, the schema is compiled to a pushdown matcher that runs over the bytes of each candidate token, and the sampler only picks tokens that keep the output a valid prefix of a matching document. Objects get exactly the declared keys in order, integers are integers, enums are enum values, arrays respect `minItems`/`maxItems`; `anyOf`, nullable types and `$ref` work. Strings keep to `minLength`/`maxLength` and to a `pattern`, run as a regular expression compiled to an NFA (with no dependency, like everything else) and stepped one decoded character at a time; the formats `date`, `time`, `date-time`, `uuid`, `email` and `ipv4` are built-in patterns. Numbers keep to `minimum`/`maximum` and their exclusive forms: after each digit the matcher checks that some completion still lands in range, so `{"age": 5` is allowed toward 18–65 and `{"age": 7` is not. Asked at temperature 1.0 to invent a movie as `{title, year, genres (1-3 from a list), rating, sequel (string or null)}`, 3 of 3 replies matched exactly. `json_object` mode (any valid object) works the same way.
 
-**Tool calling.** OpenAI's `tools` / `tool_choice` / `tool_calls` / `role: "tool"` round trip, in each model's own format: Qwen's `<tool_call>` blocks, or Llama 3's tool definitions in the first user turn and calls as bare `{"name": .., "parameters": ..}` replies. With `tool_choice: "auto"` the model decides and the server parses its calls (streamed as `tool_calls` deltas). With `"required"` or a named function, the call is opened for it (Qwen) and its arguments are constrained to that function's parameter schema, so they always fit it. (Llama 3.2 1B tends to call again after a result while tools are on offer; `tool_choice: "none"` gets its answer.)
+**Tool calling.** OpenAI's `tools` / `tool_choice` / `tool_calls` / `role: "tool"` round trip, in each model's own format: Qwen's `<tool_call>` blocks, Llama 3's tool definitions in the first user turn and calls as bare `{"name": .., "parameters": ..}` replies, or Granite's `tools` turn and `<|tool_call|>[...]` lists (its models also write the marker as plain `<tool_call>`, which is accepted as vLLM accepts it). With `tool_choice: "auto"` the model decides and the server parses its calls (streamed as `tool_calls` deltas). With `"required"` or a named function, the call is opened for it (Qwen, Granite) and its arguments are constrained to that function's parameter schema, so they always fit it. (Llama 3.2 1B tends to call again after a result while tools are on offer; `tool_choice: "none"` gets its answer.)
 
 **Logprobs.** `logprobs` and `top_logprobs` (up to 20) report each generated token's log-probability under the model and the most likely alternatives, streamed or not.
 
@@ -140,16 +157,18 @@ Property tests check the matchers against the JSON parser on tens of thousands o
 | | |
 |---|---|
 | [`kv.rs`](src/kv.rs) | Paged KV cache: block allocator, per-sequence block tables, prefix cache with LRU eviction |
-| [`scheduler.rs`](src/scheduler.rs) | Continuous batching, chunked prefill, preemption by recompute, parallel sampling |
+| [`scheduler.rs`](src/scheduler.rs) | Continuous batching, chunked prefill, priorities, preemption by swap-out or recompute, parallel sampling |
+| [`lora.rs`](src/lora.rs) | LoRA adapters from PEFT checkpoints, applied per token with the batch grouped by adapter |
 | [`server.rs`](src/server.rs) | HTTP/1.1 on `std::net`: `/v1/chat/completions` (streaming, `stop`, `response_format`, `ignore_eos`), `/v1/models`, `/info`, chat page |
 | [`model.rs`](src/model.rs) | CPU forward pass over a batch: RMSNorm, grouped-query attention through block tables, RoPE (with Llama 3's scaling), SiLU MLP or mixture of experts, Qwen3's q/k norm |
 | [`gpu/`](src/gpu) | Metal backend: [`kernels.metal`](src/gpu/kernels.metal) (matrix-vector kernels for decode, `simdgroup_matrix` GEMM for batches and per expert, FlashAttention-style prefill attention and paged decode attention, expert routing, RoPE, norms) and an [Objective-C bridge](src/gpu/shim.m) compiled by `build.rs` |
-| [`kernels.rs`](src/kernels.rs) | NEON kernels for bf16, int8×int8 and int4×int8: I8MM matrix instructions for batches, SDOT for single tokens; the quantizers |
+| [`kernels.rs`](src/kernels.rs) | NEON kernels for bf16, int8×int8 and int4×int8: I8MM matrix instructions for batches, SDOT for single tokens; the quantizers. AVX2 versions in [`kernels_x86.rs`](src/kernels_x86.rs), WebAssembly SIMD in [`kernels_wasm.rs`](src/kernels_wasm.rs) |
 | [`speculative.rs`](src/speculative.rs) | Speculative decoding and sampling, model and prompt-lookup drafters |
-| [`constrain.rs`](src/constrain.rs) | JSON pushdown automaton for constrained decoding |
+| [`constrain.rs`](src/constrain.rs), [`schema.rs`](src/schema.rs) | JSON and JSON Schema pushdown matchers for constrained decoding |
+| [`regex.rs`](src/regex.rs) | Regular expressions compiled to an NFA, for schema patterns and formats |
 | [`sampler.rs`](src/sampler.rs) | Temperature, top-k (single pass), top-p, repetition penalty, constraint masks |
 | [`tokenizer.rs`](src/tokenizer.rs) | Byte-level BPE from `tokenizer.json`, with GPT-4's and GPT-2's pre-tokenizer regexes reimplemented by hand |
-| [`chat.rs`](src/chat.rs) | ChatML, Llama 3 and Granite chat formats, and the first two's tool calls |
+| [`chat.rs`](src/chat.rs) | ChatML, Llama 3 and Granite chat formats, and each one's tool calls |
 | [`web.rs`](src/web.rs), [`web/`](web) | The browser build: an exported C-style API over WebAssembly memory, a worker and a chat page (no bindings library) |
 | [`safetensors.rs`](src/safetensors.rs), [`json.rs`](src/json.rs), [`pool.rs`](src/pool.rs) | mmap'd weights, JSON, a spin-then-park thread pool |
 
@@ -169,6 +188,9 @@ Property tests check the matchers against the JSON parser on tens of thousands o
 - **The offset costs nothing in the int8 kernels.** With `value = scale * (q - 8) + offset`, a block's dot product is the old integer sum plus `offset * (sum of the block's inputs)`. The input sums are computed once per token, the offset term is a short dot product per row, and every CPU path (SDOT, I8MM, the browser's SIMD) adds it the same way, so batch invariance holds.
 - **The tokenizer is checked against llama.cpp.** `tachyon tokenize` prints token ids the way `llama-tokenize --ids` does; [`bench/compare_tokenizer.sh`](bench/compare_tokenizer.sh) compares them on any files. Over this repository's source, docs and test texts (31 files, 118,401 tokens) they are identical. The check found one difference, now fixed: added tokens that aren't special, like Qwen's `<tool_call>`, are matched in plain text too, as Hugging Face and llama.cpp do.
 - **The browser build is the same code.** The library compiles to `wasm32` with no changes to the model: the checkpoint is read from bytes instead of mmap, layers load on one thread, the dot products have WebAssembly SIMD versions, and the clock (which wasm doesn't have) is never needed. A 1 GB download streams straight into the module's memory so it is never held twice.
+- **Adapters are read whole for every step that uses them, so their size is their cost.** The first LoRA kernels gave each token its own pass over its adapter: with four adapters mixed in a batch of 64, throughput fell 18%. Grouping the batch's tokens by adapter (tiles of up to 8 that share one, built on the CPU each step) and storing adapters as f16 on the GPU and bf16 on the CPU brought it to 11%; splitting each low-rank dot product across a 256-thread threadgroup fixed the rest of the latency at batch 1. The prefix cache's hash chains start from a different root per adapter, since the same tokens give different keys and values under different adapters.
+- **Swapped sequences come back through the prefix cache.** Swapping out first copied every block back on resume into fresh ones, which used more cache than recomputing (whose full blocks are usually still cached) and lowered the mean batch. Now a resumed sequence takes whatever of its prefix is still cached and copies in only the rest.
+- **A pattern is a set of states.** Constrained decoding asks "can this string still match?" after every character, and patterns have to work over JSON escapes and multi-byte UTF-8. A Thompson NFA answers that directly: the matcher keeps the set of live states, decodes each character (`\u00e9`, `\"` or raw UTF-8) and steps the set. An ASCII-only pattern refuses a multi-byte character at its first byte, so a token can't start a character that could never match.
 - **The thread pool.** With one spinning worker per core, any background process preempts one and every matmul waits for it. Leaving two efficiency cores free doubled CPU decode speed.
 - **Measure under identical conditions, or not at all.** GPU speed on a laptop moves with power source, Low Power Mode and background load (one run measured 105 tok/s, the same code later 131). Every optimization here was decided by building both versions and alternating them in the same session. Kept and rejected so far:
   - kept: **1,024 threads per attention head** for decode (+26% at 2,048 tokens of context), with **4 value dims per thread** in its last pass (+11% more); **32-token GEMM tiles fed 128-token prefill chunks** (+15-18% prefill), with **weights staged as half precision** (+11-14%, and the tile's threadgroup memory down from 20 KB to 8 KB); the **FlashAttention-style prefill kernel** (+30% at 256 tokens, 2x at 2,048); **SDOT with four tokens per weight load** (1.7x CPU prefill), then **I8MM with eight** (another +45%); an **f16 KV cache** by default (lossless here, and llama.cpp's default too);
@@ -176,7 +198,7 @@ Property tests check the matchers against the JSON parser on tens of thousands o
 
 ### How it's verified
 
-`cargo test --release` runs 64 tests, in CI on Apple Silicon. GitHub's virtual Macs expose a GPU that returns zeros, so the engine self-tests the GPU at startup and refuses a broken one; there the GPU comparisons skip, and they run on real hardware. Beyond unit tests of every kernel against a scalar reference, the tests check against the real model that:
+`cargo test --release` runs 82 tests, in CI on Apple Silicon and on x86-64 Linux (where the AVX2 kernels run). GitHub's virtual Macs expose a GPU that returns zeros, so the engine self-tests the GPU at startup and refuses a broken one; there the GPU comparisons skip, and they run on real hardware. Beyond unit tests of every kernel against a scalar reference, the tests check against the real model that:
 
 - several sequences batched together produce exactly the tokens each produces alone, on CPU and GPU;
 - the GPU produces exactly the same greedy tokens as the CPU, for Qwen2.5, Qwen3, Llama 3.2 and the Granite mixture of experts (through both its per-token and per-expert paths);
@@ -185,7 +207,9 @@ Property tests check the matchers against the JSON parser on tens of thousands o
 - the CPU's int8 kernels give bit-identical results for a token whichever path (alone, in fours, in pairs) computes it;
 - speculative decoding (model or prompt-lookup drafter) is identical to plain greedy decoding, and speculative sampling reproduces the target distribution (200,000 trials);
 - reusing the KV cache gives the same output as recomputing it;
-- JSON mode always parses, schema-constrained output has the requested shape (optional properties may be left out, in order, required ones never), and forced tool calls fit the function's schema;
+- JSON mode always parses, schema-constrained output has the requested shape (optional properties may be left out, in order, required ones never) and keeps to its patterns, formats, lengths and number ranges, and forced tool calls fit the function's schema, in Qwen's, Llama's and Granite's formats;
+- LoRA adapters give what merging them into the weights gives, the GPU's match the CPU's, and a batch mixing adapters gives each sequence what it gets alone;
+- requests preempted under memory pressure, swapped out or recomputed, produce exactly the text they produce alone, and queued requests start in priority order;
 - the tokenizer round-trips code, Unicode and emoji and won't let user text forge control tokens, and GPT-2-style pre-tokenization splits as its regex does (and, outside `cargo test`, the token ids match llama.cpp's exactly; see the design notes);
 - the JSON parser, safetensors reader and pre-tokenizer survive thousands of random and corrupted inputs, and the JSON and JSON Schema matchers never accept anything the parser rejects.
 
@@ -222,6 +246,7 @@ In a browser: `rustup target add wasm32-unknown-unknown`, then `web/build.sh`, s
     --imatrix models/qwen2.5-0.5b-instruct/imatrix.bin --prompt "..."  # better 4-bit
 ./target/release/tachyon run --schema movie.schema.json --prompt "Invent a movie."
 ./target/release/tachyon tokenize --prompt "Hello world"  # token ids
+./target/release/tachyon serve --gpu --lora sql=adapters/sql --lora chat=adapters/chat  # pick one per request with "model"
 ```
 
 Any OpenAI client works against `serve`:
@@ -254,15 +279,15 @@ Run `tachyon help` for every option.
 
 ## Limitations
 
-- Apple Silicon for the GPU path; the CPU path is portable but only has NEON kernels (other CPUs fall back to scalar code).
-- JSON Schema support covers what structured output needs (objects with properties in order, optional ones included, arrays, enums, unions told apart by their first character, `$ref`), not string `pattern`s or numeric ranges.
-- Tool calling isn't implemented for Granite's format (Qwen's and Llama's are).
+- Apple Silicon for the GPU path; the CPU path has NEON and AVX2 kernels (other CPUs fall back to scalar code).
+- JSON Schema support covers what structured output needs (objects with properties in order, optional ones included, arrays, enums, unions told apart by their first character, `$ref`, string patterns, formats and lengths, number ranges), not `multipleOf`, `uniqueItems` or `patternProperties`. A `pattern` must match the whole string, as other constrained decoders take it; bounded numbers are written without an exponent.
+- LoRA adapters can't target a mixture of experts' MLPs, or train layers in full (`modules_to_save`).
 - The browser build runs on one thread (no shared-memory threads without cross-origin isolation headers).
 - The tokenizer skips NFC normalization and treats Unicode letters slightly more broadly than `\p{L}`; this matters only for some scripts with combining marks.
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md): long-context attention, WebGPU for the browser build, CUDA, and LoRA serving.
+See [ROADMAP.md](ROADMAP.md): long-context attention, CPU prefill, smaller 4-bit formats, WebGPU for the browser build, and CUDA.
 
 ## License
 
