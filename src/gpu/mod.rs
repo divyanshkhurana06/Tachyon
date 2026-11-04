@@ -217,13 +217,29 @@ impl GpuMatrix {
                     Buffer::from_slice(ctx, qs)?,
                 ],
             ),
-            Matrix::Q4 { scales, qs, .. } => (
-                Kernel::MatQ4,
-                vec![
-                    Buffer::from_slice(ctx, scales)?,
-                    Buffer::from_slice(ctx, qs)?,
-                ],
-            ),
+            Matrix::Q4 {
+                scales,
+                qs,
+                offsets,
+                ..
+            } => {
+                let zeros;
+                let offsets = match offsets {
+                    Some(o) => o.as_slice(),
+                    None => {
+                        zeros = vec![0f32; scales.len()];
+                        &zeros
+                    }
+                };
+                (
+                    Kernel::MatQ4,
+                    vec![
+                        Buffer::from_slice(ctx, scales)?,
+                        Buffer::from_slice(ctx, qs)?,
+                        Buffer::from_slice(ctx, offsets)?,
+                    ],
+                )
+            }
         };
         if m.cols() % 32 != 0 {
             return Err(Error::msg("GPU matrices need a multiple of 32 columns"));
@@ -631,8 +647,8 @@ impl GpuBackend {
         let mut args: Vec<(&Buffer, usize)> = m.bufs.iter().map(|b| (b, 0)).collect();
         let (t, k, rows) = (p.t as usize, p.k as usize, p.rows as usize);
         if grouped {
-            if args.len() == 1 {
-                args.push((&m.bufs[0], 0)); // bf16 has one buffer; inputs stay at index 2
+            while args.len() < 3 {
+                args.push((&m.bufs[0], 0)); // pad: inputs are always at index 3
             }
             args.extend([(x, 0), (y, 0), (&a.moe_counts, 0), (&a.moe_lists, 0)]);
             let kernel = match m.kernel {

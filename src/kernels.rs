@@ -85,74 +85,95 @@ pub fn quantize_q4(x: &[f32], scales: &mut [f32], qs: &mut [u8]) {
     }
 }
 
-/// [`quantize_q4`] for one row, guided by `importance[j]`, the mean squared
-/// input that column `j` multiplies (see `imatrix.rs`). Each block picks the
-/// scale minimizing `sum_j w_j (x_j - d q_j)^2` with
-/// `w_j = importance_j * sqrt(sigma^2 + x_j^2)` (llama.cpp's weighting;
-/// sigma^2 is the row's mean squared weight). The plain scale is among the
-/// candidates, so the weighted error is never worse than [`quantize_q4`]'s.
-pub fn quantize_q4_weighted(row: &[f32], importance: &[f32], scales: &mut [f32], qs: &mut [u8]) {
+/// 4-bit with an offset per block: value = `d * (q - 8) + c`, q in 0..=15,
+/// so a block's 16 levels span its own range instead of one centred on
+/// zero. Same nibble layout as [`quantize_q4`]. For each block the scale and
+/// offset minimize `sum_j w_j (x_j - value_j)^2` (a weighted least-squares
+/// fit for each of several roundings, as llama.cpp's k-quants search), with
+/// `w_j = importance_j * sqrt(sigma^2 + x_j^2)` and importance 1 without an
+/// importance matrix.
+pub fn quantize_q4_offset(
+    row: &[f32],
+    importance: Option<&[f32]>,
+    scales: &mut [f32],
+    offsets: &mut [f32],
+    qs: &mut [u8],
+) {
     let sigma2 = row.iter().map(|v| v * v).sum::<f32>() / row.len() as f32;
-    for (b, ((block, q), scale)) in row
-        .chunks_exact(QK)
-        .zip(qs.chunks_exact_mut(QK / 2))
-        .zip(scales.iter_mut())
-        .enumerate()
-    {
-        let imp = &importance[b * QK..(b + 1) * QK];
+    for (b, block) in row.chunks_exact(QK).enumerate() {
         let mut w = [0f32; QK];
         for j in 0..QK {
-            w[j] = imp[j] * (sigma2 + block[j] * block[j]).sqrt();
+            let imp = importance.map_or(1.0, |i| i[b * QK + j]);
+            w[j] = imp * (sigma2 + block[j] * block[j]).sqrt();
         }
-        let (d, ints) = fit_q4_weighted(block, &w);
+        let (d, c, levels) = fit_q4_offset(block, &w);
+        let q = &mut qs[b * QK / 2..(b + 1) * QK / 2];
         for j in 0..QK / 2 {
-            q[j] = (ints[j] + 8) as u8 | (((ints[j + QK / 2] + 8) as u8) << 4);
+            q[j] = levels[j] | (levels[j + QK / 2] << 4);
         }
-        *scale = d;
+        scales[b] = d;
+        offsets[b] = c;
     }
 }
 
-fn fit_q4_weighted(x: &[f32], w: &[f32]) -> (f32, [i8; QK]) {
-    let max = x
+/// (scale, offset, levels) for one block; see [`quantize_q4_offset`].
+fn fit_q4_offset(x: &[f32], w: &[f32]) -> (f32, f32, [u8; QK]) {
+    let (lo, hi) = x
         .iter()
-        .copied()
-        .fold(0f32, |m, v| if v.abs() > m.abs() { v } else { m });
-    if max == 0.0 {
-        return (0.0, [0; QK]);
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &v| {
+            (lo.min(v), hi.max(v))
+        });
+    if hi <= lo {
+        return (0.0, lo, [8; QK]); // a constant block: all offset
     }
-    let err = |d: f32, q: &[i8; QK]| {
+    let levels_for = |iscale: f32| {
+        let mut l = [0u8; QK];
+        for (l, &v) in l.iter_mut().zip(x) {
+            *l = ((v - lo) * iscale).round().clamp(0.0, 15.0) as u8;
+        }
+        l
+    };
+    let err = |a: f32, m: f32, l: &[u8; QK]| {
         x.iter()
-            .zip(q)
+            .zip(l)
             .zip(w)
-            .map(|((&v, &q), &w)| w * (v - d * q as f32).powi(2))
+            .map(|((&v, &l), &w)| w * (v - a * l as f32 - m).powi(2))
             .sum::<f32>()
     };
-    let ints_for = |iscale: f32| {
-        let mut q = [0i8; QK];
-        for (q, &v) in q.iter_mut().zip(x) {
-            *q = (v * iscale).round().clamp(-8.0, 7.0) as i8;
+    // The plain choice: the block's range in 15 steps from its minimum.
+    let plain = levels_for(15.0 / (hi - lo));
+    let mut best = (
+        (hi - lo) / 15.0,
+        lo,
+        plain,
+        err((hi - lo) / 15.0, lo, &plain),
+    );
+    for step in -10..=10 {
+        let l = levels_for((15.0 + 0.1 * step as f32) / (hi - lo));
+        // weighted least squares for x ≈ a * l + m
+        let (mut sw, mut sl, mut sll, mut sx, mut slx) = (0f32, 0f32, 0f32, 0f32, 0f32);
+        for ((&v, &l), &w) in x.iter().zip(&l).zip(w) {
+            let l = l as f32;
+            sw += w;
+            sl += w * l;
+            sll += w * l * l;
+            sx += w * v;
+            slx += w * l * v;
         }
-        q
-    };
-    // The plain choice: the largest value maps exactly to -8.
-    let plain = ints_for(-8.0 / max);
-    let mut best = (max / -8.0, plain, err(max / -8.0, &plain));
-    for step in -9..=9 {
-        let q = ints_for(-(8.0 + 0.1 * step as f32) / max);
-        let (mut sxq, mut sqq) = (0f32, 0f32);
-        for ((&v, &q), &w) in x.iter().zip(&q).zip(w) {
-            sxq += w * v * q as f32;
-            sqq += w * (q as f32) * (q as f32);
+        let det = sw * sll - sl * sl;
+        if det <= 0.0 {
+            continue;
         }
-        if sqq > 0.0 {
-            let d = sxq / sqq;
-            let e = err(d, &q);
-            if e < best.2 {
-                best = (d, q, e);
-            }
+        let a = (sw * slx - sl * sx) / det;
+        let m = (sll * sx - sl * slx) / det;
+        let e = err(a, m, &l);
+        if e < best.3 {
+            best = (a, m, l, e);
         }
     }
-    (best.0, best.1)
+    let (a, m, l, _) = best;
+    // value = a * l + m = a * (l - 8) + (m + 8a)
+    (a, m + 8.0 * a, l)
 }
 
 pub fn dequantize_q8(scales: &[f32], qs: &[i8], out: &mut [f32]) {
@@ -875,33 +896,42 @@ mod tests {
     }
 
     #[test]
-    fn weighted_q4_never_loses_to_plain_on_its_own_measure() {
+    fn offset_q4_beats_symmetric_q4_on_its_own_measure() {
         let x = data(64 * QK, 11);
         let imp: Vec<f32> = data(64 * QK, 12)
             .iter()
             .map(|v| v * v * 10.0 + 0.01)
             .collect();
         let nb = x.len() / QK;
-        let (mut s, mut q) = (vec![0.0; nb], vec![0u8; x.len() / 2]);
-        let (mut out_w, mut out_p) = (vec![0.0; x.len()], vec![0.0; x.len()]);
-        quantize_q4_weighted(&x, &imp, &mut s, &mut q);
-        dequantize_q4(&s, &q, &mut out_w);
-        quantize_q4(&x, &mut s, &mut q);
-        dequantize_q4(&s, &q, &mut out_p);
         let sigma2 = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
-        let werr = |out: &[f32]| -> f32 {
+        let werr = |out: &[f32], imp: Option<&[f32]>| -> f32 {
             x.iter()
                 .zip(out)
-                .zip(&imp)
-                .map(|((&a, &b), &i)| i * (sigma2 + a * a).sqrt() * (a - b).powi(2))
+                .enumerate()
+                .map(|(j, (&a, &b))| {
+                    imp.map_or(1.0, |i| i[j]) * (sigma2 + a * a).sqrt() * (a - b).powi(2)
+                })
                 .sum()
         };
-        assert!(
-            werr(&out_w) <= werr(&out_p) * 1.0001,
-            "{} vs {}",
-            werr(&out_w),
-            werr(&out_p)
-        );
+        let (mut s, mut q) = (vec![0.0; nb], vec![0u8; x.len() / 2]);
+        let mut sym = vec![0.0; x.len()];
+        quantize_q4(&x, &mut s, &mut q);
+        dequantize_q4(&s, &q, &mut sym);
+        for imp in [None, Some(imp.as_slice())] {
+            let (mut s, mut o, mut q) = (vec![0.0; nb], vec![0.0; nb], vec![0u8; x.len() / 2]);
+            quantize_q4_offset(&x, imp, &mut s, &mut o, &mut q);
+            let mut out = vec![0.0; x.len()];
+            dequantize_q4(&s, &q, &mut out);
+            for (block, &c) in out.chunks_exact_mut(QK).zip(&o) {
+                block.iter_mut().for_each(|v| *v += c);
+            }
+            assert!(
+                werr(&out, imp) < werr(&sym, imp) * 0.8,
+                "{} vs {}",
+                werr(&out, imp),
+                werr(&sym, imp)
+            );
+        }
     }
 
     #[test]

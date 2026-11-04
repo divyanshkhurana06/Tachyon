@@ -60,10 +60,12 @@ struct LoadQ8 {
 };
 
 // Q4 blocks: 16 bytes per 32 weights; byte j holds weight j (low nibble) and
-// weight j+16 (high nibble), each stored offset by 8.
+// weight j+16 (high nibble), each stored offset by 8. A weight is
+// (q - 8) * scale + offset, with a scale and an offset per block.
 struct LoadQ4 {
     device const float *scales;
     device const uchar *qs;
+    device const float *offsets;
     uint cols;
     float4 operator()(uint row, uint k) const {
         ulong e = (ulong)row * cols + k;
@@ -71,7 +73,7 @@ struct LoadQ4 {
         uint j = e % 32;
         uchar4 c = *(device const uchar4 *)(qs + block * 16 + (j & 15));
         float4 v = j < 16 ? float4(c & uchar4(0xF)) : float4(c >> uchar4(4));
-        return (v - 8.0f) * scales[block];
+        return (v - 8.0f) * scales[block] + offsets[block];
     }
 };
 
@@ -137,11 +139,11 @@ kernel void matmul_q8(device const float *scales [[buffer(0)]], device const cha
 }
 
 kernel void matmul_q4(device const float *scales [[buffer(0)]], device const uchar *qs [[buffer(1)]],
-                      device const float *x [[buffer(2)]], device float *y [[buffer(3)]],
-                      device const float *bias [[buffer(4)]], constant MatParams &p [[buffer(5)]],
-                      uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
-                      uint lane [[thread_index_in_simdgroup]]) {
-    LoadQ4 load = {scales, qs, p.cols};
+                      device const float *offsets [[buffer(2)]], device const float *x [[buffer(3)]],
+                      device float *y [[buffer(4)]], device const float *bias [[buffer(5)]],
+                      constant MatParams &p [[buffer(6)]], uint tg [[threadgroup_position_in_grid]],
+                      uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    LoadQ4 load = {scales, qs, offsets, p.cols};
     matmul_impl(load, x, y, bias, p, (tg * SIMDS + sg) * R, lane);
 }
 
@@ -191,16 +193,17 @@ struct TileQ8 {
 struct TileQ4 {
     device const float *scales;
     device const uchar *qs;
+    device const float *offsets;
     uint cols;
     void operator()(threadgroup half *d, uint row, uint k) const {
         ulong e = (ulong)row * cols + k;
         ulong block = e / 32;
         bool high = (e % 32) >= 16;
         device const uchar4 *q = (device const uchar4 *)(qs + block * 16);
-        float s = scales[block];
+        float s = scales[block], o = offsets[block];
         for (uint i = 0; i < 4; i++) {
             uchar4 c = q[i];
-            float4 f = ((high ? float4(c >> uchar4(4)) : float4(c & uchar4(0xF))) - 8.0f) * s;
+            float4 f = ((high ? float4(c >> uchar4(4)) : float4(c & uchar4(0xF))) - 8.0f) * s + o;
             *(threadgroup half4 *)(d + i * 4) = half4(f);
         }
     }
@@ -315,12 +318,12 @@ kernel void gemm_q8(device const float *scales [[buffer(0)]], device const char 
 }
 
 kernel void gemm_q4(device const float *scales [[buffer(0)]], device const uchar *qs [[buffer(1)]],
-                    device const float *x [[buffer(2)]], device float *y [[buffer(3)]],
-                    device const float *bias [[buffer(4)]], constant MatParams &p [[buffer(5)]],
-                    uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-                    uint sg [[simdgroup_index_in_threadgroup]]) {
+                    device const float *offsets [[buffer(2)]], device const float *x [[buffer(3)]],
+                    device float *y [[buffer(4)]], device const float *bias [[buffer(5)]],
+                    constant MatParams &p [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]],
+                    uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
     threadgroup float shared[GM_TOK * GM_ROWS];
-    TileQ4 tile = {scales, qs, p.cols};
+    TileQ4 tile = {scales, qs, offsets, p.cols};
     DenseRows g = {y, bias, p.t, p.rows, p.accumulate, p.has_bias};
     gemm_impl(tile, g, x, p.rows, p.cols, tg, tid, sg, shared);
 }
@@ -699,11 +702,11 @@ kernel void moe_q8(device const float *scales [[buffer(0)]], device const char *
 }
 
 kernel void moe_q4(device const float *scales [[buffer(0)]], device const uchar *qs [[buffer(1)]],
-                   device const float *x [[buffer(2)]], device float *y [[buffer(3)]],
-                   device const uint *ids [[buffer(4)]], constant MoeParams &p [[buffer(5)]],
-                   uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
-                   uint lane [[thread_index_in_simdgroup]]) {
-    LoadQ4 load = {scales, qs, p.cols};
+                   device const float *offsets [[buffer(2)]], device const float *x [[buffer(3)]],
+                   device float *y [[buffer(4)]], device const uint *ids [[buffer(5)]],
+                   constant MoeParams &p [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]],
+                   uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    LoadQ4 load = {scales, qs, offsets, p.cols};
     moe_impl(load, x, y, ids, p, tg, sg, lane);
 }
 
@@ -720,10 +723,12 @@ kernel void moe_group(device const uint *ids [[buffer(0)]], device uint *counts 
     counts[e] = n;
 }
 
+// Weight buffers first (padded to three), then inputs, outputs, the
+// experts' slot counts and lists.
 #define MOE_GEMM(NAME, TILE, ARGS, INIT)                                                                   \
-    kernel void NAME(ARGS, device const float *x [[buffer(2)]], device float *y [[buffer(3)]],             \
-                     device const uint *counts [[buffer(4)]], device const uint *lists [[buffer(5)]],       \
-                     constant MoeParams &p [[buffer(6)]], uint3 tg [[threadgroup_position_in_grid]],        \
+    kernel void NAME(ARGS, device const float *x [[buffer(3)]], device float *y [[buffer(4)]],             \
+                     device const uint *counts [[buffer(5)]], device const uint *lists [[buffer(6)]],       \
+                     constant MoeParams &p [[buffer(7)]], uint3 tg [[threadgroup_position_in_grid]],        \
                      uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]]) { \
         threadgroup float shared[GM_TOK * GM_ROWS];                                                         \
         TILE tile = INIT;                                                                                   \
@@ -732,12 +737,18 @@ kernel void moe_group(device const uint *ids [[buffer(0)]], device uint *counts 
         gemm_impl(tile, g, x, p.rows, p.cols, tg.xy, tid, sg, shared);                                      \
     }
 #define COMMA ,
-MOE_GEMM(moe_gemm_bf16, TileBf16, device const ushort *w [[buffer(0)]] COMMA device const float *unused [[buffer(1)]],
+MOE_GEMM(moe_gemm_bf16, TileBf16,
+         device const ushort *w [[buffer(0)]] COMMA device const float *unused [[buffer(1)]] COMMA
+             device const float *unused2 [[buffer(2)]],
          (TileBf16{w, p.cols}))
-MOE_GEMM(moe_gemm_q8, TileQ8, device const float *scales [[buffer(0)]] COMMA device const char *qs [[buffer(1)]],
+MOE_GEMM(moe_gemm_q8, TileQ8,
+         device const float *scales [[buffer(0)]] COMMA device const char *qs [[buffer(1)]] COMMA
+             device const float *unused [[buffer(2)]],
          (TileQ8{scales, qs, p.cols}))
-MOE_GEMM(moe_gemm_q4, TileQ4, device const float *scales [[buffer(0)]] COMMA device const uchar *qs [[buffer(1)]],
-         (TileQ4{scales, qs, p.cols}))
+MOE_GEMM(moe_gemm_q4, TileQ4,
+         device const float *scales [[buffer(0)]] COMMA device const uchar *qs [[buffer(1)]] COMMA
+             device const float *offsets [[buffer(2)]],
+         (TileQ4{scales, qs, offsets, p.cols}))
 
 // A thread per token: its k highest router scores (ties to the lower
 // expert, as on the CPU), weighted by a softmax over those k.

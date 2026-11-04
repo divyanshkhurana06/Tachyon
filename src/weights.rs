@@ -69,6 +69,8 @@ pub enum Matrix {
         cols: usize,
         scales: Vec<f32>,
         qs: Vec<u8>,
+        /// Per-block offsets (`d * (q - 8) + c`), when quantized with them.
+        offsets: Option<Vec<f32>>,
     },
 }
 
@@ -94,16 +96,30 @@ impl Matrix {
                     qs,
                 }
             }
-            Format::Q4 | Format::Q4M => {
-                let (mut scales, mut qs) = (vec![0.0; blocks], vec![0u8; rows * cols / 2]);
-                kernels::quantize_q4(data, &mut scales, &mut qs);
-                Matrix::Q4 {
-                    rows,
-                    cols,
-                    scales,
-                    qs,
-                }
-            }
+            Format::Q4 | Format::Q4M => Matrix::q4_offset(data, rows, cols, None),
+        }
+    }
+
+    /// 4-bit with per-block offsets, fitted to `importance` if given.
+    fn q4_offset(data: &[f32], rows: usize, cols: usize, importance: Option<&[f32]>) -> Matrix {
+        let nb = cols / QK;
+        let (mut scales, mut offsets) = (vec![0.0; rows * nb], vec![0.0; rows * nb]);
+        let mut qs = vec![0u8; rows * cols / 2];
+        for r in 0..rows {
+            kernels::quantize_q4_offset(
+                &data[r * cols..(r + 1) * cols],
+                importance,
+                &mut scales[r * nb..(r + 1) * nb],
+                &mut offsets[r * nb..(r + 1) * nb],
+                &mut qs[r * cols / 2..(r + 1) * cols / 2],
+            );
+        }
+        Matrix::Q4 {
+            rows,
+            cols,
+            scales,
+            qs,
+            offsets: Some(offsets),
         }
     }
 
@@ -122,22 +138,7 @@ impl Matrix {
         if cols % QK != 0 || imp.len() != cols {
             return Matrix::from_f32(data, rows, cols, format);
         }
-        let nb = cols / QK;
-        let (mut scales, mut qs) = (vec![0.0; rows * nb], vec![0u8; rows * cols / 2]);
-        for r in 0..rows {
-            kernels::quantize_q4_weighted(
-                &data[r * cols..(r + 1) * cols],
-                imp,
-                &mut scales[r * nb..(r + 1) * nb],
-                &mut qs[r * cols / 2..(r + 1) * cols / 2],
-            );
-        }
-        Matrix::Q4 {
-            rows,
-            cols,
-            scales,
-            qs,
-        }
+        Matrix::q4_offset(data, rows, cols, Some(imp))
     }
 
     pub fn rows(&self) -> usize {
@@ -164,7 +165,12 @@ impl Matrix {
         match self {
             Matrix::Bf16 { data, .. } => data.len() * 2,
             Matrix::Q8 { scales, qs, .. } => scales.len() * 4 + qs.len(),
-            Matrix::Q4 { scales, qs, .. } => scales.len() * 4 + qs.len(),
+            Matrix::Q4 {
+                scales,
+                qs,
+                offsets,
+                ..
+            } => scales.len() * 4 + qs.len() + offsets.as_ref().map_or(0, |o| o.len() * 4),
         }
     }
 
@@ -183,11 +189,23 @@ impl Matrix {
                 &qs[r * cols..(r + 1) * cols],
                 out,
             ),
-            Matrix::Q4 { scales, qs, .. } => kernels::dequantize_q4(
-                &scales[r * nb..(r + 1) * nb],
-                &qs[r * cols / 2..(r + 1) * cols / 2],
-                out,
-            ),
+            Matrix::Q4 {
+                scales,
+                qs,
+                offsets,
+                ..
+            } => {
+                kernels::dequantize_q4(
+                    &scales[r * nb..(r + 1) * nb],
+                    &qs[r * cols / 2..(r + 1) * cols / 2],
+                    out,
+                );
+                if let Some(o) = offsets {
+                    for (block, &c) in out.chunks_exact_mut(QK).zip(&o[r * nb..(r + 1) * nb]) {
+                        block.iter_mut().for_each(|v| *v += c);
+                    }
+                }
+            }
         }
     }
 
@@ -246,11 +264,17 @@ impl Matrix {
                 grain,
                 out,
             ),
-            Matrix::Q4 { scales, qs, .. } => int_matmul(
+            Matrix::Q4 {
+                scales,
+                qs,
+                offsets,
+                ..
+            } => int_matmul(
                 pool,
                 &Q4Rows {
                     scales,
                     qs,
+                    offsets: offsets.as_deref(),
                     cols,
                     row0,
                 },
@@ -269,6 +293,14 @@ impl Matrix {
 trait IntRows: Sync {
     fn dot(&self, r: usize, xs: &[f32], xq: &[i8]) -> f32;
     fn dot_x4(&self, r: usize, xs: [&[f32]; 4], xq: [&[i8]; 4]) -> [f32; 4];
+    /// The per-block offsets' share of row `r` times a token, given the
+    /// token's blocks' input sums (`scale * sum of quantized values`).
+    fn offset(&self, _r: usize, _sums: &[f32]) -> f32 {
+        0.0
+    }
+    fn has_offsets(&self) -> bool {
+        false
+    }
     /// Rows `r` and `r + 1` against token pairs (see `kernels::pair_tokens`).
     fn dot2_pairs<const P: usize>(
         &self,
@@ -319,6 +351,7 @@ impl IntRows for Q8Rows<'_> {
 struct Q4Rows<'a> {
     scales: &'a [f32],
     qs: &'a [u8],
+    offsets: Option<&'a [f32]>,
     cols: usize,
     row0: usize,
 }
@@ -334,6 +367,15 @@ impl Q4Rows<'_> {
 }
 
 impl IntRows for Q4Rows<'_> {
+    fn offset(&self, r: usize, sums: &[f32]) -> f32 {
+        let nb = self.cols / QK;
+        let r = self.row0 + r;
+        self.offsets
+            .map_or(0.0, |o| kernels::dot_f32(&o[r * nb..(r + 1) * nb], sums))
+    }
+    fn has_offsets(&self) -> bool {
+        self.offsets.is_some()
+    }
     fn dot(&self, r: usize, xs: &[f32], xq: &[i8]) -> f32 {
         let (ws, wq) = self.row(r);
         dot_q4(ws, wq, xs, xq)
@@ -372,9 +414,30 @@ fn int_matmul(
     let nb = cols / QK;
     let tok = |i: usize| (&xs[i * nb..(i + 1) * nb], &xq[i * cols..(i + 1) * cols]);
     let paired = (t >= 2 && kernels::has_i8mm()).then(|| kernels::pair_tokens(&xs, &xq, t, cols));
+    // For per-block offsets: each token's blocks' input sums.
+    let sums: Vec<f32> = if m.has_offsets() {
+        (0..t * nb)
+            .map(|k| {
+                xs[k]
+                    * xq[k * QK..(k + 1) * QK]
+                        .iter()
+                        .map(|&q| q as i32)
+                        .sum::<i32>() as f32
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     pool.parallel_for(rows, grain, |range| {
         // SAFETY: each (token, row) of `out` is written by exactly one thread.
-        let put = |i: usize, r: usize, y: f32| unsafe { out.write(i * rows + r, y) };
+        let put = |i: usize, r: usize, y: f32| {
+            let y = if sums.is_empty() {
+                y
+            } else {
+                y + m.offset(r, &sums[i * nb..(i + 1) * nb])
+            };
+            unsafe { out.write(i * rows + r, y) }
+        };
         let mut r = range.start;
         if let Some((ps, pq)) = &paired {
             let pair = |p: usize| {
