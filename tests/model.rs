@@ -423,6 +423,7 @@ fn qwen3_runs_and_backends_agree() {
     );
     tpl.skip_thinking(&tok, &mut p);
 
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
     let (text, on_cpu) = greedy_tokens(cpu(&dir, Format::Bf16).as_mut(), &tok, &p, 20);
     assert!(text.contains("Paris"), "{text}");
     #[cfg(target_os = "macos")]

@@ -79,8 +79,23 @@ jobs:
             [ -f "$f" ] || curl -sSfLO "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/$f"
           done
 
+      # Compiler errors are raised as annotations, readable without the log.
       - name: Lint
-        run: cargo clippy --release --all-targets -- -D warnings
+        run: |
+          set -o pipefail
+          cargo clippy --release --all-targets -- -D warnings 2>&1 | tee lint.log || {
+            grep -E -A4 "^error" lint.log | head -40 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            exit 1
+          }
 
       - name: Test
-        run: cargo test --release
+        run: |
+          set -o pipefail
+          cargo test --release 2>&1 | tee test.log || {
+            grep -E "panicked|FAILED|left:|right:|error" test.log | head -20 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            exit 1
+          }
