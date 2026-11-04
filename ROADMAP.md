@@ -63,6 +63,14 @@ finished; every one should end with a number in the README.
 - [x] **Llama 3 tool calling** in its own format, with forced calls schema-constrained; indented JSON matching Python's `json.dumps`
 - Tried and rejected: split-context decode attention with threadgroup-memory scores, unrolled value loads (no faster); 16- and 64-query prefill attention tiles (slower)
 
+### v0.7: mixture of experts, the browser, better 4-bit
+
+- [x] **Mixture of experts** (Granite 3.1 1B-A400M): top-k routing, per-(token, expert) products for decode and a GEMM per expert over gathered tokens for prefill, all on the GPU in one command buffer; GPU and CPU agree token for token
+- [x] **Browser build**: the library compiled to WebAssembly with SIMD kernels, a worker and a chat page; Qwen2.5-0.5B at 49 tok/s on one thread
+- [x] **4-bit with per-block offsets**, fitted by weighted least squares: `q4m` 3.2% from bf16 (was 7.7%), `q4` 7.3% (was 11.3%), 5.9% with the importance matrix
+- [x] **Tokenizer checked against llama.cpp** (`tachyon tokenize`, `bench/compare_tokenizer.sh`): 118,401 tokens identical after fixing non-special added tokens
+- [x] **JSON Schema optional properties** (`required`), GPT-2 style pre-tokenization, Granite's chat format and scalings
+
 ## Next
 
 ### Long context
@@ -78,35 +86,35 @@ At 2,048 tokens, prefill is 65% of llama.cpp's and decode 87%. Attention is a th
 
 About 65% of llama.cpp. Next: repack weights at load into the interleaved layout `smmla` reads, so the per-block shuffles go away, and fuse activation quantization into the previous op.
 
-### Better 4-bit
+### Smaller 4-bit
 
-Least-squares scale fitting without activation statistics made perplexity
-worse; with the importance matrix, `q4` is 8.5% behind bf16 (it was 11%).
+With per-block offsets `q4m` is 3.2% from bf16, but each 32 weights now carry 8 bytes of scale and offset.
 
-- **k-quants:** 256-weight super-blocks with 6-bit sub-block scales and minimums.
-- A bigger, more varied calibration set, and per-layer format choices driven by it.
+- **k-quant packing:** 256-weight super-blocks with 6-bit sub-block scales and offsets, for the same quality in 4.5 bits per weight instead of 6.
+- A bigger, more varied calibration set (the importance matrix now helps `q4` but not `q4m`).
 
-*Done when:* `q4` perplexity is within 5% of bf16.
+*Done when:* `q4m` quality at under 5 bits per weight.
 
 ### Serving
 
 - Swap-to-CPU preemption instead of recompute, and request priorities.
-- JSON Schema `pattern`, numeric ranges, and optional properties.
+- JSON Schema `pattern`, numeric ranges, string lengths.
+- Tool calling in Granite's format (`<|tool_call|>` and a JSON list).
 - Multiple LoRA adapters served from one base model.
 
 ### Models
 
-- SmolLM2 (a GPT-2 style pre-tokenizer).
-- **Mixture of experts** (Qwen-MoE / Mixtral): a router and top-k expert matmuls.
+- SmolLM2 (GPT-2 style pre-tokenization is in; it adds a digit splitter).
+- Larger mixtures of experts (OLMoE, Qwen-MoE): the same kernels, more memory.
 
 ### Other platforms
 
 - **CUDA backend** (the same kernels in CUDA C, through the driver API).
-- **WebGPU / WASM:** the 0.5B model in a browser tab.
+- **WebGPU** for the browser build (it runs on the CPU today), and threads through shared memory where the page is cross-origin isolated.
 - **x86 SIMD:** AVX2 versions of the four dot-product kernels.
 
 ### Always on
 
-- Compare tokenizer output with Hugging Face's on a large corpus.
+- Compare tokenizer output on a large multilingual corpus (llama.cpp agrees on this repository's 118k tokens).
 - Fuzz with `cargo fuzz` (the property tests are a dependency-free start).
 - Flamegraphs for every performance change, before and after.

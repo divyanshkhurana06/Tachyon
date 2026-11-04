@@ -4,7 +4,7 @@
 
 **An LLM inference engine and serving stack written from scratch in Rust, with hand-written ARM NEON and Metal GPU kernels, and zero dependencies.**
 
-Tachyon runs real Hugging Face checkpoints (Llama 3.2, Qwen2.5, Qwen3) on a MacBook's CPU or GPU, and serves many users at once the way vLLM does: a paged KV cache with prefix sharing, continuous batching, and an OpenAI-compatible API. It quantizes to 8 and 4 bits (with activation-aware calibration), decodes speculatively (with a draft model or with no model at all), and supports the API features agents rely on: structured output that matches a JSON Schema, tool calling and logprobs. Everything between the weights file and the HTTP response is in this repository, including the JSON parser, safetensors reader, BPE tokenizer, thread pool, SIMD kernels, GPU shaders, scheduler and web server. `Cargo.toml` has no dependencies.
+Tachyon runs real Hugging Face checkpoints (Llama 3.2, Qwen2.5, Qwen3, and IBM's Granite mixture of experts) on a MacBook's CPU or GPU, or in a browser tab compiled to WebAssembly, and serves many users at once the way vLLM does: a paged KV cache with prefix sharing, continuous batching, and an OpenAI-compatible API. It quantizes to 8 and 4 bits (with activation-aware calibration), decodes speculatively (with a draft model or with no model at all), and supports the API features agents rely on: structured output that matches a JSON Schema, tool calling and logprobs. Everything between the weights file and the HTTP response is in this repository, including the JSON parser, safetensors reader, BPE tokenizer, thread pool, SIMD kernels, GPU shaders, scheduler and web server. `Cargo.toml` has no dependencies.
 
 ![Chat page served by Tachyon](docs/chat-ui.jpg)
 
@@ -46,14 +46,14 @@ Qwen2.5-0.5B-Instruct, one sequence at a time:
 |---|---|---:|---:|---:|---:|
 | GPU | bf16 | 988 MB | 2,500 tok/s | 78.0 tok/s | 17.95 |
 | GPU | 8-bit | 556 MB | 2,512 tok/s | 126.0 tok/s | 17.99 |
-| GPU | `q4m` (mixed 4/8-bit) | 441 MB | 2,454 tok/s | 127.8 tok/s | 19.32 |
-| GPU | `q4` (mostly 4-bit) | 389 MB | 2,325 tok/s | 126.7 tok/s | 19.97 |
-| GPU | `q4` + importance matrix | 389 MB | | | **19.48** |
-| GPU | `q4m` + importance matrix | 441 MB | | | **19.11** |
+| GPU | `q4m` (mixed 4/8-bit) | 470 MB | 2,576 tok/s | 129.5 tok/s | **18.52** |
+| GPU | `q4` (mostly 4-bit) | 431 MB | 2,530 tok/s | 127.5 tok/s | 19.26 |
+| GPU | `q4` + importance matrix | 431 MB | | | **19.00** |
+| GPU | `q4m` + importance matrix | 470 MB | | | 18.65 |
 | CPU | bf16 | 988 MB | 173 tok/s | 73.7 tok/s | 17.94 |
 | CPU | 8-bit | 556 MB | 727 tok/s | 134.6 tok/s | 18.00 |
-| CPU | `q4m` | 441 MB | 690 tok/s | 143.2 tok/s | 19.32 |
-| CPU | `q4` | 389 MB | 642 tok/s | 128.0 tok/s | 20.04 |
+| CPU | `q4m` | 470 MB | 628 tok/s | 140.2 tok/s | 18.55 |
+| CPU | `q4` | 431 MB | 581 tok/s | 139.2 tok/s | 19.33 |
 
 From `tachyon bench`: best of 3 runs, prefill 256 tokens, decode 128, perplexity over 979 tokens of [`bench/eval.txt`](bench/eval.txt). Speeds move by ±20% with background load, CPU decode most of all.
 
@@ -61,11 +61,27 @@ From `tachyon bench`: best of 3 runs, prefill 256 tokens, decode 128, perplexity
 - **Prefill** is processing the prompt. The GPU does it on its matrix units (`simdgroup_matrix`), for the matrix multiplies and for attention; the CPU with ARM's int8 matrix instructions (I8MM), two weight rows by two tokens per instruction.
 - **Perplexity** measures how surprised the model is by a held-out text (lower is better), and shows what each format costs. CPU and GPU agree in bf16 (to 0.002) because they compute the same function. `q4` and `q4m` are mixed precision: the matrices that measurably matter most stay at 8 bits (see below).
 
-The **importance matrix** (`tachyon calibrate`, then `--imatrix`) runs calibration text through the model, records how large each linear layer's inputs are per channel, and fits each 4-bit block's scale to minimize error weighted by those activations (llama.cpp's imatrix, in the spirit of AWQ). It cuts 4-bit's quality loss against bf16 from 11% to 8.5%, at no cost in size or speed. The calibration text ([`bench/calib.txt`](bench/calib.txt)) is separate from the evaluation text.
+4-bit blocks store a **scale and an offset** each (`value = scale * (q - 8) + offset`), fitted together by weighted least squares over several roundings, so a block's 16 levels span its own range rather than one centred on zero. That took `q4m`'s loss against bf16 from 7.7% to 3.2%, and `q4`'s from 11.3% to 7.3%, for 4 more bytes per 32 weights.
+
+The **importance matrix** (`tachyon calibrate`, then `--imatrix`) runs calibration text through the model, records how large each linear layer's inputs are per channel, and weights each 4-bit block's fit by those activations (llama.cpp's imatrix, in the spirit of AWQ). It takes `q4` to 5.9% from bf16; with the offsets, `q4m` does slightly better without it. The calibration text ([`bench/calib.txt`](bench/calib.txt)) is separate from the evaluation text.
 
 Qwen3-0.6B on the GPU: 55 tok/s in bf16, 86 tok/s in 8-bit.
 
 **Llama 3.2 1B Instruct** (Llama 3's scaled RoPE, tokenizer and chat format): on the GPU in 8-bit, 1,140 tok/s prefill and 55 tok/s decode; perplexity 16.64 in 8-bit against 16.66 in bf16, where CPU and GPU agree exactly.
+
+**Granite 3.1 1B-A400M Instruct**, IBM's mixture of experts (32 experts per layer, 8 per token, so 400M of its 1.3B parameters work on each token):
+
+| backend | format | weights | prefill | decode | perplexity |
+|---|---|---:|---:|---:|---:|
+| GPU | bf16 | 2,669 MB | 1,714 tok/s | 81.3 tok/s | 10.63 |
+| GPU | 8-bit | 1,502 MB | 1,747 tok/s | 127.1 tok/s | 10.64 |
+| GPU | `q4m` | 1,191 MB | 1,691 tok/s | 126.0 tok/s | 10.90 |
+| CPU | 8-bit | 1,502 MB | 545 tok/s | 103.2 tok/s | 10.63 |
+| CPU | `q4m` | 1,191 MB | 496 tok/s | 118.7 tok/s | 10.86 |
+
+(Perplexities of different models aren't comparable: they tokenize the text differently.)
+
+**In the browser**: the same engine compiled to WebAssembly with SIMD kernels chats with Qwen2.5-0.5B in 8-bit at **49 tok/s** on one thread, in a Chrome tab on the same Mac, after converting the 1 GB checkpoint in 2.7 s.
 
 ### Against llama.cpp
 
@@ -126,14 +142,15 @@ Property tests check the matchers against the JSON parser on tens of thousands o
 | [`kv.rs`](src/kv.rs) | Paged KV cache: block allocator, per-sequence block tables, prefix cache with LRU eviction |
 | [`scheduler.rs`](src/scheduler.rs) | Continuous batching, chunked prefill, preemption by recompute, parallel sampling |
 | [`server.rs`](src/server.rs) | HTTP/1.1 on `std::net`: `/v1/chat/completions` (streaming, `stop`, `response_format`, `ignore_eos`), `/v1/models`, `/info`, chat page |
-| [`model.rs`](src/model.rs) | CPU forward pass over a batch: RMSNorm, grouped-query attention through block tables, RoPE (with Llama 3's scaling), SiLU MLP, Qwen3's q/k norm |
-| [`gpu/`](src/gpu) | Metal backend: [`kernels.metal`](src/gpu/kernels.metal) (matrix-vector kernels for decode, `simdgroup_matrix` GEMM for batches, FlashAttention-style prefill attention and paged decode attention, RoPE, norms) and an [Objective-C bridge](src/gpu/shim.m) compiled by `build.rs` |
+| [`model.rs`](src/model.rs) | CPU forward pass over a batch: RMSNorm, grouped-query attention through block tables, RoPE (with Llama 3's scaling), SiLU MLP or mixture of experts, Qwen3's q/k norm |
+| [`gpu/`](src/gpu) | Metal backend: [`kernels.metal`](src/gpu/kernels.metal) (matrix-vector kernels for decode, `simdgroup_matrix` GEMM for batches and per expert, FlashAttention-style prefill attention and paged decode attention, expert routing, RoPE, norms) and an [Objective-C bridge](src/gpu/shim.m) compiled by `build.rs` |
 | [`kernels.rs`](src/kernels.rs) | NEON kernels for bf16, int8×int8 and int4×int8: I8MM matrix instructions for batches, SDOT for single tokens; the quantizers |
 | [`speculative.rs`](src/speculative.rs) | Speculative decoding and sampling, model and prompt-lookup drafters |
 | [`constrain.rs`](src/constrain.rs) | JSON pushdown automaton for constrained decoding |
 | [`sampler.rs`](src/sampler.rs) | Temperature, top-k (single pass), top-p, repetition penalty, constraint masks |
-| [`tokenizer.rs`](src/tokenizer.rs) | Byte-level BPE from `tokenizer.json`, with the pre-tokenizer regex reimplemented by hand |
-| [`chat.rs`](src/chat.rs) | ChatML and Llama 3 chat formats, and each one's tool calls |
+| [`tokenizer.rs`](src/tokenizer.rs) | Byte-level BPE from `tokenizer.json`, with GPT-4's and GPT-2's pre-tokenizer regexes reimplemented by hand |
+| [`chat.rs`](src/chat.rs) | ChatML, Llama 3 and Granite chat formats, and the first two's tool calls |
+| [`web.rs`](src/web.rs), [`web/`](web) | The browser build: an exported C-style API over WebAssembly memory, a worker and a chat page (no bindings library) |
 | [`safetensors.rs`](src/safetensors.rs), [`json.rs`](src/json.rs), [`pool.rs`](src/pool.rs) | mmap'd weights, JSON, a spin-then-park thread pool |
 
 ### Design notes
@@ -148,6 +165,10 @@ Property tests check the matchers against the JSON parser on tens of thousands o
 - **The CPU's int8 path is SDOT.** One `sdot` instruction multiplies 16 pairs of int8 values and adds them into four int32 lanes, against four instructions for the widening multiply-adds it replaced (written as inline assembly, since Rust's intrinsic for it is unstable). Each weight block is also loaded once for four tokens. Prefill went from about 300 to 490 tok/s and batch-4 decoding from about 200 to 400 tok/s.
 - **Then I8MM.** The M2 and later also have `smmla`, which multiplies a 2x8 int8 matrix by an 8x2 one: two weight rows by two tokens, 32 multiply-adds per instruction. Activations are interleaved two tokens at a time once per matmul so the instruction reads them directly, and each weight block is loaded once for eight tokens. CPU prefill went up another 45%, to about 700 tok/s.
 - **Batch invariance.** Every int8 path (single token, four tokens with SDOT, token pairs with I8MM) scales each block's exact integer sum into one running total with a fused multiply-add, in the same order, so a sequence's logits on the CPU are bit-for-bit the same whether it runs alone or batched with any others. A kernel test checks that equality exactly, not within a tolerance.
+- **Mixture of experts without a round trip.** A router scores 32 experts per token and keeps the top 8, weighted by a softmax over those 8. On the GPU everything stays in one command buffer: a kernel routes each token, decode runs a matrix-vector product per (token, expert) that reads only the chosen experts' rows of the stacked expert matrices, and prefill first lists each expert's tokens on the GPU and then runs one GEMM per expert over its gathered rows. That last step made prefill 4.5x faster (392 to 1,747 tok/s). Granite's extra scalings (embeddings, attention, residuals, logits) are folded into the weights at load where they can be, so no kernel changed for them.
+- **The offset costs nothing in the int8 kernels.** With `value = scale * (q - 8) + offset`, a block's dot product is the old integer sum plus `offset * (sum of the block's inputs)`. The input sums are computed once per token, the offset term is a short dot product per row, and every CPU path (SDOT, I8MM, the browser's SIMD) adds it the same way, so batch invariance holds.
+- **The tokenizer is checked against llama.cpp.** `tachyon tokenize` prints token ids the way `llama-tokenize --ids` does; [`bench/compare_tokenizer.sh`](bench/compare_tokenizer.sh) compares them on any files. Over this repository's source, docs and test texts (31 files, 118,401 tokens) they are identical. The check found one difference, now fixed: added tokens that aren't special, like Qwen's `<tool_call>`, are matched in plain text too, as Hugging Face and llama.cpp do.
+- **The browser build is the same code.** The library compiles to `wasm32` with no changes to the model: the checkpoint is read from bytes instead of mmap, layers load on one thread, the dot products have WebAssembly SIMD versions, and the clock (which wasm doesn't have) is never needed. A 1 GB download streams straight into the module's memory so it is never held twice.
 - **The thread pool.** With one spinning worker per core, any background process preempts one and every matmul waits for it. Leaving two efficiency cores free doubled CPU decode speed.
 - **Measure under identical conditions, or not at all.** GPU speed on a laptop moves with power source, Low Power Mode and background load (one run measured 105 tok/s, the same code later 131). Every optimization here was decided by building both versions and alternating them in the same session. Kept and rejected so far:
   - kept: **1,024 threads per attention head** for decode (+26% at 2,048 tokens of context), with **4 value dims per thread** in its last pass (+11% more); **32-token GEMM tiles fed 128-token prefill chunks** (+15-18% prefill), with **weights staged as half precision** (+11-14%, and the tile's threadgroup memory down from 20 KB to 8 KB); the **FlashAttention-style prefill kernel** (+30% at 256 tokens, 2x at 2,048); **SDOT with four tokens per weight load** (1.7x CPU prefill), then **I8MM with eight** (another +45%); an **f16 KV cache** by default (lossless here, and llama.cpp's default too);
@@ -155,17 +176,17 @@ Property tests check the matchers against the JSON parser on tens of thousands o
 
 ### How it's verified
 
-`cargo test --release` runs 59 tests, in CI on Apple Silicon. GitHub's virtual Macs expose a GPU that returns zeros, so the engine self-tests the GPU at startup and refuses a broken one; there the GPU comparisons skip, and they run on real hardware. Beyond unit tests of every kernel against a scalar reference, the tests check against the real model that:
+`cargo test --release` runs 64 tests, in CI on Apple Silicon. GitHub's virtual Macs expose a GPU that returns zeros, so the engine self-tests the GPU at startup and refuses a broken one; there the GPU comparisons skip, and they run on real hardware. Beyond unit tests of every kernel against a scalar reference, the tests check against the real model that:
 
 - several sequences batched together produce exactly the tokens each produces alone, on CPU and GPU;
-- the GPU produces exactly the same greedy tokens as the CPU, for Qwen2.5, Qwen3 and Llama 3.2;
+- the GPU produces exactly the same greedy tokens as the CPU, for Qwen2.5, Qwen3, Llama 3.2 and the Granite mixture of experts (through both its per-token and per-expert paths);
 - the prefill attention kernel, fed a whole prompt through a scrambled block table, gives the same logits as the per-token kernel (largest difference 0.009);
 - Llama 3.2's tokenizer and chat format give the known token ids of Llama 3's prompt header and assistant turn, and it calls tools in its own format;
 - the CPU's int8 kernels give bit-identical results for a token whichever path (alone, in fours, in pairs) computes it;
 - speculative decoding (model or prompt-lookup drafter) is identical to plain greedy decoding, and speculative sampling reproduces the target distribution (200,000 trials);
 - reusing the KV cache gives the same output as recomputing it;
-- JSON mode always parses, schema-constrained output has the requested shape, and forced tool calls fit the function's schema;
-- the tokenizer round-trips code, Unicode and emoji and won't let user text forge control tokens;
+- JSON mode always parses, schema-constrained output has the requested shape (optional properties may be left out, in order, required ones never), and forced tool calls fit the function's schema;
+- the tokenizer round-trips code, Unicode and emoji and won't let user text forge control tokens, and GPT-2-style pre-tokenization splits as its regex does (and, outside `cargo test`, the token ids match llama.cpp's exactly; see the design notes);
 - the JSON parser, safetensors reader and pre-tokenizer survive thousands of random and corrupted inputs, and the JSON and JSON Schema matchers never accept anything the parser rejects.
 
 ## Try it
@@ -184,7 +205,9 @@ cd ../..
 cargo build --release
 ```
 
-For Llama 3.2 1B, download the same four files from [meta-llama/Llama-3.2-1B-Instruct](https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct) (gated: accept Meta's license on Hugging Face first) into `models/llama-3.2-1b-instruct`, and pass `--model models/llama-3.2-1b-instruct`.
+For Llama 3.2 1B, download the same four files from [meta-llama/Llama-3.2-1B-Instruct](https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct) (gated: accept Meta's license on Hugging Face first) into `models/llama-3.2-1b-instruct`, and pass `--model models/llama-3.2-1b-instruct`. For the mixture of experts, the same from [ibm-granite/granite-3.1-1b-a400m-instruct](https://huggingface.co/ibm-granite/granite-3.1-1b-a400m-instruct) (Apache-2.0) into `models/granite-3.1-1b-a400m-instruct`.
+
+In a browser: `rustup target add wasm32-unknown-unknown`, then `web/build.sh`, serve the repository (`python3 -m http.server`) and open `/web/?model=/models/qwen2.5-0.5b-instruct/`. Without `?model=` the page downloads Qwen2.5-0.5B from Hugging Face.
 
 ```bash
 ./target/release/tachyon run --gpu --prompt "Explain recursion to a five-year-old."
@@ -198,6 +221,7 @@ For Llama 3.2 1B, download the same four files from [meta-llama/Llama-3.2-1B-Ins
 ./target/release/tachyon calibrate && ./target/release/tachyon run --quant q4 \
     --imatrix models/qwen2.5-0.5b-instruct/imatrix.bin --prompt "..."  # better 4-bit
 ./target/release/tachyon run --schema movie.schema.json --prompt "Invent a movie."
+./target/release/tachyon tokenize --prompt "Hello world"  # token ids
 ```
 
 Any OpenAI client works against `serve`:
@@ -231,13 +255,14 @@ Run `tachyon help` for every option.
 ## Limitations
 
 - Apple Silicon for the GPU path; the CPU path is portable but only has NEON kernels (other CPUs fall back to scalar code).
-- JSON Schema support covers what structured output needs (objects with all properties required and in order, arrays, enums, unions told apart by their first character, `$ref`), not string `pattern`s or numeric ranges.
-- No mixture-of-experts models yet.
+- JSON Schema support covers what structured output needs (objects with properties in order, optional ones included, arrays, enums, unions told apart by their first character, `$ref`), not string `pattern`s or numeric ranges.
+- Tool calling isn't implemented for Granite's format (Qwen's and Llama's are).
+- The browser build runs on one thread (no shared-memory threads without cross-origin isolation headers).
 - The tokenizer skips NFC normalization and treats Unicode letters slightly more broadly than `\p{L}`; this matters only for some scripts with combining marks.
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md): long-context attention, I8MM for CPU prefill, k-quants, MoE models, CUDA and WebGPU backends.
+See [ROADMAP.md](ROADMAP.md): long-context attention, WebGPU for the browser build, CUDA, and LoRA serving.
 
 ## License
 
