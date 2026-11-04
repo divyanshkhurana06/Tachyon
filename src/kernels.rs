@@ -234,10 +234,21 @@ pub fn pair_tokens(xs: &[f32], xq: &[i8], t: usize, cols: usize) -> (Vec<f32>, V
 pub use neon::{
     dot2_q4_pairs, dot2_q8_pairs, dot_bf16, dot_f32, dot_q4, dot_q4_x4, dot_q8, dot_q8_x4, has_i8mm,
 };
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "wasm32", target_feature = "simd128")
+)))]
 pub use scalar::{
     dot2_q4_pairs, dot2_q8_pairs, dot_bf16, dot_f32, dot_q4, dot_q4_x4, dot_q8, dot_q8_x4, has_i8mm,
 };
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+pub use scalar::{dot2_q4_pairs, dot2_q8_pairs, has_i8mm};
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+pub use wasm::{dot_bf16, dot_f32, dot_q4, dot_q4_x4, dot_q8, dot_q8_x4};
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[path = "kernels_wasm.rs"]
+mod wasm;
 
 #[cfg(target_arch = "aarch64")]
 mod neon {
@@ -603,7 +614,10 @@ mod neon {
     }
 }
 
-#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+#[cfg_attr(
+    any(target_arch = "aarch64", target_feature = "simd128"),
+    allow(dead_code)
+)]
 mod scalar {
     use super::{bf16_to_f32, QK};
 

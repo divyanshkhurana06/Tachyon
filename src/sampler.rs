@@ -42,6 +42,9 @@ impl SamplerConfig {
 }
 
 fn clock_seed() -> u64 {
+    if cfg!(target_arch = "wasm32") {
+        return 0x9E37_79B9; // no clock in the browser build; the page seeds it
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0x9E37_79B9, |d| d.as_nanos() as u64)

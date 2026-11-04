@@ -13,7 +13,7 @@ jobs:
       # Pinned so new lints in a newer clippy can't fail a build that passed locally.
       - name: Toolchain
         run: |
-          rustup toolchain install 1.87.0 --profile minimal --component clippy,rustfmt
+          rustup toolchain install 1.87.0 --profile minimal --component clippy,rustfmt --target wasm32-unknown-unknown
           rustup default 1.87.0
           rustc --version
 
@@ -35,6 +35,12 @@ jobs:
 
       - name: Lint
         run: cargo clippy --release --all-targets -- -D warnings
+
+      - name: Browser build
+        run: |
+          RUSTFLAGS="-C target-feature=+simd128" CARGO_TARGET_DIR=target/web \
+            cargo clippy --release --lib --target wasm32-unknown-unknown -- -D warnings
+          web/build.sh
 
       # Failures are also raised as annotations, which show on the run page.
       - name: Test

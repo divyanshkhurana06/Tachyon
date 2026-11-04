@@ -3,12 +3,11 @@
 //! raw tensor data.
 //!
 //! Files are memory-mapped, so opening a multi-gigabyte checkpoint is
-//! instant and the OS pages in only what is read.
+//! instant and the OS pages in only what is read. Without `mmap` (the
+//! browser build) a checkpoint is read from bytes in memory instead.
 
 use std::collections::HashMap;
-use std::ffi::{c_int, c_void};
-use std::fs::{self, File};
-use std::os::fd::AsRawFd;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::json::Json;
@@ -68,8 +67,25 @@ struct Entry {
 }
 
 pub struct SafeTensors {
-    files: Vec<Mmap>,
+    files: Vec<Storage>,
     entries: HashMap<String, Entry>,
+}
+
+/// A checkpoint file's bytes: mapped from disk, or owned.
+enum Storage {
+    #[cfg(unix)]
+    Mapped(Mmap),
+    Owned(Vec<u8>),
+}
+
+impl Storage {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            #[cfg(unix)]
+            Storage::Mapped(m) => m.bytes(),
+            Storage::Owned(v) => v,
+        }
+    }
 }
 
 impl SafeTensors {
@@ -89,15 +105,27 @@ impl SafeTensors {
             entries: HashMap::new(),
         };
         for path in paths {
-            st.add(&path)?;
+            #[cfg(unix)]
+            let storage = Storage::Mapped(Mmap::open(&path)?);
+            #[cfg(not(unix))]
+            let storage = Storage::Owned(fs::read(&path)?);
+            st.add(storage, &path.display().to_string())?;
         }
         Ok(st)
     }
 
-    fn add(&mut self, path: &Path) -> Result<()> {
-        let map = Mmap::open(path)?;
-        let bytes = map.bytes();
-        let ctx = path.display();
+    /// A checkpoint already in memory (one file's bytes).
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<SafeTensors> {
+        let mut st = SafeTensors {
+            files: Vec::new(),
+            entries: HashMap::new(),
+        };
+        st.add(Storage::Owned(bytes), "model.safetensors")?;
+        Ok(st)
+    }
+
+    fn add(&mut self, storage: Storage, ctx: &str) -> Result<()> {
+        let bytes = storage.bytes();
         if bytes.len() < 8 {
             bail!("{ctx}: too short to be safetensors");
         }
@@ -152,7 +180,7 @@ impl SafeTensors {
                 },
             );
         }
-        self.files.push(map);
+        self.files.push(storage);
         Ok(())
     }
 
@@ -173,62 +201,75 @@ impl SafeTensors {
     }
 }
 
-struct Mmap {
-    ptr: *mut c_void,
-    len: usize,
-}
+#[cfg(unix)]
+use mmap::Mmap;
 
-// The mapping is read-only and lives as long as the struct.
-unsafe impl Send for Mmap {}
-unsafe impl Sync for Mmap {}
+#[cfg(unix)]
+mod mmap {
+    use std::ffi::{c_int, c_void};
+    use std::fs::File;
+    use std::os::fd::AsRawFd;
+    use std::path::Path;
 
-extern "C" {
-    fn mmap(
-        addr: *mut c_void,
+    use crate::{bail, Error, Result};
+
+    pub struct Mmap {
+        ptr: *mut c_void,
         len: usize,
-        prot: c_int,
-        flags: c_int,
-        fd: c_int,
-        offset: i64,
-    ) -> *mut c_void;
-    fn munmap(addr: *mut c_void, len: usize) -> c_int;
-}
-
-const PROT_READ: c_int = 1;
-const MAP_PRIVATE: c_int = 2;
-
-impl Mmap {
-    fn open(path: &Path) -> Result<Mmap> {
-        let file =
-            File::open(path).map_err(|e| Error(format!("cannot open {}: {e}", path.display())))?;
-        let len = file.metadata()?.len() as usize;
-        if len == 0 {
-            bail!("{} is empty", path.display());
-        }
-        // The mapping stays valid after `file` is closed.
-        let ptr = unsafe {
-            mmap(
-                std::ptr::null_mut(),
-                len,
-                PROT_READ,
-                MAP_PRIVATE,
-                file.as_raw_fd(),
-                0,
-            )
-        };
-        if ptr as isize == -1 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        Ok(Mmap { ptr, len })
     }
 
-    fn bytes(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.len) }
-    }
-}
+    // The mapping is read-only and lives as long as the struct.
+    unsafe impl Send for Mmap {}
+    unsafe impl Sync for Mmap {}
 
-impl Drop for Mmap {
-    fn drop(&mut self) {
-        unsafe { munmap(self.ptr, self.len) };
+    extern "C" {
+        fn mmap(
+            addr: *mut c_void,
+            len: usize,
+            prot: c_int,
+            flags: c_int,
+            fd: c_int,
+            offset: i64,
+        ) -> *mut c_void;
+        fn munmap(addr: *mut c_void, len: usize) -> c_int;
+    }
+
+    const PROT_READ: c_int = 1;
+    const MAP_PRIVATE: c_int = 2;
+
+    impl Mmap {
+        pub fn open(path: &Path) -> Result<Mmap> {
+            let file = File::open(path)
+                .map_err(|e| Error(format!("cannot open {}: {e}", path.display())))?;
+            let len = file.metadata()?.len() as usize;
+            if len == 0 {
+                bail!("{} is empty", path.display());
+            }
+            // The mapping stays valid after `file` is closed.
+            let ptr = unsafe {
+                mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    PROT_READ,
+                    MAP_PRIVATE,
+                    file.as_raw_fd(),
+                    0,
+                )
+            };
+            if ptr as isize == -1 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            Ok(Mmap { ptr, len })
+        }
+
+        pub fn bytes(&self) -> &[u8] {
+            unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.len) }
+        }
+    }
+
+    impl Drop for Mmap {
+        fn drop(&mut self) {
+            unsafe { munmap(self.ptr, self.len) };
+        }
     }
 }

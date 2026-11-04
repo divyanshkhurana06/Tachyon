@@ -63,6 +63,16 @@ impl Weights {
         importance: Option<&Importance>,
     ) -> Result<Weights> {
         let st = SafeTensors::open_dir(dir)?;
+        Weights::from_safetensors(&st, c, format, importance)
+    }
+
+    /// [`Weights::load_with`] from a checkpoint already opened.
+    pub fn from_safetensors(
+        st: &SafeTensors,
+        c: &Config,
+        format: Format,
+        importance: Option<&Importance>,
+    ) -> Result<Weights> {
         let next = AtomicUsize::new(0);
         let done = Mutex::new(Vec::new());
         let threads = Pool::default_threads().min(c.layers + 1);
@@ -71,21 +81,29 @@ impl Weights {
         // as llama.cpp does.
         let outer = format.for_matrix("output");
 
-        // The embedding (the single biggest matrix) loads alongside the layers.
-        let embed = thread::scope(|s| {
-            let embed = s.spawn(|| matrix(&st, &["model.embed_tokens.weight"], (outer, None), 1.0));
-            for _ in 0..threads {
-                s.spawn(|| loop {
-                    let l = next.fetch_add(1, Relaxed);
-                    if l >= c.layers {
-                        break;
-                    }
-                    let layer = load_layer(&st, c, l, format, importance.map(|i| &i.layers[l]));
-                    done.lock().unwrap().push((l, layer));
-                });
+        let embed = || matrix(st, &["model.embed_tokens.weight"], (outer, None), 1.0);
+        let layers = || loop {
+            let l = next.fetch_add(1, Relaxed);
+            if l >= c.layers {
+                break;
             }
-            embed.join().unwrap()
-        })?;
+            let layer = load_layer(st, c, l, format, importance.map(|i| &i.layers[l]));
+            done.lock().unwrap().push((l, layer));
+        };
+        // The embedding (the single biggest matrix) loads alongside the
+        // layers, one layer per core; with no threads (the browser), in turn.
+        let embed = if cfg!(target_arch = "wasm32") {
+            layers();
+            embed()?
+        } else {
+            thread::scope(|s| {
+                let embed = s.spawn(embed);
+                for _ in 0..threads {
+                    s.spawn(layers);
+                }
+                embed.join().unwrap()
+            })?
+        };
 
         let mut done = done.into_inner().unwrap();
         done.sort_by_key(|(l, _)| *l);
@@ -96,7 +114,7 @@ impl Weights {
         let lm_head = if c.tied_embeddings || !st.contains("lm_head.weight") {
             None
         } else {
-            Some(matrix(&st, &["lm_head.weight"], (outer, None), 1.0)?)
+            Some(matrix(st, &["lm_head.weight"], (outer, None), 1.0)?)
         };
         if embed.rows() < c.vocab || embed.cols() != c.hidden {
             bail!(
@@ -109,7 +127,7 @@ impl Weights {
         }
         // Granite divides logits by `logits_scaling`; scaling the final norm's
         // weights does it before the (possibly shared) output matrix.
-        let mut norm = vector(&st, "model.norm.weight")?;
+        let mut norm = vector(st, "model.norm.weight")?;
         norm.iter_mut().for_each(|g| *g /= c.logits_scaling);
         Ok(Weights {
             format,

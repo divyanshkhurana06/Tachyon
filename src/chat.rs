@@ -497,8 +497,12 @@ impl ChatTemplate {
     }
 }
 
-/// Days since 1970-01-01, UTC.
+/// Days since 1970-01-01, UTC. The browser build has no clock, so it uses
+/// the date Llama 3's template falls back to (26 Jul 2024).
 fn today() -> i64 {
+    if cfg!(target_arch = "wasm32") {
+        return 19_930;
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() / 86_400) as i64

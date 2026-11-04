@@ -69,6 +69,9 @@ impl Pool {
     /// for it: on an M3, 8 threads decode at half the speed of 6.
     /// On Apple Silicon: all performance cores plus half the efficiency cores.
     pub fn default_threads() -> usize {
+        if cfg!(target_arch = "wasm32") {
+            return 1; // the browser build has no threads
+        }
         let all = thread::available_parallelism().map_or(4, |n| n.get());
         #[cfg(target_os = "macos")]
         if let (Some(p), Some(e)) = (

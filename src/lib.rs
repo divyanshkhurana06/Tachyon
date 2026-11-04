@@ -33,6 +33,8 @@ pub mod schema;
 pub mod server;
 pub mod speculative;
 pub mod tokenizer;
+#[cfg(target_arch = "wasm32")]
+pub mod web;
 pub mod weights;
 
 #[derive(Debug)]

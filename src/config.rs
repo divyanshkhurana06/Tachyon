@@ -73,7 +73,14 @@ impl Config {
         let path = dir.join("config.json");
         let text = fs::read_to_string(&path)
             .map_err(|e| Error(format!("cannot read {}: {e}", path.display())))?;
-        let j = Json::parse(&text)?;
+        let generation = fs::read_to_string(dir.join("generation_config.json")).ok();
+        Config::from_json(&text, generation.as_deref())
+    }
+
+    /// From the text of `config.json` and, if there is one,
+    /// `generation_config.json`.
+    pub fn from_json(text: &str, generation: Option<&str>) -> Result<Config> {
+        let j = Json::parse(text)?;
         let num = |k: &str| {
             j.get(k)
                 .and_then(Json::as_usize)
@@ -134,10 +141,7 @@ impl Config {
 
         // generation_config.json often adds stop tokens (e.g. <|endoftext|>).
         let mut eos_ids = token_ids(j.get("eos_token_id"));
-        if let Some(g) = fs::read_to_string(dir.join("generation_config.json"))
-            .ok()
-            .and_then(|t| Json::parse(&t).ok())
-        {
+        if let Some(g) = generation.and_then(|t| Json::parse(t).ok()) {
             for id in token_ids(g.get("eos_token_id")) {
                 if !eos_ids.contains(&id) {
                     eos_ids.push(id);

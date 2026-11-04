@@ -39,7 +39,12 @@ impl Tokenizer {
     pub fn load(path: &Path) -> Result<Tokenizer> {
         let text = fs::read_to_string(path)
             .map_err(|e| Error(format!("cannot read {}: {e}", path.display())))?;
-        let j = Json::parse(&text)?;
+        Tokenizer::from_json(&text)
+    }
+
+    /// From the text of a `tokenizer.json`.
+    pub fn from_json(text: &str) -> Result<Tokenizer> {
+        let j = Json::parse(text)?;
         let model = j
             .get("model")
             .ok_or_else(|| Error::msg("tokenizer.json: no model"))?;
