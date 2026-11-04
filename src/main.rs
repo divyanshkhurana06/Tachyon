@@ -66,6 +66,8 @@ options:
   --port P           port for `serve` (default 8080)
   --host H           address for `serve` (default 127.0.0.1)
   --kv-tokens N      KV cache size for `serve`, shared by all users (default 16384)
+  --swap-tokens N    host memory for preempted requests' caches, in tokens
+                     (default: as much as --kv-tokens; 0 recomputes them)
   --max-seqs N       most requests `serve` runs at once (default 16)
   --json             constrain the reply to a JSON object
   --schema FILE      constrain the reply to JSON matching this JSON Schema
@@ -119,6 +121,7 @@ struct Args {
     file_set: bool,
     lora: Vec<(String, PathBuf)>,
     adapter: Option<String>,
+    swap_tokens: Option<usize>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -165,6 +168,7 @@ fn parse_args() -> Result<Args> {
         file_set: false,
         lora: Vec::new(),
         adapter: None,
+        swap_tokens: None,
     };
     while let Some(flag) = it.next() {
         let mut value = || {
@@ -241,6 +245,7 @@ fn parse_args() -> Result<Args> {
             "--port" => a.port = num(&flag, value()?)?,
             "--host" => a.host = value()?,
             "--kv-tokens" => a.kv_tokens = num(&flag, value()?)?,
+            "--swap-tokens" => a.swap_tokens = Some(num(&flag, value()?)?),
             "--max-seqs" => a.max_seqs = num(&flag, value()?)?,
             "--json" => a.json = true,
             "--schema" => a.schema = Some(value()?.into()),
@@ -805,6 +810,7 @@ fn serve(a: &Args) -> Result<()> {
         SchedulerOptions {
             max_seqs: a.max_seqs.min(128),
             max_seq_len: a.ctx,
+            swap_tokens: a.swap_tokens.unwrap_or(blocks * BLOCK),
         },
     );
     let server = Server {

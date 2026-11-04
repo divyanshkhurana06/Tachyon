@@ -10,7 +10,7 @@ use std::ffi::{c_char, c_void, CStr, CString};
 use std::mem::size_of;
 
 use crate::config::Config;
-use crate::engine::Backend;
+use crate::engine::{copy_blocks, Backend};
 use crate::kernels::{bf16_to_f32, f32_to_f16};
 use crate::kv::{Batch, Logits, BLOCK};
 use crate::lora::{Adapters, Lora};
@@ -798,6 +798,20 @@ impl GpuBackend {
         }
     }
 
+    /// The key (or value) cache's bytes.
+    ///
+    /// # Safety
+    /// No GPU work may be running.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn cache_bytes(&self, keys: bool) -> &mut [u8] {
+        let b = if keys {
+            &self.act.k_cache
+        } else {
+            &self.act.v_cache
+        };
+        std::slice::from_raw_parts_mut(b.contents() as *mut u8, b.len)
+    }
+
     /// Adds each token's LoRA update `B (A x)` to `y`, if this matrix has any.
     fn lora(&self, m: &Option<GpuLora>, x: &Buffer, y: &Buffer, tiles: usize) {
         let Some(m) = m.as_ref().filter(|_| tiles > 0) else {
@@ -1045,6 +1059,61 @@ impl Backend for GpuBackend {
             panic!("GPU command buffer failed: {msg}");
         }
         unsafe { self.act.logits.floats(n * self.lm_head.rows) }
+    }
+
+    fn save_blocks(&mut self, blocks: &[u32]) -> Option<Vec<u8>> {
+        let (block_bytes, n) = (BLOCK * self.cfg.kv_dim() * self.kv_bytes, self.layers.len());
+        let per = n * blocks.len() * block_bytes;
+        let mut packed = vec![0u8; 2 * per];
+        let (k, v) = packed.split_at_mut(per);
+        // Shared memory, and no GPU work runs between forward passes.
+        unsafe {
+            copy_blocks(
+                self.cache_bytes(true),
+                n,
+                self.blocks,
+                block_bytes,
+                blocks,
+                k,
+                true,
+            );
+            copy_blocks(
+                self.cache_bytes(false),
+                n,
+                self.blocks,
+                block_bytes,
+                blocks,
+                v,
+                true,
+            );
+        }
+        Some(packed)
+    }
+
+    fn load_blocks(&mut self, blocks: &[u32], data: &[u8]) {
+        let (block_bytes, n) = (BLOCK * self.cfg.kv_dim() * self.kv_bytes, self.layers.len());
+        let mut packed = data.to_vec();
+        let (k, v) = packed.split_at_mut(data.len() / 2);
+        unsafe {
+            copy_blocks(
+                self.cache_bytes(true),
+                n,
+                self.blocks,
+                block_bytes,
+                blocks,
+                k,
+                false,
+            );
+            copy_blocks(
+                self.cache_bytes(false),
+                n,
+                self.blocks,
+                block_bytes,
+                blocks,
+                v,
+                false,
+            );
+        }
     }
 
     fn load_adapters(&mut self, adapters: Adapters) -> Result<()> {

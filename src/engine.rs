@@ -27,6 +27,61 @@ pub trait Backend: Send {
         let _ = adapters;
         bail!("this backend does not support LoRA adapters")
     }
+
+    /// Copies the keys and values in cache `blocks` out, so a preempted
+    /// sequence can give its blocks up without losing its work (`None` if
+    /// this backend can't).
+    fn save_blocks(&mut self, blocks: &[u32]) -> Option<Vec<u8>> {
+        let _ = blocks;
+        None
+    }
+
+    /// Puts what [`Backend::save_blocks`] returned back, into `blocks`
+    /// (as many as were saved, anywhere in the cache); [`SKIP`] leaves that
+    /// saved block out.
+    fn load_blocks(&mut self, blocks: &[u32], data: &[u8]) {
+        let _ = (blocks, data);
+        unimplemented!("this backend cannot swap")
+    }
+}
+
+/// In [`Backend::load_blocks`], a saved block not to put back.
+pub const SKIP: u32 = u32::MAX;
+
+/// Copies whole cache blocks between a `[layer][block][BLOCK * kv]` cache
+/// of `block_bytes` per (layer, block) and a packed buffer, in (layer, then
+/// block) order. `out`: from the cache into `packed`, or back (except
+/// blocks given as [`SKIP`]).
+pub fn copy_blocks(
+    cache: &mut [u8],
+    layers: usize,
+    blocks_per_layer: usize,
+    block_bytes: usize,
+    blocks: &[u32],
+    packed: &mut [u8],
+    out: bool,
+) {
+    assert_eq!(packed.len(), layers * blocks.len() * block_bytes);
+    let mut at = 0;
+    for l in 0..layers {
+        for &b in blocks {
+            if b == SKIP {
+                at += block_bytes;
+                continue;
+            }
+            let start = (l * blocks_per_layer + b as usize) * block_bytes;
+            let (c, p) = (
+                &mut cache[start..start + block_bytes],
+                &mut packed[at..at + block_bytes],
+            );
+            if out {
+                p.copy_from_slice(c);
+            } else {
+                c.copy_from_slice(p);
+            }
+            at += block_bytes;
+        }
+    }
 }
 
 /// A single sequence: everything generation needs.

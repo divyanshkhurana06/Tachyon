@@ -12,10 +12,12 @@
 //! are not in the cache yet (the whole prompt at first, then the last
 //! sampled token) and feeds as many as the budget allows.
 //!
-//! When the KV cache runs out, the most recently admitted sequence is
-//! preempted: its blocks are released (full ones stay in the prefix cache)
-//! and it re-queues, to be recomputed when there is room. Usually its blocks
-//! are still cached and the recompute is nearly free.
+//! When the KV cache runs out, the least urgent sequence not yet in the step
+//! (lowest priority, then latest to arrive) is preempted: its keys and
+//! values are copied out to host memory, its blocks released, and it
+//! re-queues ahead of its priority class, to be copied back in when there is
+//! room. Without swap space left it is recomputed instead; its full blocks
+//! stay in the prefix cache, so that is often nearly free too.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,7 +27,7 @@ use std::thread;
 use std::time::Instant;
 
 use crate::constrain::Constraint;
-use crate::engine::Backend;
+use crate::engine::{Backend, SKIP};
 use crate::generate::Finish;
 use crate::kv::{Batch, BlockPool, Logits, Seq};
 use crate::sampler::{Sampler, SamplerConfig, TokenLogprob};
@@ -48,6 +50,8 @@ pub struct Request {
     pub logprobs: Option<usize>,
     /// The LoRA adapter to run with (see `lora.rs`), 0 for none.
     pub adapter: u32,
+    /// Lower runs first, as in vLLM; ties go to the earlier request.
+    pub priority: i32,
     /// Special tokens whose text is part of the reply (Granite's
     /// `<|tool_call|>`); others are left out.
     pub visible: Vec<u32>,
@@ -84,6 +88,9 @@ pub struct SchedulerOptions {
     pub max_seqs: usize,
     /// Longest a sequence (prompt plus reply) may get.
     pub max_seq_len: usize,
+    /// Host memory for preempted sequences' caches, in tokens; 0 always
+    /// recomputes them instead.
+    pub swap_tokens: usize,
 }
 
 /// Live numbers, for `/info` and the load test.
@@ -96,6 +103,9 @@ pub struct Stats {
     /// Time inside the model's forward pass, and in whole steps.
     pub forward_ns: std::sync::atomic::AtomicU64,
     pub step_ns: std::sync::atomic::AtomicU64,
+    /// Sequences preempted, and of those, swapped out rather than recomputed.
+    pub preemptions: std::sync::atomic::AtomicU64,
+    pub swaps: std::sync::atomic::AtomicU64,
 }
 
 pub struct Scheduler {
@@ -145,6 +155,15 @@ struct Sequence {
     /// The token just sampled, before it is checked and appended.
     picked: u32,
     picked_logprob: Option<TokenLogprob>,
+    /// A preempted sequence's cache, while it waits to be resumed.
+    swapped: Option<Swapped>,
+}
+
+/// The keys and values of a sequence's first `len` positions, out of the
+/// cache.
+struct Swapped {
+    data: Vec<u8>,
+    len: usize,
 }
 
 impl Sequence {
@@ -170,6 +189,8 @@ struct Worker {
     running: Vec<Sequence>,
     waiting: VecDeque<Sequence>,
     batch: Batch,
+    /// Tokens' worth of swapped-out cache held now.
+    swapped_tokens: usize,
 }
 
 impl Worker {
@@ -189,6 +210,7 @@ impl Worker {
             running: Vec::new(),
             waiting: VecDeque::new(),
             batch: Batch::default(),
+            swapped_tokens: 0,
         }
     }
 
@@ -234,7 +256,7 @@ impl Worker {
             return;
         }
         let sampler = Sampler::new(req.sampler.clone());
-        self.waiting.push_back(Sequence {
+        let s = Sequence {
             tokens: req.prompt.clone(),
             prompt_len: req.prompt.len(),
             req,
@@ -248,12 +270,33 @@ impl Worker {
             batch_steps: 0,
             picked: 0,
             picked_logprob: None,
-        });
+            swapped: None,
+        };
+        self.queue(s, false);
+    }
+
+    /// Queues a sequence by priority: behind the others of its priority, or
+    /// with `first` (a preempted one), ahead of them.
+    fn queue(&mut self, s: Sequence, first: bool) {
+        let p = s.req.priority;
+        let at = self
+            .waiting
+            .iter()
+            .position(|w| w.req.priority > p || (first && w.req.priority == p))
+            .unwrap_or(self.waiting.len());
+        self.waiting.insert(at, s);
     }
 
     fn drop_cancelled(&mut self) {
-        self.waiting
-            .retain(|s| !s.req.cancel.load(Ordering::Relaxed));
+        let mut freed = 0;
+        self.waiting.retain(|s| {
+            let keep = !s.req.cancel.load(Ordering::Relaxed);
+            if !keep {
+                freed += s.swapped.as_ref().map_or(0, |w| w.len);
+            }
+            keep
+        });
+        self.swapped_tokens -= freed;
         let mut i = 0;
         while i < self.running.len() {
             if self.running[i].req.cancel.load(Ordering::Relaxed) {
@@ -271,15 +314,39 @@ impl Worker {
     fn admit(&mut self) {
         while self.running.len() < self.opts.max_seqs {
             let Some(s) = self.waiting.front() else { break };
-            let chunk = s.tokens.len().min(self.backend.max_batch());
+            let restore = s.swapped.as_ref().map_or(0, |w| w.len);
+            let chunk = (s.tokens.len() - restore).min(self.backend.max_batch());
             if !self.running.is_empty()
-                && self.pool.available() < chunk.div_ceil(crate::kv::BLOCK) + 1
+                && self.pool.available() < (restore + chunk).div_ceil(crate::kv::BLOCK) + 1
             {
                 break;
             }
             let mut s = self.waiting.pop_front().unwrap();
-            let seq = self.pool.start_with(&s.tokens, s.req.adapter);
-            s.cached.get_or_insert(seq.len);
+            let seq = match s.swapped.take() {
+                // Swapped out: blocks still in the prefix cache are taken
+                // from there, and the rest copied back in.
+                Some(w) => {
+                    let mut seq = self.pool.start_with(&s.tokens[..w.len], s.req.adapter);
+                    let cached = seq.blocks.len();
+                    if !self.pool.reserve(&mut seq, w.len) {
+                        self.pool.release(seq);
+                        s.swapped = Some(w);
+                        self.waiting.push_front(s);
+                        break;
+                    }
+                    let mut blocks = seq.blocks[..w.len.div_ceil(crate::kv::BLOCK)].to_vec();
+                    blocks[..cached].fill(SKIP);
+                    self.backend.load_blocks(&blocks, &w.data);
+                    seq.len = w.len;
+                    self.swapped_tokens -= w.len;
+                    seq
+                }
+                None => {
+                    let seq = self.pool.start_with(&s.tokens, s.req.adapter);
+                    s.cached.get_or_insert(seq.len);
+                    seq
+                }
+            };
             s.seq = Some(seq);
             self.running.push(s);
         }
@@ -293,22 +360,40 @@ impl Worker {
         }
     }
 
-    /// Frees room by sending the last sequence after `after` back to the
-    /// queue. Only sequences not yet in this step's batch are candidates.
+    /// Frees room by sending a sequence after `after` back to the queue:
+    /// only those not yet in this step's batch are candidates, and of them
+    /// the least urgent goes. Its cache is swapped out if there is room for
+    /// it, or else recomputed later.
     fn preempt(&mut self, after: usize) -> bool {
         if self.running.len() <= after + 1 {
             return false;
         }
-        let mut s = self.running.pop().unwrap();
+        let victim = (after + 1..self.running.len())
+            .max_by_key(|&j| (self.running[j].req.priority, self.running[j].arrived))
+            .unwrap();
+        let mut s = self.running.remove(victim);
+        self.stats.preemptions.fetch_add(1, Ordering::Relaxed);
+        let len = s.seq.as_ref().map_or(0, |q| q.len);
+        if len > 0 && self.swapped_tokens + len <= self.opts.swap_tokens {
+            let seq = s.seq.as_ref().unwrap();
+            let blocks = &seq.blocks[..len.div_ceil(crate::kv::BLOCK)];
+            if let Some(data) = self.backend.save_blocks(blocks) {
+                self.swapped_tokens += len;
+                s.swapped = Some(Swapped { data, len });
+                self.stats.swaps.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         self.release(&mut s);
-        self.waiting.push_front(s);
+        self.queue(s, true);
         true
     }
 
     fn step(&mut self) {
-        // Decoding sequences (one pending token) go first, to keep replies
-        // flowing; prompts fill the rest of the budget.
-        self.running.sort_by_key(|s| s.pending() > 1);
+        // By priority; within one, decoding sequences (one pending token)
+        // go first, to keep replies flowing, and prompts fill the rest of
+        // the budget.
+        self.running
+            .sort_by_key(|s| (s.req.priority, s.pending() > 1));
         let budget = self.backend.max_batch();
         self.batch.clear();
         let mut rows: Vec<usize> = Vec::new(); // running index per logits row

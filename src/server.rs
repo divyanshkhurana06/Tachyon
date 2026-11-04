@@ -72,6 +72,8 @@ impl Server {
             ("waiting", st.waiting.load(Ordering::Relaxed).into()),
             ("steps", st.steps.load(Ordering::Relaxed).into()),
             ("tokens_generated", st.tokens.load(Ordering::Relaxed).into()),
+            ("preemptions", st.preemptions.load(Ordering::Relaxed).into()),
+            ("swaps", st.swaps.load(Ordering::Relaxed).into()),
             (
                 "forward_seconds",
                 (st.forward_ns.load(Ordering::Relaxed) as f64 / 1e9).into(),
@@ -251,6 +253,8 @@ fn handle(mut conn: TcpStream, server: &Server) -> io::Result<()> {
 struct ChatRequest {
     /// Selects a LoRA adapter by name; anything else means the base model.
     model: Option<String>,
+    /// vLLM's `priority`: lower is served first.
+    priority: i32,
     messages: Vec<Message>,
     stream: bool,
     max_tokens: Option<usize>,
@@ -524,6 +528,10 @@ fn parse_chat(body: &[u8], defaults: &SamplerConfig) -> std::result::Result<Chat
     }
     Ok(ChatRequest {
         model: j.get("model").and_then(Json::as_str).map(str::to_string),
+        priority: j
+            .get("priority")
+            .and_then(Json::as_f64)
+            .map_or(0, |p| p.clamp(i32::MIN as f64, i32::MAX as f64) as i32),
         messages,
         stream: j.get("stream").and_then(Json::as_bool).unwrap_or(false),
         max_tokens: j
@@ -667,6 +675,7 @@ fn chat_completion(conn: &mut TcpStream, server: &Server, body: &[u8]) -> io::Re
     server.scheduler.submit(Request {
         adapter: adapter.map_or(0, |i| i as u32 + 1),
         visible: server.template.visible_tokens(),
+        priority: req.priority,
         prompt,
         max_tokens: req.max_tokens.unwrap_or(server.max_tokens).min(room),
         sampler: req.sampler,

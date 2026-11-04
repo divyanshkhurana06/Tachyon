@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::config::Config;
-use crate::engine::Backend;
+use crate::engine::{copy_blocks, Backend};
 use crate::imatrix::{Importance, LayerImportance};
 use crate::kernels::{axpy, dot_f32, rmsnorm, silu};
 use crate::kv::{slot, Batch, BLOCK};
@@ -709,6 +709,64 @@ impl Backend for CpuBackend {
         self.lora = Some(adapters);
         Ok(())
     }
+
+    fn save_blocks(&mut self, blocks: &[u32]) -> Option<Vec<u8>> {
+        let block_bytes = BLOCK * self.cfg.kv_dim() * 4;
+        let per = self.cfg.layers * blocks.len() * block_bytes;
+        let mut packed = vec![0u8; 2 * per];
+        let (k, v) = packed.split_at_mut(per);
+        let n = self.cfg.layers;
+        copy_blocks(
+            bytes(&mut self.k_cache),
+            n,
+            self.blocks,
+            block_bytes,
+            blocks,
+            k,
+            true,
+        );
+        copy_blocks(
+            bytes(&mut self.v_cache),
+            n,
+            self.blocks,
+            block_bytes,
+            blocks,
+            v,
+            true,
+        );
+        Some(packed)
+    }
+
+    fn load_blocks(&mut self, blocks: &[u32], data: &[u8]) {
+        let block_bytes = BLOCK * self.cfg.kv_dim() * 4;
+        let mut packed = data.to_vec();
+        let (k, v) = packed.split_at_mut(data.len() / 2);
+        let n = self.cfg.layers;
+        copy_blocks(
+            bytes(&mut self.k_cache),
+            n,
+            self.blocks,
+            block_bytes,
+            blocks,
+            k,
+            false,
+        );
+        copy_blocks(
+            bytes(&mut self.v_cache),
+            n,
+            self.blocks,
+            block_bytes,
+            blocks,
+            v,
+            false,
+        );
+    }
+}
+
+/// A float buffer's bytes.
+fn bytes(v: &mut [f32]) -> &mut [u8] {
+    // Any bytes are valid floats and u8 has no alignment needs.
+    unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, v.len() * 4) }
 }
 
 #[cfg(test)]
