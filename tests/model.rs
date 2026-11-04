@@ -500,6 +500,68 @@ fn json_schema_output_has_the_requested_shape() {
     }
 }
 
+/// String patterns, formats, lengths and number ranges hold in sampled
+/// output.
+#[test]
+fn json_schema_patterns_and_ranges_hold() {
+    use tachyon::constrain::OutputFormat;
+    use tachyon::json::Json;
+    use tachyon::regex::Regex;
+    use tachyon::schema::{JsonSchema, Schema};
+    let Some((_g, dir)) = setup() else { return };
+    let tok = Tokenizer::load(&dir.join("tokenizer.json")).unwrap();
+    let mut e = cpu(&dir, Format::Q8);
+    let schema = Json::parse(
+        r#"{"type":"object","properties":{
+            "id":{"type":"string","pattern":"[A-Z]{2}-\\d{4}"},
+            "name":{"type":"string","minLength":3,"maxLength":12},
+            "joined":{"type":"string","format":"date"},
+            "age":{"type":"integer","minimum":18,"maximum":65},
+            "rating":{"type":"number","minimum":0,"exclusiveMaximum":5}},
+          "required":["id","name","joined","age","rating"]}"#,
+    )
+    .unwrap();
+    let format = OutputFormat::JsonSchema(JsonSchema::new(Schema::parse(&schema).unwrap()));
+    let id = Regex::new("[A-Z]{2}-\\d{4}").unwrap();
+    let date = Regex::new(tachyon::regex::format_pattern("date").unwrap()).unwrap();
+    for seed in 1..=4 {
+        let opts = GenOptions {
+            max_tokens: 300,
+            sampler: SamplerConfig {
+                temperature: 1.0,
+                seed,
+                ..SamplerConfig::default()
+            },
+            stop_tokens: e.config().eos_ids.clone(),
+            format: format.clone(),
+        };
+        let mut text = String::new();
+        generate(
+            e.as_mut(),
+            &tok,
+            &mut Vec::new(),
+            &prompt(&tok, "Make up an employee record."),
+            &opts,
+            &mut |p| {
+                text.push_str(p);
+                true
+            },
+        )
+        .unwrap();
+        let v = Json::parse(&text).unwrap_or_else(|e| panic!("{e}: {text}"));
+        let s = |k: &str| v.get(k).and_then(Json::as_str).unwrap().to_string();
+        let n = |k: &str| v.get(k).and_then(Json::as_f64).unwrap();
+        assert!(id.is_match(&s("id")), "{text}");
+        assert!((3..=12).contains(&s("name").chars().count()), "{text}");
+        assert!(date.is_match(&s("joined")), "{text}");
+        assert!(
+            (18.0..=65.0).contains(&n("age")) && n("age").fract() == 0.0,
+            "{text}"
+        );
+        assert!((0.0..5.0).contains(&n("rating")), "{text}");
+    }
+}
+
 /// A forced call: the reply opens with <tool_call> and the arguments are
 /// constrained to the function's schema, so they always fit it.
 #[test]

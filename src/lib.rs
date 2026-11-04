@@ -27,6 +27,7 @@ pub mod kv;
 pub mod lora;
 pub mod model;
 pub mod pool;
+pub mod regex;
 pub mod safetensors;
 pub mod sampler;
 pub mod scheduler;

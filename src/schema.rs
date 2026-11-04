@@ -10,14 +10,19 @@
 //! Supported: `type` (object, array, string, integer, number, boolean,
 //! null, or a list of them), `properties` (written in schema order; those
 //! not listed in `required` may be left out), `items`, `minItems`, `maxItems`,
-//! `enum`, `const`, `anyOf`/`oneOf`, and `$ref` into `$defs`. Alternatives
-//! in a union are told apart by their first byte, so "string or null"
-//! works but "integer or number" commits to the first.
+//! `enum`, `const`, `anyOf`/`oneOf`, and `$ref` into `$defs`; for strings
+//! `minLength`, `maxLength`, `pattern` (matching the whole string, see
+//! `regex.rs`) and the formats date, time, date-time, uuid, email and
+//! ipv4; for numbers `minimum`, `maximum` and their exclusive forms
+//! (bounded numbers are written without an exponent). Alternatives in a
+//! union are told apart by their first byte, so "string or null" works but
+//! "integer or number" commits to the first.
 
 use std::sync::Arc;
 
 use crate::constrain::Constraint;
 use crate::json::Json;
+use crate::regex::{format_pattern, Live, Regex};
 use crate::tokenizer::Tokenizer;
 use crate::{bail, Error, Result};
 
@@ -35,13 +40,111 @@ enum Node {
         min: usize,
         max: Option<usize>,
     },
-    String,
+    String {
+        /// Length limits, in characters.
+        min: usize,
+        max: Option<usize>,
+        pattern: Option<Arc<Regex>>,
+    },
     Number {
         integer: bool,
+        bounds: Option<Bounds>,
     },
     /// One of these exact JSON texts (enum, const, booleans, null).
     Literals(Vec<Vec<u8>>),
     Union(Vec<usize>),
+}
+
+/// A number's allowed range; an exclusive end is not itself allowed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Bounds {
+    lo: f64,
+    hi: f64,
+    lo_open: bool,
+    hi_open: bool,
+}
+
+impl Bounds {
+    /// `minimum`, `maximum` and `exclusiveMinimum`/`exclusiveMaximum`, as
+    /// numbers (draft 6 on) or as flags on the others (draft 4).
+    fn of(s: &Json) -> Result<Option<Bounds>> {
+        let num = |k: &str| s.get(k).and_then(Json::as_f64);
+        let mut b = Bounds {
+            lo: num("minimum").unwrap_or(f64::NEG_INFINITY),
+            hi: num("maximum").unwrap_or(f64::INFINITY),
+            lo_open: false,
+            hi_open: false,
+        };
+        match s.get("exclusiveMinimum") {
+            Some(Json::Bool(open)) => b.lo_open = *open,
+            Some(Json::Num(x)) if *x >= b.lo => (b.lo, b.lo_open) = (*x, true),
+            _ => {}
+        }
+        match s.get("exclusiveMaximum") {
+            Some(Json::Bool(open)) => b.hi_open = *open,
+            Some(Json::Num(x)) if *x <= b.hi => (b.hi, b.hi_open) = (*x, true),
+            _ => {}
+        }
+        if b.lo > b.hi || (b.lo == b.hi && (b.lo_open || b.hi_open)) {
+            bail!("the number range is empty");
+        }
+        Ok((b.lo.is_finite() || b.hi.is_finite()).then_some(b))
+    }
+
+    fn contains(&self, v: f64) -> bool {
+        (if self.lo_open {
+            v > self.lo
+        } else {
+            v >= self.lo
+        }) && (if self.hi_open {
+            v < self.hi
+        } else {
+            v <= self.hi
+        })
+    }
+
+    /// Whether a number written so far as `text` (in state `state`) can
+    /// still end inside the range: the magnitudes its completions can take
+    /// are intervals, checked against the range (taking ends as closed).
+    fn reachable(&self, text: &[u8], state: Num, integer: bool) -> bool {
+        let neg = text.first() == Some(&b'-');
+        let (lo, hi) = if neg {
+            ((-self.hi).max(0.0), -self.lo)
+        } else {
+            (self.lo.max(0.0), self.hi)
+        };
+        if lo > hi {
+            return false;
+        }
+        let digits = std::str::from_utf8(&text[neg as usize..]).unwrap_or("");
+        let (int, frac) = digits.split_once('.').unwrap_or((digits, ""));
+        let d: f64 = int.parse().unwrap_or(0.0);
+        // Completions span [a, z): open at z unless integer.
+        let meets = |a: f64, z: f64| a <= hi && (z > lo || a >= lo);
+        match state {
+            Num::Minus => true,
+            Num::Zero if integer => lo <= 0.0,
+            Num::Zero => meets(0.0, 1.0),
+            Num::Int => {
+                // More integer digits: [d * 10^j, (d + 1) * 10^j) for each j.
+                let mut p = 1.0;
+                while d * p <= hi && p < 1e40 {
+                    let z = (d + 1.0) * p;
+                    if if integer { z - 1.0 >= lo } else { z > lo } {
+                        return true;
+                    }
+                    p *= 10.0;
+                }
+                false
+            }
+            Num::Dot => meets(d, d + 1.0),
+            Num::Frac => {
+                let v: f64 = format!("{int}.{frac}").parse().unwrap_or(0.0);
+                meets(v, v + 10f64.powi(-(frac.len() as i32)))
+            }
+            _ => true,
+        }
+    }
 }
 
 /// Node 0 is always `Any` and node 1 an array of anything.
@@ -182,9 +285,29 @@ impl Builder<'_> {
                 }
                 Node::Array { items, min, max }
             }
-            "string" => Node::String,
-            "integer" => Node::Number { integer: true },
-            "number" => Node::Number { integer: false },
+            "string" => {
+                let min = s.get("minLength").and_then(Json::as_usize).unwrap_or(0);
+                let max = s.get("maxLength").and_then(Json::as_usize);
+                if max.is_some_and(|m| m < min) {
+                    bail!("maxLength is below minLength");
+                }
+                let pattern = match s.get("pattern").and_then(Json::as_str) {
+                    Some(p) => Some(p),
+                    None => s
+                        .get("format")
+                        .and_then(Json::as_str)
+                        .and_then(format_pattern),
+                };
+                Node::String {
+                    min,
+                    max,
+                    pattern: pattern.map(Regex::new).transpose()?.map(Arc::new),
+                }
+            }
+            "integer" | "number" => Node::Number {
+                integer: t == "integer",
+                bounds: Bounds::of(s)?,
+            },
             "boolean" => Node::Literals(vec![b"true".to_vec(), b"false".to_vec()]),
             "null" => Node::Literals(vec![b"null".to_vec()]),
             other => bail!("unsupported type {other:?}"),
@@ -240,16 +363,33 @@ enum Frame {
     Str {
         escape: bool,
         hex: u8,
+        /// For strings with a length or pattern to keep to.
+        check: Option<Box<StrCheck>>,
     },
     Num {
         state: Num,
         len: u8,
         integer: bool,
+        /// A bounded number, and its text so far.
+        bounds: Option<Bounds>,
+        text: Vec<u8>,
     },
     Lit {
         options: Vec<Vec<u8>>,
         pos: usize,
     },
+}
+
+/// A checked string's progress: characters so far, the pattern's live
+/// states, and a character being assembled from UTF-8 bytes or a `\u`
+/// escape.
+#[derive(Debug, Clone)]
+struct StrCheck {
+    node: usize,
+    chars: usize,
+    live: Live,
+    code: u32,
+    utf8: u8,
 }
 
 const MAX_WHITESPACE: u8 = 16;
@@ -303,8 +443,9 @@ impl JsonSchema {
                 b'"' => self.push(Frame::Str {
                     escape: false,
                     hex: 0,
+                    check: None,
                 }),
-                b'-' | b'0'..=b'9' => self.start_number(false, b),
+                b'-' | b'0'..=b'9' => self.start_number(false, None, b),
                 _ => self.start_literals(
                     vec![b"true".to_vec(), b"false".to_vec(), b"null".to_vec()],
                     b,
@@ -329,16 +470,27 @@ impl JsonSchema {
                         stage: Stage::Open,
                     })
             }
-            Node::String => {
+            Node::String { min, max, pattern } => {
+                let checked = *min > 0 || max.is_some() || pattern.is_some();
+                let check = checked.then(|| {
+                    Box::new(StrCheck {
+                        node,
+                        chars: 0,
+                        live: pattern.as_ref().map(|r| r.start()).unwrap_or_default(),
+                        code: 0,
+                        utf8: 0,
+                    })
+                });
                 b == b'"'
                     && self.push(Frame::Str {
                         escape: false,
                         hex: 0,
+                        check,
                     })
             }
-            Node::Number { integer } => {
-                let integer = *integer;
-                matches!(b, b'-' | b'0'..=b'9') && self.start_number(integer, b)
+            Node::Number { integer, bounds } => {
+                let (integer, bounds) = (*integer, *bounds);
+                matches!(b, b'-' | b'0'..=b'9') && self.start_number(integer, bounds, b)
             }
             Node::Literals(options) => {
                 let options = options.clone();
@@ -357,16 +509,26 @@ impl JsonSchema {
         }
     }
 
-    fn start_number(&mut self, integer: bool, b: u8) -> bool {
+    fn start_number(&mut self, integer: bool, bounds: Option<Bounds>, b: u8) -> bool {
         let state = match b {
             b'-' => Num::Minus,
             b'0' => Num::Zero,
             _ => Num::Int,
         };
+        let text = if bounds.is_some() {
+            vec![b]
+        } else {
+            Vec::new()
+        };
+        if bounds.is_some_and(|r| !r.reachable(&text, state, integer)) {
+            return false;
+        }
         self.push(Frame::Num {
             state,
             len: 1,
             integer,
+            bounds,
+            text,
         })
     }
 
@@ -409,7 +571,92 @@ impl JsonSchema {
                     }
                     return !keys.is_empty();
                 }
-                Frame::Str { escape, hex } => {
+                Frame::Str {
+                    escape,
+                    hex,
+                    check: Some(ck),
+                } => {
+                    let Node::String { min, max, pattern } = &schema.nodes[ck.node] else {
+                        unreachable!()
+                    };
+                    let room = max.is_none_or(|m| ck.chars < m);
+                    // One more character: within the length, and the
+                    // pattern still alive.
+                    let feed = |ck: &mut StrCheck, c: Option<char>| {
+                        let Some(c) = c else { return false };
+                        ck.chars += 1;
+                        if max.is_some_and(|m| ck.chars > m) {
+                            return false;
+                        }
+                        match pattern {
+                            Some(r) => {
+                                ck.live = r.step(&ck.live, c);
+                                !ck.live.is_empty()
+                            }
+                            None => true,
+                        }
+                    };
+                    if ck.utf8 > 0 {
+                        if b & 0xC0 != 0x80 {
+                            return false;
+                        }
+                        ck.code = ck.code << 6 | (b & 0x3F) as u32;
+                        ck.utf8 -= 1;
+                        return ck.utf8 > 0 || feed(ck, char::from_u32(ck.code));
+                    }
+                    if *hex > 0 {
+                        let Some(d) = (b as char).to_digit(16) else {
+                            return false;
+                        };
+                        ck.code = ck.code * 16 + d;
+                        *hex -= 1;
+                        return *hex > 0 || feed(ck, char::from_u32(ck.code));
+                    }
+                    if *escape {
+                        *escape = false;
+                        let c = match b {
+                            b'"' => '"',
+                            b'\\' => '\\',
+                            b'/' => '/',
+                            b'b' => '\x08',
+                            b'f' => '\x0c',
+                            b'n' => '\n',
+                            b'r' => '\r',
+                            b't' => '\t',
+                            b'u' => {
+                                (*hex, ck.code) = (4, 0);
+                                return true;
+                            }
+                            _ => return false,
+                        };
+                        return feed(ck, Some(c));
+                    }
+                    return match b {
+                        b'"' => {
+                            let done = ck.chars >= *min
+                                && pattern.as_ref().is_none_or(|r| r.accepts(&ck.live));
+                            if done {
+                                self.pop();
+                            }
+                            done
+                        }
+                        b'\\' => {
+                            *escape = true;
+                            room
+                        }
+                        0x20..=0x7F => feed(ck, Some(b as char)),
+                        0xC2..=0xF4 => {
+                            (ck.utf8, ck.code) = match b {
+                                0xF0.. => (3, (b & 0x07) as u32),
+                                0xE0.. => (2, (b & 0x0F) as u32),
+                                _ => (1, (b & 0x1F) as u32),
+                            };
+                            room && pattern.as_ref().is_none_or(|r| r.wants_non_ascii(&ck.live))
+                        }
+                        _ => false,
+                    };
+                }
+                Frame::Str { escape, hex, .. } => {
                     return match (*escape, *hex) {
                         (_, n) if n > 0 => {
                             *hex = n - 1;
@@ -438,6 +685,8 @@ impl JsonSchema {
                     state,
                     len,
                     integer,
+                    bounds,
+                    text,
                 } => {
                     let digit = b.is_ascii_digit();
                     let next = match (*state, b) {
@@ -446,7 +695,9 @@ impl JsonSchema {
                         (Num::Zero | Num::Int, b'.') if !*integer => Some(Num::Dot),
                         (Num::Int, _) if digit => Some(Num::Int),
                         (Num::Dot | Num::Frac, _) if digit => Some(Num::Frac),
-                        (Num::Zero | Num::Int | Num::Frac, b'e' | b'E') if !*integer => {
+                        (Num::Zero | Num::Int | Num::Frac, b'e' | b'E')
+                            if !*integer && bounds.is_none() =>
+                        {
                             Some(Num::Exp)
                         }
                         (Num::Exp, b'+' | b'-') => Some(Num::ExpSign),
@@ -458,10 +709,22 @@ impl JsonSchema {
                     if let Some(next) = next {
                         *state = next;
                         *len += 1;
+                        if let Some(r) = bounds {
+                            text.push(b);
+                            if !r.reachable(text, next, *integer) {
+                                return false;
+                            }
+                        }
                         return *len <= MAX_NUMBER;
                     }
                     if !matches!(state, Num::Zero | Num::Int | Num::Frac | Num::ExpDigits) {
                         return false;
+                    }
+                    if let Some(r) = bounds {
+                        let v = std::str::from_utf8(text).ok().and_then(|t| t.parse().ok());
+                        if !v.is_some_and(|v| r.contains(v)) {
+                            return false;
+                        }
                     }
                     self.pop(); // the number ended; `b` belongs to the parent
                     continue;
@@ -555,6 +818,7 @@ impl JsonSchema {
                         self.push(Frame::Str {
                             escape: false,
                             hex: 0,
+                            check: None,
                         })
                     }
                     (Stage::Colon, b':') => {
@@ -728,5 +992,81 @@ mod tests {
         ] {
             assert!(Schema::parse(&Json::parse(s).unwrap()).is_err(), "{s}");
         }
+    }
+
+    #[test]
+    fn string_lengths_patterns_and_formats() {
+        let m = matcher(
+            r#"{"type":"object","properties":{
+                "code":{"type":"string","pattern":"^[A-Z]{3}-\\d{2}$"},
+                "name":{"type":"string","minLength":2,"maxLength":4},
+                "day":{"type":"string","format":"date"}},
+              "required":["code","name","day"]}"#,
+        );
+        let ok = r#"{"code":"ABC-12","name":"Ada","day":"2026-11-05"}"#;
+        assert_eq!(check(&m, ok), (true, true));
+        for bad in [
+            r#"{"code":"A1"#,                                  // a digit where a letter must be
+            r#"{"code":"abc"#,                                 // lower case
+            r#"{"code":"ABC-123"#,                             // too long for the pattern
+            r#"{"code":"ABC-1""#,                              // ends early
+            r#"{"code":"ABC-12","name":"A""#,                  // shorter than minLength
+            r#"{"code":"ABC-12","name":"Grace"#,               // longer than maxLength
+            r#"{"code":"ABC-12","name":"Ada","day":"2026-13"#, // month 13
+            r#"{"code":"ABC-12","name":"Ada","day":"Nov"#,
+        ] {
+            assert!(!check(&m, bad).0, "{bad}");
+        }
+        // Escapes and multi-byte characters count as one character each.
+        let m = matcher(r#"{"type":"string","maxLength":3,"pattern":"[^x]*"}"#);
+        assert_eq!(check(&m, r#""a\né""#), (true, true));
+        assert_eq!(check(&m, r#""é\"b""#), (true, true));
+        assert!(!check(&m, r#""abcd"#).0);
+        assert!(!check(&m, r#""x"#).0); // an escaped x is still x
+                                        // An ASCII-only pattern refuses a multi-byte character at its first byte.
+        let m = matcher(r#"{"type":"string","pattern":"[a-z]+"}"#);
+        assert!(!m.accepts_bytes("\"\u{e9}".as_bytes()[..2].as_ref()));
+    }
+
+    #[test]
+    fn number_ranges() {
+        let m = matcher(
+            r#"{"type":"object","properties":{
+                "age":{"type":"integer","minimum":0,"maximum":120},
+                "score":{"type":"number","exclusiveMinimum":-1,"maximum":1}},
+              "required":["age","score"]}"#,
+        );
+        for ok in [
+            r#"{"age":0,"score":-0.5}"#,
+            r#"{"age":120,"score":1}"#,
+            r#"{"age":37,"score":0.999}"#,
+            r#"{"age":7,"score":-0.0001}"#,
+        ] {
+            assert_eq!(check(&m, ok), (true, true), "{ok}");
+        }
+        for bad in [
+            r#"{"age":-1"#,            // below the minimum ("-0" is 0, so allowed)
+            r#"{"age":121"#,           // above the maximum
+            r#"{"age":1000"#,          // can only grow
+            r#"{"age":12.5"#,          // an integer
+            r#"{"age":5,"score":-1,"#, // the exclusive minimum itself
+            r#"{"age":5,"score":2"#,
+            r#"{"age":5,"score":1.5"#,
+            r#"{"age":5,"score":1e"#, // no exponents when bounded
+        ] {
+            assert!(!check(&m, bad).0, "{bad}");
+        }
+        // Prefixes that can still reach the range are allowed.
+        let m = matcher(
+            r#"{"type":"object","properties":{"n":{"type":"integer","minimum":500,"maximum":600}},"required":["n"]}"#,
+        );
+        assert!(m.accepts_bytes(br#"{"n":5"#));
+        assert!(!m.accepts_bytes(br#"{"n":7"#));
+        assert!(!m.accepts_bytes(br#"{"n":5}"#));
+        assert!(check(&m, r#"{"n":512}"#).1);
+        assert!(Schema::parse(
+            &Json::parse(r#"{"type":"integer","minimum":3,"maximum":2}"#).unwrap()
+        )
+        .is_err());
     }
 }
