@@ -48,6 +48,9 @@ pub struct Request {
     pub logprobs: Option<usize>,
     /// The LoRA adapter to run with (see `lora.rs`), 0 for none.
     pub adapter: u32,
+    /// Special tokens whose text is part of the reply (Granite's
+    /// `<|tool_call|>`); others are left out.
+    pub visible: Vec<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -433,7 +436,7 @@ impl Worker {
             if let Some(c) = &mut s.req.constraint {
                 c.advance(self.tok.token_bytes(next));
             }
-            if !self.tok.is_special(next) {
+            if !self.tok.is_special(next) || s.req.visible.contains(&next) {
                 let piece = s.text.push(self.tok.token_bytes(next));
                 if !piece.is_empty() && !s.send(Event::Text(piece)) {
                     finished.push((idx, Finish::Cancelled));

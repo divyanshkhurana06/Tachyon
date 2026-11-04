@@ -291,6 +291,7 @@ fn call_schema(
     tools: &[Json],
     choice: &ToolChoice,
     key: &str,
+    as_list: bool,
 ) -> std::result::Result<Schema, String> {
     let any_object = obj([("type", "object".into())]);
     let (name, arguments) = match choice {
@@ -319,6 +320,17 @@ fn call_schema(
         ),
         ("required", Json::Arr(vec!["name".into(), key.into()])),
     ]);
+    // Granite calls are a list: `[{"name": ..., "arguments": ...}]`.
+    let schema = if as_list {
+        obj([
+            ("type", "array".into()),
+            ("items", schema),
+            ("minItems", 1usize.into()),
+            ("maxItems", 1usize.into()),
+        ])
+    } else {
+        schema
+    };
     Schema::parse(&schema).map_err(|e| format!("bad tool parameters: {e}"))
 }
 
@@ -624,7 +636,12 @@ fn chat_completion(conn: &mut TcpStream, server: &Server, body: &[u8]) -> io::Re
     let format = if forced {
         server.template.open_call(&server.tok, &mut prompt);
         let key = server.template.arguments_key();
-        match call_schema(&req.tools, &req.tool_choice, key) {
+        match call_schema(
+            &req.tools,
+            &req.tool_choice,
+            key,
+            server.template.calls_as_list(),
+        ) {
             Ok(schema) => OutputFormat::JsonSchema(JsonSchema::new(schema)),
             Err(e) => return error(conn, "400 Bad Request", &e),
         }
@@ -649,6 +666,7 @@ fn chat_completion(conn: &mut TcpStream, server: &Server, body: &[u8]) -> io::Re
     let cancel = Arc::new(AtomicBool::new(false));
     server.scheduler.submit(Request {
         adapter: adapter.map_or(0, |i| i as u32 + 1),
+        visible: server.template.visible_tokens(),
         prompt,
         max_tokens: req.max_tokens.unwrap_or(server.max_tokens).min(room),
         sampler: req.sampler,
@@ -725,8 +743,9 @@ fn chat_completion(conn: &mut TcpStream, server: &Server, body: &[u8]) -> io::Re
                 if let Some(buf) = held.as_mut() {
                     buf.push_str(&piece);
                     let start = buf.trim_start();
-                    let opener = server.template.call_opener();
-                    if forced || start.starts_with(opener) || opener.starts_with(start) {
+                    let openers = server.template.call_openers();
+                    let maybe = |o: &&str| start.starts_with(o) || o.starts_with(start);
+                    if forced || openers.iter().any(maybe) {
                         continue; // a call, or still might be
                     }
                     piece = held.take().unwrap();

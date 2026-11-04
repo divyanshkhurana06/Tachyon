@@ -23,7 +23,8 @@
 //! ```
 //!
 //! and Granite's, `<|start_of_role|>user<|end_of_role|>Hi!<|end_of_text|>`
-//! with a newline after each turn and a default system message.
+//! with a newline after each turn and a default system message. Each
+//! family also has its own way of offering tools and of calling them.
 //!
 //! Control tokens are inserted by id; message text is encoded with added
 //! tokens disabled, so a user typing `<|im_start|>` cannot forge a turn.
@@ -129,6 +130,8 @@ pub struct ChatTemplate {
     after_end: Vec<u32>,
     /// Llama 3's `<|begin_of_text|>`.
     bos: Option<u32>,
+    /// Granite's `<|tool_call|>`, which starts a reply's list of calls.
+    tool_call: Option<u32>,
 }
 
 impl ChatTemplate {
@@ -143,6 +146,7 @@ impl ChatTemplate {
                 end,
                 after_end: tok.encode("\n", false),
                 bos: None,
+                tool_call: None,
             });
         }
         if let (Some(start), Some(end_header), Some(end)) = (
@@ -157,6 +161,7 @@ impl ChatTemplate {
                 end,
                 after_end: Vec::new(),
                 bos: id("<|begin_of_text|>"),
+                tool_call: None,
             });
         }
         if let (Some(start), Some(end_header), Some(end)) = (
@@ -171,6 +176,7 @@ impl ChatTemplate {
                 end,
                 after_end: tok.encode("\n", false),
                 bos: None,
+                tool_call: id("<|tool_call|>"),
             });
         }
         Err(Error::msg(
@@ -183,19 +189,32 @@ impl ChatTemplate {
         self.end
     }
 
-    /// Whether tool calling is implemented for this format (not yet for
-    /// Granite's).
+    /// Whether tool calling is implemented for this format.
     pub fn supports_tools(&self) -> bool {
-        self.style != Style::Granite
+        self.style != Style::Granite || self.tool_call.is_some()
     }
 
     /// What a reply that calls a tool starts with: Qwen's `<tool_call>`
-    /// block, or the bare JSON object Llama 3 answers with.
-    pub fn call_opener(&self) -> &'static str {
+    /// block, the bare JSON object Llama 3 answers with, or Granite's
+    /// `<|tool_call|>` and a list (which its models also write out as plain
+    /// `<tool_call>`, as vLLM's parser allows).
+    pub fn call_openers(&self) -> &'static [&'static str] {
         match self.style {
-            Style::ChatMl | Style::Granite => "<tool_call>",
-            Style::Llama3 => "{",
+            Style::ChatMl => &["<tool_call>"],
+            Style::Llama3 => &["{"],
+            Style::Granite => &["<|tool_call|>", "<tool_call>"],
         }
+    }
+
+    /// Special tokens whose text belongs in a reply: Granite's
+    /// `<|tool_call|>`, which marks a reply as calls.
+    pub fn visible_tokens(&self) -> Vec<u32> {
+        self.tool_call.into_iter().collect()
+    }
+
+    /// Whether calls come as a JSON list (Granite) rather than one object.
+    pub fn calls_as_list(&self) -> bool {
+        self.style == Style::Granite
     }
 
     /// The key a call's arguments go under.
@@ -209,8 +228,10 @@ impl ChatTemplate {
     /// Starts a reply that must be a call; the rest is constrained to the
     /// call's JSON.
     pub fn open_call(&self, tok: &Tokenizer, out: &mut Vec<u32>) {
-        if self.style == Style::ChatMl {
-            out.extend(tok.encode("<tool_call>\n", true));
+        match self.style {
+            Style::ChatMl => out.extend(tok.encode("<tool_call>\n", true)),
+            Style::Granite => out.extend(self.tool_call),
+            Style::Llama3 => {}
         }
     }
 
@@ -223,7 +244,31 @@ impl ChatTemplate {
                 parse_tool_calls(&format!("<tool_call>{text}</tool_call>")).1,
             ),
             Style::ChatMl => parse_tool_calls(text),
-            Style::Granite => (text.to_string(), Vec::new()),
+            Style::Granite => {
+                let found = ["<|tool_call|>", "<tool_call>"]
+                    .iter()
+                    .filter_map(|m| text.split_once(m))
+                    .min_by_key(|(before, _)| before.len());
+                let (content, list) = match found {
+                    _ if opened => ("", text),
+                    Some(split) => split,
+                    None => return (text.to_string(), Vec::new()),
+                };
+                let calls: Vec<ToolCall> = match Json::parse(list.trim()) {
+                    Ok(Json::Arr(items)) => items
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, v)| call_from_json(v, i))
+                        .collect(),
+                    Ok(v) => call_from_json(&v, 0).into_iter().collect(),
+                    Err(_) => Vec::new(),
+                };
+                if calls.is_empty() {
+                    (text.to_string(), calls)
+                } else {
+                    (content.trim().to_string(), calls)
+                }
+            }
             Style::Llama3 => match Json::parse(text.trim())
                 .ok()
                 .and_then(|v| call_from_json(&v, 0))
@@ -270,12 +315,7 @@ impl ChatTemplate {
                 self.close_turn(out);
             }
             Style::Granite => {
-                // Its template's default system message, dated like it.
-                let (day, month, year) = civil(today());
-                let default = format!(
-                    "Knowledge Cutoff Date: April 2024.\nToday's Date: {} {day:02}, {year}.\nYou are Granite, developed by IBM.",
-                    MONTH_NAMES[month - 1]
-                );
+                let default = granite_system(" You are a helpful AI assistant.");
                 self.push(tok, out, "system", system.unwrap_or(&default));
             }
         }
@@ -327,7 +367,7 @@ impl ChatTemplate {
         }
         match self.style {
             Style::Llama3 => return self.encode_llama_tools(tok, messages, system, tools),
-            Style::Granite => return self.encode(tok, messages, system),
+            Style::Granite => return self.encode_granite_tools(tok, messages, system, tools),
             Style::ChatMl => {}
         }
         let mut out = Vec::new();
@@ -469,6 +509,67 @@ impl ChatTemplate {
         out
     }
 
+    /// Tools as Granite 3.1's template renders them: a sentence about them
+    /// in the default system message, their definitions (indented JSON) in
+    /// a `tools` turn, and calls as `<|tool_call|>` and a JSON list. Its
+    /// template writes no assistant calls back, so they are written as the
+    /// model made them; results go in `tool_response` turns.
+    fn encode_granite_tools(
+        &self,
+        tok: &Tokenizer,
+        messages: &[Message],
+        system: Option<&str>,
+        tools: &[Json],
+    ) -> Vec<u32> {
+        let (system, rest) = match messages.first() {
+            Some(m) if m.role == "system" => (Some(m.content.as_str()), &messages[1..]),
+            _ => (system, messages),
+        };
+        let mut out = Vec::new();
+        self.header(tok, &mut out, "system");
+        match system {
+            Some(s) => out.extend(tok.encode(s, false)),
+            // The template's own text, which names <|tool_call|> (the token).
+            None if !tools.is_empty() => {
+                out.extend(tok.encode(&granite_system(GRANITE_TOOLS), true))
+            }
+            None => {
+                out.extend(tok.encode(&granite_system(" You are a helpful AI assistant."), false))
+            }
+        }
+        self.close_turn(&mut out);
+        if !tools.is_empty() {
+            self.header(tok, &mut out, "tools");
+            out.extend(tok.encode(&Json::Arr(tools.to_vec()).to_indented_string(4), false));
+            self.close_turn(&mut out);
+        }
+        for m in rest {
+            match m.role.as_str() {
+                "assistant" if !m.tool_calls.is_empty() => {
+                    self.header(tok, &mut out, "assistant");
+                    out.extend(tok.encode(&m.content, false));
+                    out.extend(self.tool_call);
+                    let calls: Vec<Json> = m
+                        .tool_calls
+                        .iter()
+                        .map(|c| {
+                            Json::Obj(vec![
+                                ("name".into(), Json::Str(c.name.clone())),
+                                ("arguments".into(), c.arguments.clone()),
+                            ])
+                        })
+                        .collect();
+                    out.extend(tok.encode(&Json::Arr(calls).to_spaced_string(), false));
+                    self.close_turn(&mut out);
+                }
+                "tool" => self.push(tok, &mut out, "tool_response", &m.content),
+                role => self.push(tok, &mut out, role, &m.content),
+            }
+        }
+        self.open_assistant(tok, &mut out);
+        out
+    }
+
     pub fn open_assistant(&self, tok: &Tokenizer, out: &mut Vec<u32>) {
         match self.style {
             Style::ChatMl => {
@@ -495,6 +596,18 @@ impl ChatTemplate {
         out.push(self.end);
         out.extend_from_slice(&self.after_end);
     }
+}
+
+const GRANITE_TOOLS: &str = " You are a helpful AI assistant with access to the following tools. When a tool is required to answer the user's query, respond with <|tool_call|> followed by a JSON list of tools used. If a tool does not exist in the provided list of tools, notify the user that you do not have the ability to fulfill the request.";
+
+/// Granite's default system message, dated as its template dates it, then
+/// `tail`.
+fn granite_system(tail: &str) -> String {
+    let (day, month, year) = civil(today());
+    format!(
+        "Knowledge Cutoff Date: April 2024.\nToday's Date: {} {day:02}, {year}.\nYou are Granite, developed by IBM.{tail}",
+        MONTH_NAMES[month - 1]
+    )
 }
 
 /// Days since 1970-01-01, UTC. The browser build has no clock, so it uses
