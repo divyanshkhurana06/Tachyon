@@ -1,6 +1,7 @@
 //! Inner loops: a dot product for each weight format, quantizers, and the
 //! small element-wise ops around them. NEON intrinsics on aarch64 (every
-//! Apple Silicon Mac), plain Rust elsewhere.
+//! Apple Silicon Mac), AVX2 on x86-64, SIMD128 in the browser, plain Rust
+//! elsewhere.
 //!
 //! Quantized formats store weights in blocks of [`QK`] values sharing one f32
 //! scale. Activations are quantized to 8 bits on the fly so the inner loop is
@@ -257,6 +258,7 @@ pub use neon::{
 };
 #[cfg(not(any(
     target_arch = "aarch64",
+    target_arch = "x86_64",
     all(target_arch = "wasm32", target_feature = "simd128")
 )))]
 pub use scalar::{
@@ -270,6 +272,15 @@ pub use wasm::{dot_bf16, dot_f32, dot_q4, dot_q4_x4, dot_q8, dot_q8_x4};
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 #[path = "kernels_wasm.rs"]
 mod wasm;
+
+#[cfg(target_arch = "x86_64")]
+pub use scalar::{dot2_q4_pairs, dot2_q8_pairs, has_i8mm};
+#[cfg(target_arch = "x86_64")]
+pub use x86::{dot_bf16, dot_f32, dot_q4, dot_q4_x4, dot_q8, dot_q8_x4};
+
+#[cfg(target_arch = "x86_64")]
+#[path = "kernels_x86.rs"]
+mod x86;
 
 #[cfg(target_arch = "aarch64")]
 mod neon {

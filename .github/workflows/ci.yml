@@ -52,3 +52,35 @@ jobs:
             done
             exit 1
           }
+
+  # x86-64 Linux: the AVX2 kernels, and everything but Metal.
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Toolchain
+        run: |
+          rustup toolchain install 1.87.0 --profile minimal --component clippy
+          rustup default 1.87.0
+          rustc --version
+          grep -m1 -o -w 'avx2' /proc/cpuinfo && grep -m1 -o -w 'fma' /proc/cpuinfo
+
+      - name: Cache the test model
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: qwen2.5-0.5b-instruct-v1
+
+      - name: Download the test model
+        run: |
+          mkdir -p models/qwen2.5-0.5b-instruct && cd models/qwen2.5-0.5b-instruct
+          for f in config.json generation_config.json tokenizer.json model.safetensors; do
+            [ -f "$f" ] || curl -sSfLO "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/$f"
+          done
+
+      - name: Lint
+        run: cargo clippy --release --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --release
