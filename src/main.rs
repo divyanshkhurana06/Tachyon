@@ -73,6 +73,10 @@ options:
                      the memory and measured lossless)
   --no-think         Qwen3: answer directly, without a <think> block
   --imatrix FILE     fit 4-bit weights to this importance matrix (from `calibrate`)
+  --lora NAME=DIR    load a LoRA adapter (PEFT format); repeat for more. `serve`
+                     runs a request with the adapter its `model` names;
+                     `run` and `chat` use --adapter, or the first
+  --adapter NAME     which adapter `run` and `chat` use
   --out FILE         where `calibrate` writes (default <model>/imatrix.bin)
   --url URL          server for `loadtest` (default http://127.0.0.1:8080)
   --clients LIST     concurrency levels for `loadtest` (default 1,4,16)
@@ -113,6 +117,8 @@ struct Args {
     imatrix: Option<PathBuf>,
     out: Option<PathBuf>,
     file_set: bool,
+    lora: Vec<(String, PathBuf)>,
+    adapter: Option<String>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -157,6 +163,8 @@ fn parse_args() -> Result<Args> {
         imatrix: None,
         out: None,
         file_set: false,
+        lora: Vec::new(),
+        adapter: None,
     };
     while let Some(flag) = it.next() {
         let mut value = || {
@@ -188,6 +196,21 @@ fn parse_args() -> Result<Args> {
             "--context" => a.context = Some(num(&flag, value()?)?),
             "--no-think" => a.no_think = true,
             "--imatrix" => a.imatrix = Some(value()?.into()),
+            "--lora" => {
+                let v = value()?;
+                let (name, dir) = match v.split_once('=') {
+                    Some((n, d)) => (n.to_string(), PathBuf::from(d)),
+                    None => {
+                        let dir = PathBuf::from(&v);
+                        let name = dir
+                            .file_name()
+                            .map_or(v.clone(), |n| n.to_string_lossy().into_owned());
+                        (name, dir)
+                    }
+                };
+                a.lora.push((name, dir));
+            }
+            "--adapter" => a.adapter = Some(value()?),
             "--out" => a.out = Some(value()?.into()),
             "--top-k" => a.sampler.top_k = num(&flag, value()?)?,
             "--top-p" => a.sampler.top_p = num(&flag, value()?)?,
@@ -302,11 +325,21 @@ fn load_backend(
     };
     let weights = Weights::load_with(dir, &cfg, format, importance.as_ref())?;
     let bytes = weights.bytes();
-    let backend: Box<dyn Backend> = if gpu {
+    let mut backend: Box<dyn Backend> = if gpu {
         gpu_backend(cfg.clone(), weights, blocks, a.ctx, a.kv_f16)?
     } else {
         Box::new(CpuBackend::new(cfg.clone(), weights, pool.clone(), blocks))
     };
+    if !a.lora.is_empty() && dir == a.model {
+        let adapters = tachyon::lora::Adapters::load(&cfg, &a.lora)?;
+        eprintln!(
+            "loaded LoRA adapters {} (rank {}, {:.0} MB)",
+            adapters.names.join(", "),
+            adapters.rank,
+            adapters.bytes() as f64 / 1e6
+        );
+        backend.load_adapters(adapters)?;
+    }
     eprintln!(
         "loaded {} ({:.0}M params, {}, {:.0} MB) in {:.2}s on {}",
         dir.file_name()
@@ -334,8 +367,18 @@ fn load_from(
     pool: &Arc<Pool>,
 ) -> Result<Loaded> {
     let m = load_backend(a, dir, format, gpu, pool, a.ctx.div_ceil(BLOCK))?;
+    let mut session = Session::new(m.backend);
+    if !a.lora.is_empty() && dir == a.model {
+        let id = match &a.adapter {
+            Some(name) => a.lora.iter().position(|(n, _)| n == name).ok_or_else(|| {
+                Error(format!("--adapter {name}: no --lora adapter has that name"))
+            })?,
+            None => 0,
+        };
+        session.set_adapter(id as u32 + 1);
+    }
     Ok(Loaded {
-        engine: Box::new(Session::new(m.backend)),
+        engine: Box::new(session),
         tok: m.tok,
         cfg: m.cfg,
         bytes: m.bytes,
@@ -783,6 +826,7 @@ fn serve(a: &Args) -> Result<()> {
         kv_tokens: blocks * BLOCK,
         defaults: a.sampler.clone(),
         max_tokens: a.max_tokens,
+        adapters: a.lora.iter().map(|(n, _)| n.clone()).collect(),
     };
     tachyon::server::serve(server, &format!("{}:{}", a.host, a.port))
 }
@@ -972,11 +1016,16 @@ fn bench_batch(a: &Args) -> Result<()> {
             let mut kv = BlockPool::new(blocks);
             let mut seqs: Vec<_> = (0..b).map(|_| kv.start(&[])).collect();
             let mut batch = Batch::default();
-            for seq in seqs.iter_mut() {
+            // With --lora, sequence i runs adapter i mod n: every step mixes them.
+            let adapter = |i: usize| match a.lora.len() {
+                0 => 0,
+                n => (i % n) as u32 + 1,
+            };
+            for (i, seq) in seqs.iter_mut().enumerate() {
                 assert!(kv.reserve(seq, PROMPT + STEPS + 1));
                 for chunk in prompt.chunks(budget) {
                     batch.clear();
-                    batch.push(&seq.blocks, seq.len, chunk, Logits::None);
+                    batch.push_with(&seq.blocks, seq.len, chunk, Logits::None, adapter(i));
                     seq.len += chunk.len();
                     m.backend.forward(&batch);
                 }
@@ -984,12 +1033,13 @@ fn bench_batch(a: &Args) -> Result<()> {
             let mut best = f64::MAX;
             for step in 0..STEPS {
                 batch.clear();
-                for seq in seqs.iter_mut() {
-                    batch.push(
+                for (i, seq) in seqs.iter_mut().enumerate() {
+                    batch.push_with(
                         &seq.blocks,
                         seq.len,
                         &[prompt[step % prompt.len()]],
                         Logits::Last,
+                        adapter(i),
                     );
                     seq.len += 1;
                 }

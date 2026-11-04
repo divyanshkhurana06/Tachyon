@@ -1,5 +1,7 @@
 use crate::config::Config;
 use crate::kv::{Batch, Logits, BLOCK};
+use crate::lora::Adapters;
+use crate::{bail, Result};
 
 /// A model on some hardware, with a paged KV cache. Runs batches of tokens
 /// from any number of sequences in one forward pass.
@@ -18,6 +20,13 @@ pub trait Backend: Send {
     /// Runs `batch` and returns logits for its `logit_rows`, one row of
     /// `config().vocab` values each.
     fn forward(&mut self, batch: &Batch) -> &[f32];
+
+    /// Takes LoRA adapters that batches may then name per token (ids from
+    /// 1, in the order given).
+    fn load_adapters(&mut self, adapters: Adapters) -> Result<()> {
+        let _ = adapters;
+        bail!("this backend does not support LoRA adapters")
+    }
 }
 
 /// A single sequence: everything generation needs.
@@ -47,6 +56,7 @@ pub struct Session {
     max_seq: usize,
     pos: usize,
     batch: Batch,
+    adapter: u32,
 }
 
 impl Session {
@@ -59,7 +69,22 @@ impl Session {
             max_seq,
             pos: 0,
             batch: Batch::default(),
+            adapter: 0,
         }
+    }
+
+    /// Runs every later token with LoRA adapter `id` (0: none). Positions
+    /// already in the cache were computed with the previous one, so this
+    /// also forgets them.
+    pub fn set_adapter(&mut self, id: u32) {
+        if id != self.adapter {
+            self.adapter = id;
+            self.pos = 0;
+        }
+    }
+
+    pub fn load_adapters(&mut self, adapters: Adapters) -> Result<()> {
+        self.backend.load_adapters(adapters)
     }
 }
 
@@ -106,7 +131,8 @@ impl Engine for Session {
             } else {
                 Logits::None
             };
-            self.batch.push(&self.table, self.pos, chunk, want);
+            self.batch
+                .push_with(&self.table, self.pos, chunk, want, self.adapter);
             self.pos += chunk.len();
             if i + 1 < chunks {
                 self.backend.forward(&self.batch);

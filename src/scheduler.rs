@@ -46,6 +46,8 @@ pub struct Request {
     pub cancel: Arc<AtomicBool>,
     /// Report each token's log-probability and this many alternatives.
     pub logprobs: Option<usize>,
+    /// The LoRA adapter to run with (see `lora.rs`), 0 for none.
+    pub adapter: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -273,7 +275,7 @@ impl Worker {
                 break;
             }
             let mut s = self.waiting.pop_front().unwrap();
-            let seq = self.pool.start(&s.tokens);
+            let seq = self.pool.start_with(&s.tokens, s.req.adapter);
             s.cached.get_or_insert(seq.len);
             s.seq = Some(seq);
             self.running.push(s);
@@ -334,7 +336,7 @@ impl Worker {
             }
             let s = &mut self.running[i];
             let done_prompt = fed + take == s.tokens.len();
-            self.batch.push(
+            self.batch.push_with(
                 &seq.blocks,
                 fed,
                 &s.tokens[fed..fed + take],
@@ -343,6 +345,7 @@ impl Worker {
                 } else {
                     Logits::None
                 },
+                s.req.adapter,
             );
             seq.len = fed + take;
             s.seq = Some(seq);

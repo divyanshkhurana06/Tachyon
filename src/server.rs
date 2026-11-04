@@ -51,6 +51,8 @@ pub struct Server {
     pub kv_tokens: usize,
     pub defaults: SamplerConfig,
     pub max_tokens: usize,
+    /// LoRA adapters a request can name as its `model` (ids from 1).
+    pub adapters: Vec<String>,
 }
 
 impl Server {
@@ -58,6 +60,10 @@ impl Server {
         let st = &self.scheduler.stats;
         obj([
             ("model", self.model_id.as_str().into()),
+            (
+                "adapters",
+                Json::Arr(self.adapters.iter().map(|a| a.as_str().into()).collect()),
+            ),
             ("backend", self.backend.as_str().into()),
             ("params", self.params.into()),
             ("context", self.context.into()),
@@ -213,15 +219,24 @@ fn handle(mut conn: TcpStream, server: &Server) -> io::Result<()> {
         ("GET", "/health") => respond_json(&mut conn, "200 OK", &obj([("status", "ok".into())])),
         ("GET", "/info") => respond_json(&mut conn, "200 OK", &server.info()),
         ("GET", "/v1/models") => {
-            let model = obj([
+            let mut models = vec![obj([
                 ("id", server.model_id.as_str().into()),
                 ("object", "model".into()),
                 ("owned_by", "tachyon".into()),
-            ]);
+            ])];
+            // Adapters are listed as models of their own, as vLLM does.
+            models.extend(server.adapters.iter().map(|a| {
+                obj([
+                    ("id", a.as_str().into()),
+                    ("object", "model".into()),
+                    ("owned_by", "tachyon".into()),
+                    ("parent", server.model_id.as_str().into()),
+                ])
+            }));
             respond_json(
                 &mut conn,
                 "200 OK",
-                &obj([("object", "list".into()), ("data", Json::Arr(vec![model]))]),
+                &obj([("object", "list".into()), ("data", Json::Arr(models))]),
             )
         }
         ("POST", "/v1/chat/completions") => chat_completion(&mut conn, server, &req.body),
@@ -234,6 +249,8 @@ fn handle(mut conn: TcpStream, server: &Server) -> io::Result<()> {
 }
 
 struct ChatRequest {
+    /// Selects a LoRA adapter by name; anything else means the base model.
+    model: Option<String>,
     messages: Vec<Message>,
     stream: bool,
     max_tokens: Option<usize>,
@@ -494,6 +511,7 @@ fn parse_chat(body: &[u8], defaults: &SamplerConfig) -> std::result::Result<Chat
         return Err("tool_choice needs `tools`".into());
     }
     Ok(ChatRequest {
+        model: j.get("model").and_then(Json::as_str).map(str::to_string),
         messages,
         stream: j.get("stream").and_then(Json::as_bool).unwrap_or(false),
         max_tokens: j
@@ -622,9 +640,15 @@ fn chat_completion(conn: &mut TcpStream, server: &Server, body: &[u8]) -> io::Re
         );
         return error(conn, "400 Bad Request", &msg);
     }
+    let adapter = server
+        .adapters
+        .iter()
+        .position(|a| Some(a) == req.model.as_ref());
+    let model_id = adapter.map_or(server.model_id.as_str(), |i| &server.adapters[i]);
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     server.scheduler.submit(Request {
+        adapter: adapter.map_or(0, |i| i as u32 + 1),
         prompt,
         max_tokens: req.max_tokens.unwrap_or(server.max_tokens).min(room),
         sampler: req.sampler,
@@ -651,7 +675,7 @@ fn chat_completion(conn: &mut TcpStream, server: &Server, body: &[u8]) -> io::Re
             ("id", id.as_str().into()),
             ("object", "chat.completion.chunk".into()),
             ("created", created.into()),
-            ("model", server.model_id.as_str().into()),
+            ("model", model_id.into()),
             (
                 "choices",
                 Json::Arr(vec![obj([
@@ -829,7 +853,7 @@ fn chat_completion(conn: &mut TcpStream, server: &Server, body: &[u8]) -> io::Re
             ("id", id.as_str().into()),
             ("object", "chat.completion".into()),
             ("created", created.into()),
-            ("model", server.model_id.as_str().into()),
+            ("model", model_id.into()),
             (
                 "choices",
                 Json::Arr(vec![obj([

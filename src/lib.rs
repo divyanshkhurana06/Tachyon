@@ -24,6 +24,7 @@ pub mod imatrix;
 pub mod json;
 pub mod kernels;
 pub mod kv;
+pub mod lora;
 pub mod model;
 pub mod pool;
 pub mod safetensors;

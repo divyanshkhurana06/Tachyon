@@ -39,6 +39,8 @@ pub struct Batch {
     pub tables: Vec<u32>,
     /// Rows (token indices) to return logits for, in order.
     pub logit_rows: Vec<u32>,
+    /// Each token's LoRA adapter (see `lora.rs`), 0 for the base model.
+    pub adapters: Vec<u32>,
 }
 
 impl Batch {
@@ -49,6 +51,7 @@ impl Batch {
         self.table_of.clear();
         self.tables.clear();
         self.logit_rows.clear();
+        self.adapters.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -59,9 +62,26 @@ impl Batch {
         self.tokens.is_empty()
     }
 
+    /// Whether any token uses an adapter.
+    pub fn uses_adapters(&self) -> bool {
+        self.adapters.iter().any(|&a| a != 0)
+    }
+
     /// Adds `tokens` of the sequence with block table `table`, at positions
     /// `start..`. The table must already cover them.
     pub fn push(&mut self, table: &[u32], start: usize, tokens: &[u32], logits: Logits) {
+        self.push_with(table, start, tokens, logits, 0);
+    }
+
+    /// [`Batch::push`] for a sequence that uses LoRA adapter `adapter`.
+    pub fn push_with(
+        &mut self,
+        table: &[u32],
+        start: usize,
+        tokens: &[u32],
+        logits: Logits,
+        adapter: u32,
+    ) {
         assert!(
             table.len() * BLOCK >= start + tokens.len(),
             "block table too short"
@@ -76,6 +96,7 @@ impl Batch {
             self.slots
                 .push(table[pos / BLOCK] * BLOCK as u32 + (pos % BLOCK) as u32);
             self.table_of.push(table_at);
+            self.adapters.push(adapter);
         }
         let last = self.tokens.len();
         match logits {
@@ -101,6 +122,9 @@ pub struct Seq {
     pub len: usize,
     /// Chain hashes of the full blocks registered so far.
     hashes: Vec<u64>,
+    /// Where the chain starts: different for each LoRA adapter, whose
+    /// keys and values differ from the base model's for the same tokens.
+    root: u64,
 }
 
 const ROOT: u64 = 0x5441_4348_594F_4E00; // "TACHYON\0"
@@ -178,8 +202,22 @@ impl BlockPool {
     /// computed; at least the last token is always left to compute, since
     /// its logits are needed.
     pub fn start(&mut self, prompt: &[u32]) -> Seq {
-        let mut seq = Seq::default();
-        let mut h = ROOT;
+        self.start_with(prompt, 0)
+    }
+
+    /// [`BlockPool::start`] for a sequence run with LoRA adapter `adapter`:
+    /// it shares cached blocks only with sequences of the same adapter.
+    pub fn start_with(&mut self, prompt: &[u32], adapter: u32) -> Seq {
+        let root = if adapter == 0 {
+            ROOT
+        } else {
+            chain(ROOT, &[adapter])
+        };
+        let mut seq = Seq {
+            root,
+            ..Seq::default()
+        };
+        let mut h = root;
         for block in prompt[..prompt.len().saturating_sub(1)].chunks_exact(BLOCK) {
             let next = chain(h, block);
             let Some(&b) = self.cached.get(&next) else {
@@ -213,7 +251,7 @@ impl BlockPool {
         let full = seq.len.min(tokens.len()) / BLOCK;
         while seq.hashes.len() < full {
             let i = seq.hashes.len();
-            let prev = seq.hashes.last().copied().unwrap_or(ROOT);
+            let prev = seq.hashes.last().copied().unwrap_or(seq.root);
             let h = chain(prev, &tokens[i * BLOCK..(i + 1) * BLOCK]);
             let b = seq.blocks[i];
             seq.hashes.push(h);
@@ -278,6 +316,19 @@ mod tests {
         pool.release(b);
         // Cached blocks survive release and are found again...
         assert_eq!(pool.start(&prompt).len, 32);
+    }
+
+    #[test]
+    fn adapters_do_not_share_cached_blocks() {
+        let mut pool = BlockPool::new(8);
+        let prompt: Vec<u32> = (0..40).collect();
+        let mut a = pool.start_with(&prompt, 1);
+        assert!(pool.reserve(&mut a, prompt.len()));
+        a.len = prompt.len();
+        pool.commit(&mut a, &prompt);
+        assert_eq!(pool.start(&prompt).len, 0);
+        assert_eq!(pool.start_with(&prompt, 2).len, 0);
+        assert_eq!(pool.start_with(&prompt, 1).len, 32);
     }
 
     #[test]

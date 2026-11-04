@@ -25,6 +25,38 @@ pub fn f32_to_bf16(f: f32) -> u16 {
     (bits.wrapping_add(round) >> 16) as u16
 }
 
+/// Rounds to the nearest half-precision float, ties to even.
+pub fn f32_to_f16(f: f32) -> u16 {
+    let x = f.to_bits();
+    let sign = ((x >> 16) & 0x8000) as u16;
+    let exp = ((x >> 23) & 0xFF) as i32;
+    let mant = x & 0x7F_FFFF;
+    if exp == 0xFF {
+        return sign | 0x7C00 | if mant != 0 { 0x200 } else { 0 };
+    }
+    let e = exp - 127 + 15;
+    if e >= 0x1F {
+        return sign | 0x7C00;
+    }
+    // The mantissa with its leading 1, and how far it shifts to fit 10 bits
+    // (further for subnormals).
+    let (full, shift, base) = if e > 0 {
+        (mant, 13, (e as u32) << 10)
+    } else {
+        (mant | 0x80_0000, (14 - e) as u32, 0)
+    };
+    if shift > 25 {
+        return sign;
+    }
+    let mut h = base | (full >> shift);
+    let rem = full & ((1 << shift) - 1);
+    let half = 1 << (shift - 1);
+    if rem > half || (rem == half && h & 1 == 1) {
+        h += 1; // a carry rolls into the exponent, as it should
+    }
+    sign | h as u16
+}
+
 pub fn f16_to_f32(h: u16) -> f32 {
     let sign = ((h >> 15) as u32) << 31;
     let exp = ((h >> 10) & 0x1F) as u32;
@@ -951,5 +983,21 @@ mod tests {
         assert_eq!(f16_to_f32(0x3C00), 1.0);
         assert_eq!(f16_to_f32(0xC000), -2.0);
         assert_eq!(f16_to_f32(0x0001), 2f32.powi(-24));
+        for (v, h) in [
+            (1.0, 0x3C00),
+            (-2.0, 0xC000),
+            (65504.0, 0x7BFF),
+            (65520.0, 0x7C00), // halfway to 65536: ties to even, which overflows
+            (2f32.powi(-24), 0x0001),
+            (2f32.powi(-14), 0x0400),
+            (1.0 + 2f32.powi(-11), 0x3C00), // halfway: down to even
+            (1.0 + 3.0 * 2f32.powi(-11), 0x3C02),
+        ] {
+            assert_eq!(f32_to_f16(v), h, "{v}");
+        }
+        let x = data(1000, 3);
+        assert!(x
+            .iter()
+            .all(|&v| (f16_to_f32(f32_to_f16(v * 100.0)) - v * 100.0).abs() <= 0.05));
     }
 }

@@ -13,6 +13,7 @@ use crate::engine::Backend;
 use crate::imatrix::{Importance, LayerImportance};
 use crate::kernels::{axpy, dot_f32, rmsnorm, silu};
 use crate::kv::{slot, Batch, BLOCK};
+use crate::lora::{Adapters, LayerLora, Lora};
 use crate::pool::{Pool, SyncPtr};
 use crate::safetensors::SafeTensors;
 use crate::weights::{Format, Matrix};
@@ -362,6 +363,7 @@ pub struct CpuBackend {
     /// When set, every forward pass adds its linear layers' squared inputs
     /// here (see `imatrix.rs`).
     pub calibration: Option<Importance>,
+    lora: Option<Adapters>,
 }
 
 impl CpuBackend {
@@ -379,6 +381,7 @@ impl CpuBackend {
             blocks,
             s: Scratch::default(),
             calibration: None,
+            lora: None,
         }
     }
 }
@@ -539,8 +542,15 @@ impl Backend for CpuBackend {
             v_cache,
             s,
             calibration,
+            lora,
             ..
         } = self;
+        let none = LayerLora::default();
+        let adapt = |m: Option<&Lora>, pool: &Pool, x: &[f32], y: &mut [f32]| {
+            if let Some(m) = m {
+                m.apply_batch(pool, &b.adapters, x, y);
+            }
+        };
         let t = b.len();
         assert!(t > 0, "empty batch");
         let (dim, kv_dim, q_dim, inter, hd) =
@@ -578,6 +588,10 @@ impl Backend for CpuBackend {
         }
 
         for (l, layer) in w.layers.iter().enumerate() {
+            let ll = match lora {
+                Some(a) if b.uses_adapters() => &a.layers[l],
+                _ => &none,
+            };
             // attention block: x += o(attention(rope(qkv(norm(x)))))
             for i in 0..t {
                 rmsnorm(
@@ -591,6 +605,7 @@ impl Backend for CpuBackend {
                 Importance::accumulate(&mut cal.layers[l].qkv, &s.xb);
             }
             layer.wqkv.matmul(pool, &s.xb, t, &mut s.qkv);
+            adapt(ll.qkv.as_ref(), pool, &s.xb, &mut s.qkv);
             let (kc, vc) = (
                 &mut k_cache[l * layer_cache..(l + 1) * layer_cache],
                 &mut v_cache[l * layer_cache..(l + 1) * layer_cache],
@@ -621,6 +636,7 @@ impl Backend for CpuBackend {
                 Importance::accumulate(&mut cal.layers[l].o, &s.att);
             }
             layer.wo.matmul(pool, &s.att, t, &mut s.proj);
+            adapt(ll.o.as_ref(), pool, &s.att, &mut s.proj);
             s.x.iter_mut().zip(&s.proj).for_each(|(x, p)| *x += p);
 
             // MLP block: x += down(silu(gate(norm(x))) * up(norm(x)))
@@ -649,6 +665,7 @@ impl Backend for CpuBackend {
                 continue;
             }
             layer.w_gate_up.matmul(pool, &s.xb, t, &mut s.gate_up);
+            adapt(ll.gate_up.as_ref(), pool, &s.xb, &mut s.gate_up);
             for i in 0..t {
                 let (g, u) = s.gate_up[i * 2 * inter..(i + 1) * 2 * inter].split_at(inter);
                 for (h, (&g, &u)) in s.hidden[i * inter..(i + 1) * inter]
@@ -662,6 +679,7 @@ impl Backend for CpuBackend {
                 Importance::accumulate(&mut cal.layers[l].down, &s.hidden);
             }
             layer.w_down.matmul(pool, &s.hidden, t, &mut s.proj);
+            adapt(ll.down.as_ref(), pool, &s.hidden, &mut s.proj);
             s.x.iter_mut().zip(&s.proj).for_each(|(x, p)| *x += p);
         }
 
@@ -682,6 +700,14 @@ impl Backend for CpuBackend {
             head.matmul(pool, &s.xb[..n * dim], n, &mut s.logits);
         }
         &s.logits
+    }
+
+    fn load_adapters(&mut self, adapters: Adapters) -> Result<()> {
+        if adapters.layers.len() != self.cfg.layers {
+            bail!("adapters are for a different model");
+        }
+        self.lora = Some(adapters);
+        Ok(())
     }
 }
 

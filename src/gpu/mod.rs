@@ -11,7 +11,9 @@ use std::mem::size_of;
 
 use crate::config::Config;
 use crate::engine::Backend;
+use crate::kernels::{bf16_to_f32, f32_to_f16};
 use crate::kv::{Batch, Logits, BLOCK};
+use crate::lora::{Adapters, Lora};
 use crate::model::{rope_frequencies, Weights};
 use crate::weights::Matrix;
 use crate::{Error, Result};
@@ -37,6 +39,8 @@ const GEMM_MIN_BATCH: usize = 4;
 /// and runs a GEMM per expert, instead of a matrix-vector product per
 /// (token, expert).
 const MOE_GEMM_MIN_BATCH: usize = 8;
+/// Tokens sharing an adapter per LoRA tile (LORA_TILE in kernels.metal).
+const LORA_TILE: usize = 8;
 
 /// Most tokens one forward pass takes (prefill chunks, speculative checks).
 pub const MAX_BATCH: usize = 256;
@@ -67,9 +71,11 @@ enum Kernel {
     MoeGemmBf16,
     MoeGemmQ8,
     MoeGemmQ4,
+    LoraShrink,
+    LoraExpand,
 }
 
-const KERNELS: [&str; 21] = [
+const KERNELS: [&str; 23] = [
     "matmul_bf16",
     "matmul_q8",
     "matmul_q4",
@@ -91,6 +97,8 @@ const KERNELS: [&str; 21] = [
     "moe_gemm_bf16",
     "moe_gemm_q8",
     "moe_gemm_q4",
+    "lora_shrink",
+    "lora_expand",
 ];
 
 #[repr(C)]
@@ -253,6 +261,59 @@ impl GpuMatrix {
     }
 }
 
+/// Every adapter's update to one matrix (see `lora.rs`), in f16.
+struct GpuLora {
+    a: Buffer,
+    b: Buffer,
+    params: LoraParams,
+}
+
+impl GpuLora {
+    fn upload(ctx: &Context, m: &Lora) -> Result<GpuLora> {
+        if m.ends.len() > 3 || m.cols % 4 != 0 || m.rank % 4 != 0 {
+            return Err(Error::msg("unsupported LoRA shape for the GPU"));
+        }
+        let end = |i: usize| m.ends.get(i).map_or(u32::MAX, |&e| e as u32);
+        // bf16 to f16, which holds every bf16 value of the size LoRA weights
+        // have exactly, and converts to float in hardware.
+        let half = |v: &[u16]| {
+            v.iter()
+                .map(|&x| f32_to_f16(bf16_to_f32(x)))
+                .collect::<Vec<u16>>()
+        };
+        Ok(GpuLora {
+            a: Buffer::from_slice(ctx, &half(&m.a))?,
+            b: Buffer::from_slice(ctx, &half(&m.b))?,
+            params: LoraParams {
+                rows: m.rows as u32,
+                cols: m.cols as u32,
+                rank: m.rank as u32,
+                segs: m.ends.len() as u32,
+                end0: end(0),
+                end1: end(1),
+            },
+        })
+    }
+}
+
+#[derive(Default)]
+struct GpuLayerLora {
+    qkv: Option<GpuLora>,
+    o: Option<GpuLora>,
+    gate_up: Option<GpuLora>,
+    down: Option<GpuLora>,
+}
+
+#[repr(C)]
+struct LoraParams {
+    rows: u32,
+    cols: u32,
+    rank: u32,
+    segs: u32,
+    end0: u32,
+    end1: u32,
+}
+
 struct GpuLayer {
     attn_norm: Buffer,
     wqkv: GpuMatrix,
@@ -263,6 +324,7 @@ struct GpuLayer {
     w_gate_up: GpuMatrix,
     w_down: GpuMatrix,
     router: Option<GpuMatrix>,
+    lora: GpuLayerLora,
 }
 
 #[repr(C)]
@@ -359,6 +421,11 @@ struct Activations {
     moe_counts: Buffer,
     moe_lists: Buffer,
     att_tiles: Buffer,
+    /// LoRA: the batch's tokens grouped by adapter, the tiles they are cut
+    /// into, and the low-rank intermediate (A x).
+    lora_order: Buffer,
+    lora_tiles: Buffer,
+    lora_h: Buffer,
     k_cache: Buffer,
     v_cache: Buffer,
 }
@@ -465,6 +532,7 @@ impl GpuBackend {
                         .as_ref()
                         .map(|r| GpuMatrix::upload(&ctx, r))
                         .transpose()?,
+                    lora: GpuLayerLora::default(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -503,6 +571,9 @@ impl GpuBackend {
             moe_counts: Buffer::new(&ctx, (cfg.experts * 4).max(4))?,
             moe_lists: Buffer::new(&ctx, (cfg.experts * b * 4).max(4))?,
             att_tiles: Buffer::new(&ctx, b * 2 * 4)?,
+            lora_order: Buffer::new(&ctx, b * 4)?,
+            lora_tiles: Buffer::new(&ctx, b * 3 * 4)?,
+            lora_h: Buffer::new(&ctx, 4)?,
             k_cache: Buffer::new(&ctx, cache)?,
             v_cache: Buffer::new(&ctx, cache)?,
         };
@@ -727,6 +798,31 @@ impl GpuBackend {
         }
     }
 
+    /// Adds each token's LoRA update `B (A x)` to `y`, if this matrix has any.
+    fn lora(&self, m: &Option<GpuLora>, x: &Buffer, y: &Buffer, tiles: usize) {
+        let Some(m) = m.as_ref().filter(|_| tiles > 0) else {
+            return;
+        };
+        let p = &m.params;
+        let inner = (p.segs * p.rank) as usize;
+        let a = &self.act;
+        let (order, tile, h) = (&a.lora_order, &a.lora_tiles, &a.lora_h);
+        self.dispatch(
+            Kernel::LoraShrink,
+            &[(&m.a, 0), (x, 0), (h, 0), (order, 0), (tile, 0)],
+            p,
+            [inner, tiles, 1],
+            [256, 1, 1],
+        );
+        self.dispatch(
+            Kernel::LoraExpand,
+            &[(&m.b, 0), (h, 0), (y, 0), (order, 0), (tile, 0)],
+            p,
+            [(p.rows as usize).div_ceil(256), tiles, 1],
+            [256, 1, 1],
+        );
+    }
+
     /// RMSNorm `rows` rows of `x` into `out`; with `gather`, row i of the
     /// output comes from row `act.rows[i]` of the input.
     fn rmsnorm(&self, x: &Buffer, w: &Buffer, out: &Buffer, rows: usize, gather: bool) {
@@ -804,6 +900,19 @@ impl Backend for GpuBackend {
             a.tables.write_u32(&batch.tables);
             a.rows.write_u32(&batch.logit_rows);
         }
+        // LoRA: tokens grouped by adapter, in tiles of up to LORA_TILE.
+        let (mut order, mut lora_tiles) = (Vec::new(), Vec::new());
+        for (id, toks) in crate::lora::group(&batch.adapters) {
+            for chunk in toks.chunks(LORA_TILE) {
+                lora_tiles.extend([order.len() as u32, chunk.len() as u32, id as u32]);
+                order.extend(chunk.iter().map(|&t| t as u32));
+            }
+        }
+        let lora = lora_tiles.len() / 3;
+        unsafe {
+            a.lora_order.write_u32(&order);
+            a.lora_tiles.write_u32(&lora_tiles);
+        }
         let (singles, tiles) = attention_split(batch);
         unsafe {
             a.att_tokens.write_u32(&singles);
@@ -845,6 +954,7 @@ impl Backend for GpuBackend {
             let cache_off = l * self.blocks * BLOCK * kv_dim * self.kv_bytes;
             self.rmsnorm(&a.x, &layer.attn_norm, &a.xb, t, false);
             self.matmul(&layer.wqkv, &a.xb, &a.qkv, t, layer.bqkv.as_ref(), false);
+            self.lora(&layer.lora.qkv, &a.xb, &a.qkv, lora);
             if let Some((qn, kn)) = &layer.qk_norm {
                 self.dispatch(
                     Kernel::HeadNorm,
@@ -906,12 +1016,14 @@ impl Backend for GpuBackend {
                 );
             }
             self.matmul(&layer.wo, &a.att, &a.x, t, None, true);
+            self.lora(&layer.lora.o, &a.att, &a.x, lora);
             self.rmsnorm(&a.x, &layer.mlp_norm, &a.xb, t, false);
             if let Some(router) = &layer.router {
                 self.moe(layer, router, t);
                 continue;
             }
             self.matmul(&layer.w_gate_up, &a.xb, &a.gate_up, t, None, false);
+            self.lora(&layer.lora.gate_up, &a.xb, &a.gate_up, lora);
             self.dispatch(
                 Kernel::SiluMul,
                 &[(&a.gate_up, 0), (&a.hidden, 0)],
@@ -920,6 +1032,7 @@ impl Backend for GpuBackend {
                 [256, 1, 1],
             );
             self.matmul(&layer.w_down, &a.hidden, &a.x, t, None, true);
+            self.lora(&layer.lora.down, &a.hidden, &a.x, lora);
         }
         if n > 0 {
             self.rmsnorm(&a.x, &self.norm, &a.xb, n, true);
@@ -932,6 +1045,35 @@ impl Backend for GpuBackend {
             panic!("GPU command buffer failed: {msg}");
         }
         unsafe { self.act.logits.floats(n * self.lm_head.rows) }
+    }
+
+    fn load_adapters(&mut self, adapters: Adapters) -> Result<()> {
+        if adapters.layers.len() != self.layers.len() {
+            return Err(Error::msg("adapters are for a different model"));
+        }
+        let up = |m: &Option<Lora>| {
+            m.as_ref()
+                .map(|m| GpuLora::upload(&self.ctx, m))
+                .transpose()
+        };
+        let mut inner = 0;
+        let mut uploaded = Vec::with_capacity(self.layers.len());
+        for l in &adapters.layers {
+            for m in [&l.qkv, &l.o, &l.gate_up, &l.down].into_iter().flatten() {
+                inner = inner.max(m.inner());
+            }
+            uploaded.push(GpuLayerLora {
+                qkv: up(&l.qkv)?,
+                o: up(&l.o)?,
+                gate_up: up(&l.gate_up)?,
+                down: up(&l.down)?,
+            });
+        }
+        self.act.lora_h = Buffer::new(&self.ctx, (MAX_BATCH * inner * 4).max(4))?;
+        for (layer, l) in self.layers.iter_mut().zip(uploaded) {
+            layer.lora = l;
+        }
+        Ok(())
     }
 }
 

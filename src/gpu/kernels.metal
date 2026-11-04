@@ -802,3 +802,91 @@ kernel void silu_mul(device const float *gu [[buffer(0)]], device float *hidden 
     float u = gu[(ulong)i * 2 * p.inter + p.inter + j];
     hidden[gid] = g / (1.0f + exp(-g)) * u;
 }
+
+// ---- LoRA adapters: y += B (A x) per token, each with its own adapter ----
+//
+// After Punica's SGMV: the batch's tokens are grouped by adapter on the CPU
+// (`order`), and cut into tiles of up to LORA_TILE tokens that share one
+// (`tiles`: first index into `order`, count, adapter). Each row of A and B
+// is then read once per tile instead of once per token, and one dispatch
+// serves a batch that mixes adapters. Tokens without an adapter are in no
+// tile. A holds `segs * rank` rows per adapter (q, k and v each have their
+// own); output row r reads the `rank` values of its segment.
+
+#define LORA_TILE 8
+
+struct LoraParams {
+    uint rows;
+    uint cols;
+    uint rank; // a multiple of 4
+    uint segs;
+    uint end0; // where segments 0 and 1 end
+    uint end1;
+};
+
+// h[token][j] = A_adapter[j] . x[token]: one threadgroup per (j, tile), its
+// 256 threads splitting the columns.
+kernel void lora_shrink(device const half *A [[buffer(0)]], device const float *x [[buffer(1)]],
+                        device float *h [[buffer(2)]], device const uint *order [[buffer(3)]],
+                        device const uint *tiles [[buffer(4)]], constant LoraParams &p [[buffer(5)]],
+                        uint2 tg [[threadgroup_position_in_grid]],
+                        uint tid [[thread_index_in_threadgroup]],
+                        uint sg [[simdgroup_index_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float part[8][LORA_TILE];
+    uint inner = p.segs * p.rank, j = tg.x;
+    device const uint *tile = tiles + tg.y * 3;
+    uint first = tile[0], n = tile[1], id = tile[2];
+    device const half4 *a = (device const half4 *)(A + ((ulong)(id - 1) * inner + j) * p.cols);
+    device const float4 *xs[LORA_TILE];
+    float s[LORA_TILE];
+    for (uint k = 0; k < LORA_TILE; k++) {
+        xs[k] = (device const float4 *)(x + (ulong)order[first + min(k, n - 1)] * p.cols);
+        s[k] = 0.0f;
+    }
+    for (uint c = tid; c < p.cols / 4; c += 256) {
+        float4 av = float4(a[c]);
+        for (uint k = 0; k < LORA_TILE; k++) {
+            if (k < n) s[k] += dot(av, xs[k][c]);
+        }
+    }
+    for (uint k = 0; k < LORA_TILE; k++) {
+        float v = simd_sum(s[k]);
+        if (lane == 0) part[sg][k] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < n) {
+        float v = 0.0f;
+        for (uint g = 0; g < 8; g++) v += part[g][tid];
+        h[(ulong)order[first + tid] * inner + j] = v;
+    }
+}
+
+// y[token][r] += B_adapter[r] . h[token][segment of r]: one thread per
+// (output row, tile).
+kernel void lora_expand(device const half *B [[buffer(0)]], device const float *h [[buffer(1)]],
+                        device float *y [[buffer(2)]], device const uint *order [[buffer(3)]],
+                        device const uint *tiles [[buffer(4)]], constant LoraParams &p [[buffer(5)]],
+                        uint2 tg [[threadgroup_position_in_grid]],
+                        uint tid [[thread_index_in_threadgroup]]) {
+    uint r = tg.x * 256 + tid;
+    if (r >= p.rows) return;
+    device const uint *tile = tiles + tg.y * 3;
+    uint first = tile[0], n = tile[1], id = tile[2];
+    uint seg = r < p.end0 ? 0 : (r < p.end1 ? 1 : 2);
+    uint inner = p.segs * p.rank;
+    device const half4 *b = (device const half4 *)(B + ((ulong)(id - 1) * p.rows + r) * p.rank);
+    device const float4 *hs[LORA_TILE];
+    float s[LORA_TILE];
+    for (uint k = 0; k < LORA_TILE; k++) {
+        hs[k] = (device const float4 *)(h + (ulong)order[first + min(k, n - 1)] * inner + seg * p.rank);
+        s[k] = 0.0f;
+    }
+    for (uint j = 0; j < p.rank / 4; j++) {
+        float4 bv = float4(b[j]);
+        for (uint k = 0; k < LORA_TILE; k++) {
+            if (k < n) s[k] += dot(bv, hs[k][j]);
+        }
+    }
+    for (uint k = 0; k < n; k++) y[(ulong)order[first + k] * p.rows + r] += s[k];
+}

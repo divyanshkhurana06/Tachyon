@@ -184,6 +184,11 @@ impl SafeTensors {
         Ok(())
     }
 
+    /// Every tensor's name, in no particular order.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.entries.keys().map(String::as_str)
+    }
+
     pub fn contains(&self, name: &str) -> bool {
         self.entries.contains_key(name)
     }
