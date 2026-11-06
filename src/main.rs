@@ -36,6 +36,8 @@ commands:
   bench      speed and quality of each weight format
   bench-batch  decode throughput at batch sizes 1 to 64 (the engine alone)
   ppl        perplexity of the model on --file
+  kld        how far each of --formats is from bf16 on --file: KL divergence
+             of the next-token distributions, top-token agreement, perplexity
   calibrate  measure activations on --file (default bench/calib.txt) and save
              an importance matrix that improves 4-bit quantization
   tokenize   print the token ids of --prompt, or of --file
@@ -56,7 +58,7 @@ options:
   --threads N        CPU threads (default: performance cores + half the rest)
   --ctx N            context window in tokens (default 4096)
   --file PATH        text for `ppl` / `bench` (default bench/eval.txt)
-  --formats LIST     formats for `bench` (default bf16,q8,q4m,q4)
+  --formats LIST     formats for `bench` and `kld` (default bf16,q8,q4m,q4)
   --context N        `bench` decodes after N tokens of context (default 256)
   --backends LIST    backends for `bench` (default cpu,gpu)
   --draft F          speculative decoding with a draft model in format F
@@ -273,6 +275,7 @@ fn main() -> ExitCode {
         "chat" => chat(&a),
         "bench" => bench(&a),
         "ppl" => perplexity_cmd(&a),
+        "kld" => kld(&a),
         "serve" => serve(&a),
         "speculate" => speculate(&a),
         "loadtest" => loadtest(&a),
@@ -600,6 +603,87 @@ fn perplexity_cmd(a: &Args) -> Result<()> {
         "perplexity {ppl:.3} over {} tokens ({:.1}s)",
         tokens.len(),
         started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+fn log_softmax(row: &[f32]) -> Vec<f64> {
+    let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+    let lse = max
+        + row
+            .iter()
+            .map(|&l| (l as f64 - max).exp())
+            .sum::<f64>()
+            .ln();
+    row.iter().map(|&l| l as f64 - lse).collect()
+}
+
+/// Each format against bf16 on the eval text, the two models reading it in
+/// lockstep: mean KL divergence from bf16's next-token distribution to the
+/// format's, how often their most likely tokens agree, and perplexity. KL
+/// divergence measures every token's whole distribution, so it separates
+/// formats that perplexity on a short text can't.
+fn kld(a: &Args) -> Result<()> {
+    let pool = Arc::new(Pool::new(a.threads));
+    let mut reference = load(a, Format::Bf16, a.gpu, &pool)?;
+    let tokens = eval_tokens(a, &reference.tok, reference.engine.max_seq())?;
+    let vocab = reference.cfg.vocab;
+    let mut rows = Vec::new();
+    for &format in a.formats.iter().filter(|&&f| f != Format::Bf16) {
+        let mut m = load(a, format, a.gpu, &pool)?;
+        let (r, q) = (reference.engine.as_mut(), m.engine.as_mut());
+        r.truncate(0);
+        q.truncate(0);
+        let (mut kl, mut agree, mut nll, mut n) = (0f64, 0, 0f64, 0);
+        for start in (0..tokens.len() - 1).step_by(PREFILL_CHUNK) {
+            let chunk = &tokens[start..(start + PREFILL_CHUNK).min(tokens.len() - 1)];
+            let want = r.forward(chunk, true).to_vec();
+            let got = q.forward(chunk, true);
+            for (i, (p, g)) in want
+                .chunks_exact(vocab)
+                .zip(got.chunks_exact(vocab))
+                .enumerate()
+            {
+                let (lp, lq) = (log_softmax(p), log_softmax(g));
+                kl += lp
+                    .iter()
+                    .zip(&lq)
+                    .map(|(&p, &q)| p.exp() * (p - q))
+                    .sum::<f64>();
+                agree += (argmax(p) == argmax(g)) as usize;
+                nll -= lq[tokens[start + i + 1] as usize];
+                n += 1;
+            }
+        }
+        let bits = 16.0 * m.bytes as f64 / reference.bytes as f64;
+        eprintln!("{}: KL {:.4}", format.name(), kl / n as f64);
+        rows.push((
+            format,
+            m.bytes,
+            bits,
+            kl / n as f64,
+            agree as f64 / n as f64,
+            (nll / n as f64).exp(),
+        ));
+    }
+    println!(
+        "\n| format | weights | bits per weight | KL divergence | top token agrees | perplexity |"
+    );
+    println!("|---|---:|---:|---:|---:|---:|");
+    for (f, bytes, bits, kl, agree, ppl) in rows {
+        println!(
+            "| {} | {:.0} MB | {bits:.2} | {kl:.4} | {:.1}% | {ppl:.3} |",
+            f.name(),
+            bytes as f64 / 1e6,
+            agree * 100.0
+        );
+    }
+    println!(
+        "\n{} tokens of {} on the {}, against bf16 (perplexity {:.3})",
+        tokens.len(),
+        a.file.display(),
+        if a.gpu { "GPU" } else { "CPU" },
+        perplexity(reference.engine.as_mut(), &tokens)
     );
     Ok(())
 }
