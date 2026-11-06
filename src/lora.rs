@@ -17,7 +17,7 @@ use std::path::Path;
 
 use crate::config::Config;
 use crate::json::Json;
-use crate::kernels::{dot_bf16, f32_to_bf16};
+use crate::kernels::{bf16_to_f32, dot_bf16, f32_to_bf16};
 use crate::pool::{Pool, SyncPtr};
 use crate::safetensors::SafeTensors;
 use crate::{bail, Error, Result};
@@ -83,12 +83,31 @@ impl Lora {
                         let hs = &h[tok * inner + seg * r..][..r];
                         // Rows are split between threads, so no two touch
                         // the same element.
-                        unsafe { out.slice(tok * rows + row, 1)[0] += dot_bf16(b, hs) };
+                        unsafe { out.slice(tok * rows + row, 1)[0] += dot_rank(b, hs) };
                     }
                 }
             }
         });
     }
+}
+
+/// `b · h` over a rank: four lanes, added in order a step of 4 at a time,
+/// then together. Ranks are padded with zeros to the largest loaded, and
+/// those add exact zeros here, so an adapter gives the same result whatever
+/// else is loaded (a general dot product's summation order can depend on
+/// the length).
+fn dot_rank(b: &[u16], h: &[f32]) -> f32 {
+    let n = b.len().min(h.len());
+    let mut acc = [0f32; 4];
+    for (b, h) in b[..n / 4 * 4].chunks_exact(4).zip(h.chunks_exact(4)) {
+        for k in 0..4 {
+            acc[k] += bf16_to_f32(b[k]) * h[k];
+        }
+    }
+    for j in n / 4 * 4..n {
+        acc[j % 4] += bf16_to_f32(b[j]) * h[j];
+    }
+    (acc[0] + acc[1]) + (acc[2] + acc[3])
 }
 
 /// The batch's tokens grouped by adapter, without those that have none.

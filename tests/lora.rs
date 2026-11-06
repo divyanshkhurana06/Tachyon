@@ -390,15 +390,18 @@ fn adapters_load_and_unload_while_serving() {
     let load =
         |name: &str, i: usize| Adapter::load(name, &tmp.join(format!("adapter{i}"))).unwrap();
     let tok = Arc::new(Tokenizer::load(&dir.join("tokenizer.json")).unwrap());
-    let s = Scheduler::spawn(
-        Box::new(cpu(&cfg, Weights::load(&dir, &cfg, Format::Q8).unwrap())),
-        tok.clone(),
-        SchedulerOptions {
-            max_seqs: 8,
-            max_seq_len: 512,
-            swap_tokens: 0,
-        },
-    );
+    let spawn = || {
+        Scheduler::spawn(
+            Box::new(cpu(&cfg, Weights::load(&dir, &cfg, Format::Q8).unwrap())),
+            tok.clone(),
+            SchedulerOptions {
+                max_seqs: 8,
+                max_seq_len: 512,
+                swap_tokens: 0,
+            },
+        )
+    };
+    let s = spawn();
     // Long enough to fill cache blocks, which the next requests reuse.
     let text =
         std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("bench/eval.txt"))
@@ -415,9 +418,21 @@ fn adapters_load_and_unload_while_serving() {
     assert_eq!(s.adapters(), ["a0", "a1"]);
     let a1 = run(Some("a1")).unwrap();
     assert_ne!(a1, a0);
-    // Padding a0 to a1's rank changes nothing, and the base is untouched.
+    // Padding a0 to a1's rank changes nothing (the rank dot product adds
+    // the padding's zeros exactly), and the base is untouched.
     assert_eq!(run(Some("a0")).unwrap(), a0);
     assert_eq!(run(None).unwrap(), base);
+    // The same as loading both before serving anything.
+    let upfront = spawn();
+    upfront.load_adapter(load("a0", 0)).unwrap();
+    upfront.load_adapter(load("a1", 1)).unwrap();
+    for (name, want) in [("a0", &a0), ("a1", &a1)] {
+        assert_eq!(
+            &reply(submit(&upfront, &prompt, Some(name), 12)).unwrap(),
+            want
+        );
+    }
+    drop(upfront);
     assert!(s
         .load_adapter(load("a0", 1))
         .unwrap_err()
