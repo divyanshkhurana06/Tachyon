@@ -43,7 +43,12 @@ const MOE_GEMM_MIN_BATCH: usize = 8;
 const LORA_TILE: usize = 8;
 
 /// Most tokens one forward pass takes (prefill chunks, speculative checks).
-pub const MAX_BATCH: usize = 256;
+/// Bigger chunks read each weight tile for more tokens: 512 against 128
+/// made prefill 12-15% faster.
+pub const MAX_BATCH: usize = 512;
+/// Most tokens one dispatch of the per-token attention kernel takes (its
+/// score scratch is `heads * max_seq` floats for each); more go in turns.
+const MAX_SINGLES: usize = 256;
 /// Most rows of logits one forward pass returns (they are 150k floats each).
 pub const MAX_LOGIT_ROWS: usize = 128;
 
@@ -449,11 +454,13 @@ impl GpuBackend {
         max_seq: usize,
         kv_half: bool,
     ) -> Result<GpuBackend> {
-        let source = if kv_half {
-            format!("#define KV_HALF\n{SOURCE}")
-        } else {
-            SOURCE.to_string()
-        };
+        // Specialized to this model: the KV cache's type, and the head size
+        // (so attention's registers and threadgroup memory fit it exactly).
+        let source = format!(
+            "{}#define HEAD_DIM {}\n{SOURCE}",
+            if kv_half { "#define KV_HALF\n" } else { "" },
+            cfg.head_dim
+        );
         let source = CString::new(source).unwrap();
         let names: Vec<CString> = KERNELS.iter().map(|k| CString::new(*k).unwrap()).collect();
         let name_ptrs: Vec<*const c_char> = names.iter().map(|n| n.as_ptr()).collect();
@@ -536,7 +543,7 @@ impl GpuBackend {
             att: Buffer::new(&ctx, b * cfg.q_dim() * f)?,
             gate_up: Buffer::new(&ctx, b * 2 * cfg.intermediate * f)?,
             hidden: Buffer::new(&ctx, b * cfg.intermediate * f)?,
-            scores: Buffer::new(&ctx, b * cfg.heads * max_seq * f)?,
+            scores: Buffer::new(&ctx, MAX_SINGLES * cfg.heads * max_seq * f)?,
             logits: Buffer::new(&ctx, MAX_LOGIT_ROWS * lm_head.rows * f)?,
             cos: Buffer::new(&ctx, b * cfg.head_dim / 2 * f)?,
             sin: Buffer::new(&ctx, b * cfg.head_dim / 2 * f)?,
@@ -976,7 +983,9 @@ impl Backend for GpuBackend {
                 [1, c.heads + c.kv_heads, t],
                 [half, 1, 1],
             );
-            if !singles.is_empty() {
+            // (Dispatches run one after another, so each group reuses the
+            // score scratch.)
+            for (g, group) in singles.chunks(MAX_SINGLES).enumerate() {
                 self.dispatch(
                     Kernel::Attention,
                     &[
@@ -988,10 +997,10 @@ impl Backend for GpuBackend {
                         (&a.positions, 0),
                         (&a.table_of, 0),
                         (&a.tables, 0),
-                        (&a.att_tokens, 0),
+                        (&a.att_tokens, g * MAX_SINGLES * 4),
                     ],
                     &attn,
-                    [c.heads, singles.len(), 1],
+                    [c.heads, group.len(), 1],
                     [ATT_THREADS as usize, 1, 1],
                 );
             }

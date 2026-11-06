@@ -9,7 +9,7 @@ use tachyon::chat::{default_system, ChatTemplate, Message};
 use tachyon::config::Config;
 use tachyon::constrain::OutputFormat;
 use tachyon::engine::{Backend, Engine, Session};
-use tachyon::generate::{generate, GenOptions, GenStats, PREFILL_CHUNK};
+use tachyon::generate::{generate, GenOptions, GenStats, LOGITS_CHUNK, PREFILL_CHUNK};
 use tachyon::json::{obj, Json};
 use tachyon::kv::BLOCK;
 use tachyon::model::{CpuBackend, Weights};
@@ -551,8 +551,8 @@ fn perplexity(engine: &mut dyn Engine, tokens: &[u32]) -> f64 {
     engine.truncate(0);
     let mut nll = 0.0;
     let mut count = 0;
-    for start in (0..tokens.len() - 1).step_by(PREFILL_CHUNK) {
-        let chunk = &tokens[start..(start + PREFILL_CHUNK).min(tokens.len() - 1)];
+    for start in (0..tokens.len() - 1).step_by(LOGITS_CHUNK) {
+        let chunk = &tokens[start..(start + LOGITS_CHUNK).min(tokens.len() - 1)];
         let vocab = engine.config().vocab;
         let logits = engine.forward(chunk, true);
         for (i, row) in logits.chunks_exact(vocab).enumerate() {
@@ -642,8 +642,8 @@ fn kld(a: &Args) -> Result<()> {
         r.truncate(0);
         q.truncate(0);
         let (mut kl, mut agree, mut nll, mut n) = (0f64, 0, 0f64, 0);
-        for start in (0..tokens.len() - 1).step_by(PREFILL_CHUNK) {
-            let chunk = &tokens[start..(start + PREFILL_CHUNK).min(tokens.len() - 1)];
+        for start in (0..tokens.len() - 1).step_by(LOGITS_CHUNK) {
+            let chunk = &tokens[start..(start + LOGITS_CHUNK).min(tokens.len() - 1)];
             let want = r.forward(chunk, true).to_vec();
             let got = q.forward(chunk, true);
             for (i, (p, g)) in want
@@ -1194,9 +1194,10 @@ fn calibrate(a: &Args) -> Result<()> {
     let started = Instant::now();
     let table: Vec<u32> = (0..blocks as u32).collect();
     let mut batch = Batch::default();
-    for (i, chunk) in tokens[..ctx].chunks(PREFILL_CHUNK).enumerate() {
+    let step = backend.prefill_chunk();
+    for (i, chunk) in tokens[..ctx].chunks(step).enumerate() {
         batch.clear();
-        batch.push(&table, i * PREFILL_CHUNK, chunk, Logits::None);
+        batch.push(&table, i * step, chunk, Logits::None);
         backend.forward(&batch);
     }
     let importance = backend.calibration.take().unwrap();

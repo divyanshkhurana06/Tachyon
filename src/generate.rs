@@ -8,8 +8,13 @@ use crate::sampler::{Sampler, SamplerConfig};
 use crate::tokenizer::{Tokenizer, Utf8Stream};
 use crate::{bail, Result};
 
-/// Prompt tokens per forward pass during prefill.
-pub const PREFILL_CHUNK: usize = 128;
+/// Prompt tokens per forward pass during prefill (a backend may split them
+/// further: the CPU takes 256 at a time).
+pub const PREFILL_CHUNK: usize = 512;
+
+/// Tokens per forward pass when every position's logits are wanted (as
+/// for perplexity): the GPU returns at most 128 rows of them.
+pub const LOGITS_CHUNK: usize = 128;
 
 #[derive(Debug, Clone)]
 pub struct GenOptions {

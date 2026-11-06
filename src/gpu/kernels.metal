@@ -493,7 +493,7 @@ kernel void attention(device const float *qkv [[buffer(0)]], device const kv_t *
     uint kv = (h / (p.heads / p.kv_heads)) * p.head_dim;
     uint d4 = p.head_dim / 4;
     device const float4 *q = (device const float4 *)(qkv + (ulong)i * p.qkv_dim + h * p.head_dim);
-    device float *sc = scores + ((ulong)i * p.heads + h) * p.max_seq;
+    device float *sc = scores + ((ulong)tg.y * p.heads + h) * p.max_seq;
     if (tid < d4) q4[tid] = q[tid];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -553,9 +553,18 @@ kernel void attention(device const float *qkv [[buffer(0)]], device const kv_t *
 // with a diagonal matrix.
 constant uint FA_SIMDS = 4;
 constant uint FA_Q = FA_SIMDS * 8;
-constant uint FA_MAX_DIM = 128;
-// cached positions per step: two blocks when they still fit in `shared`
-constant uint FA_KV = sizeof(kv_t) == 2 ? 2 * BLOCK : BLOCK;
+#ifndef HEAD_DIM
+#define HEAD_DIM 128
+#endif
+// The head size, fixed when the kernels are compiled for a model, so the
+// query and output matrices and the staging memory are no bigger than it.
+// Threadgroup memory decides how many threadgroups share a core, so it is
+// kept to about 11 KB: for 128-wide heads by taking half as many cached
+// positions per step and staging queries and outputs in two rounds.
+constant uint FA_MAX_DIM = HEAD_DIM;
+constant uint FA_ROUNDS = HEAD_DIM > 64 ? 2 : 1;
+// cached positions per step: 8 KB of keys and values
+constant uint FA_KV = 8192 / (2 * HEAD_DIM * sizeof(kv_t));
 typedef simdgroup_matrix<kv_t, 8, 8> kv8x8;
 
 kernel void attention_prefill(device const float *qkv [[buffer(0)]], device const kv_t *kc [[buffer(1)]],
@@ -566,30 +575,36 @@ kernel void attention_prefill(device const float *qkv [[buffer(0)]], device cons
                               uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
                               uint sg [[simdgroup_index_in_threadgroup]]) {
     // Queries on the way in, keys and values per block, outputs at the end.
-    threadgroup float shared[FA_Q * FA_MAX_DIM];
+    threadgroup float shared[FA_Q * FA_MAX_DIM / FA_ROUNDS];
     threadgroup float scores[FA_SIMDS][8 * FA_KV];
     threadgroup float diag[FA_SIMDS][64];
 
     uint h = tg.x, first = tiles[tg.y].x, count = tiles[tg.y].y;
-    uint D = p.head_dim, d4 = D / 4;
+    const uint D = HEAD_DIM, d4 = D / 4;
     uint kv = (h / (p.heads / p.kv_heads)) * D;
     device const uint *table = tables + table_of[first];
     uint n = positions[first + count - 1] + 1; // cached positions any query sees
 
     // This simdgroup's 8 queries, pre-scaled; rows past the run are zero.
+    // Staged through `shared` FA_SIMDS / FA_ROUNDS simdgroups at a time.
     uint q0 = sg * 8;
-    threadgroup float *qs = shared + q0 * D;
+    const uint per_round = FA_SIMDS / FA_ROUNDS;
+    threadgroup float *qs = shared + (sg % per_round) * 8 * D;
+    for (uint e = lane; e < 64; e += 32) diag[sg][e] = 0;
+    // Queries in half precision (like the keys), which halves the registers
+    // they take; outputs stay in float.
+    simdgroup_half8x8 q[FA_MAX_DIM / 8];
+    simdgroup_float8x8 o[FA_MAX_DIM / 8];
+    threadgroup half *qh = (threadgroup half *)shared + sg * 8 * D;
     for (uint e = lane; e < 8 * d4; e += 32) {
         uint r = e / d4, c = (e % d4) * 4;
         float4 v = q0 + r < count ? *(device const float4 *)(qkv + (ulong)(first + q0 + r) * p.qkv_dim + h * D + c)
                                   : float4(0);
-        *(threadgroup float4 *)(qs + r * D + c) = v * p.scale;
+        *(threadgroup half4 *)(qh + r * D + c) = half4(v * p.scale);
     }
-    for (uint e = lane; e < 64; e += 32) diag[sg][e] = 0;
     simdgroup_barrier(mem_flags::mem_threadgroup);
-    simdgroup_float8x8 q[FA_MAX_DIM / 8], o[FA_MAX_DIM / 8];
     for (uint j = 0; j < D / 8; j++) {
-        simdgroup_load(q[j], qs + j * 8, D);
+        simdgroup_load(q[j], qh + j * 8, D);
         o[j] = simdgroup_float8x8(0);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -665,22 +680,28 @@ kernel void attention_prefill(device const float *qkv [[buffer(0)]], device cons
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // o / l, staged so only the run's rows are written
+    // o / l, staged so only the run's rows are written (in rounds, as the
+    // queries came in)
     if (lane % 4 == 0) diag[sg][row * 9] = 1.0f / l;
     simdgroup_barrier(mem_flags::mem_threadgroup);
     simdgroup_float8x8 dm;
     simdgroup_load(dm, diag[sg], 8);
-    threadgroup float *os = shared + q0 * D;
-    for (uint j = 0; j < D / 8; j++) {
-        simdgroup_float8x8 t;
-        simdgroup_multiply(t, dm, o[j]);
-        simdgroup_store(t, os + j * 8, D);
-    }
-    simdgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint e = lane; e < 8 * d4; e += 32) {
-        uint r = e / d4, c = (e % d4) * 4;
-        if (q0 + r < count)
-            *(device float4 *)(out + (ulong)(first + q0 + r) * p.q_dim + h * D + c) = *(threadgroup float4 *)(os + r * D + c);
+    for (uint round = 0; round < FA_ROUNDS; round++) {
+        if (sg / per_round == round) {
+            for (uint j = 0; j < D / 8; j++) {
+                simdgroup_float8x8 t;
+                simdgroup_multiply(t, dm, o[j]);
+                simdgroup_store(t, qs + j * 8, D);
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint e = lane; e < 8 * d4; e += 32) {
+                uint r = e / d4, c = (e % d4) * 4;
+                if (q0 + r < count)
+                    *(device float4 *)(out + (ulong)(first + q0 + r) * p.q_dim + h * D + c) =
+                        *(threadgroup float4 *)(qs + r * D + c);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 

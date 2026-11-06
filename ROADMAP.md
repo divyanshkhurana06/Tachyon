@@ -87,18 +87,20 @@ finished; every one should end with a number in the README.
 - [x] **`tachyon kld`**: KL divergence from bf16 and top-token agreement, which showed the importance matrix cutting `q4m`'s divergence by 40% where short-text perplexity said it didn't help
 - [x] **LoRA adapters loaded and unloaded while serving** (vLLM's `/v1/load_lora_adapter` and `/v1/unload_lora_adapter`), serialized with requests in the scheduler, with a prefix-cache salt per adapter ever loaded
 - [x] **Priority preemption**: a more urgent request with no room preempts less urgent running ones; under a full 8-sequence server its time to first token went from 9.3 s to 0.034 s
+- [x] **Prefill attention compiled for the model's head size**, with half-precision queries and less threadgroup memory for 128-wide heads, so more threadgroups share a core: 2,048-token prefill +47% (Qwen2.5-0.5B) to +64% (Qwen3-0.6B), 90% of llama.cpp from 63%. GPU prefill in 512-token passes
+- Tried and rejected: skipping the output rescale when no maximum moves, half-precision probabilities (no faster); 256-token CPU prefill passes (12% slower)
 - Tried and rejected: 6-bit fields packed as in Q4_K (4.5 bits per weight, but unpacking them cost 20% of CPU decode); expanding a row's scales into memory before its dot product, even eight rows at a time (about a tenth of decode on short rows)
 
 ## Next
 
 ### Long context
 
-At 2,048 tokens, prefill is 63% of llama.cpp's and decode about 92%. Attention is a third of prefill time there and an eighth of decode. Splitting a head's context across threadgroups, scores in threadgroup memory, and smaller or larger query tiles were all measured and didn't help, so the next attempts are structural:
+At 2,048 tokens, prefill is 90% of llama.cpp's and decode about 92%. Prefill attention got there by fitting more threadgroups on each core; attention is now about a tenth of prefill time at 2k for 64-wide heads. Next:
 
 - **Decode:** a single-pass kernel with an online softmax per simdgroup (no scores pass, no barriers until the merge), reading keys a cache block at a time.
-- **Prefill:** double-buffered key/value tiles, so loading the next tile overlaps the matrix multiplies on this one.
+- **Prefill at 8k:** measure, then double-buffered key/value tiles so loading the next tile overlaps the matrix multiplies on this one, and fewer registers for 128-wide heads (the output matrices alone take 32 per lane).
 
-*Done when:* both are within 90% of llama.cpp at 2k and 8k tokens.
+*Done when:* both are within 90% of llama.cpp at 8k tokens too.
 
 ### CPU prefill
 

@@ -17,6 +17,13 @@ pub trait Backend: Send {
     /// Most tokens one forward pass takes.
     fn max_batch(&self) -> usize;
 
+    /// Prompt tokens per forward pass that process fastest: on the GPU as
+    /// many as fit (each weight tile is read for more tokens), on the CPU
+    /// fewer, which its caches favor.
+    fn prefill_chunk(&self) -> usize {
+        self.max_batch()
+    }
+
     /// Runs `batch` and returns logits for its `logit_rows`, one row of
     /// `config().vocab` values each.
     fn forward(&mut self, batch: &Batch) -> &[f32];
@@ -170,14 +177,19 @@ impl Engine for Session {
             self.pos + tokens.len() <= self.max_seq,
             "context window full"
         );
-        let step = self.backend.max_batch();
         let logits = if all { Logits::All } else { Logits::Last };
-        // Split oversized calls; only the final chunk's logits are kept,
-        // so `all` must fit in one batch.
-        assert!(
-            !all || tokens.len() <= step,
-            "at most {step} tokens when asking for all logits"
-        );
+        // Split long calls; only the final chunk's logits are kept, so
+        // `all` must fit in one batch.
+        let step = if all {
+            let most = self.backend.max_batch();
+            assert!(
+                tokens.len() <= most,
+                "at most {most} tokens when asking for all logits"
+            );
+            most
+        } else {
+            self.backend.prefill_chunk()
+        };
         let chunks = tokens.len().div_ceil(step);
         for (i, chunk) in tokens.chunks(step).enumerate() {
             self.batch.clear();

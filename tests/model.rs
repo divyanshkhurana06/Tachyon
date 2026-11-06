@@ -278,6 +278,57 @@ fn gpu_reads_quantized_weights_as_the_cpu_does() {
     }
 }
 
+/// More single tokens in one batch than one dispatch of the per-token
+/// attention kernel takes: each still gets what it gets alone.
+#[cfg(target_os = "macos")]
+#[test]
+fn gpu_attention_takes_more_tokens_than_one_dispatch() {
+    use tachyon::engine::Backend;
+    use tachyon::kv::{Batch, Logits};
+    let Some((_g, dir)) = setup() else { return };
+    let tok = Tokenizer::load(&dir.join("tokenizer.json")).unwrap();
+    let cfg = Config::load(&dir).unwrap();
+    let w = Weights::load(&dir, &cfg, Format::Q8).unwrap();
+    let mut gpu = match tachyon::gpu::GpuBackend::new(cfg.clone(), w, 2 * 300 + 8, 64, true) {
+        Ok(g) => g,
+        Err(e) => return eprintln!("skipping: {e}"),
+    };
+    let ids = tok.encode("one two three", false);
+    // 300 sequences of two tokens: their first tokens in one batch, then
+    // their second tokens (each alone in its sequence: per-token attention).
+    let n = 300;
+    let table = |i: usize| [2 * i as u32, 2 * i as u32 + 1];
+    let token = |i: usize, j: usize| ids[(i + j) % ids.len()];
+    let watched = [0, 255, 256, 299];
+    let mut b = Batch::default();
+    for i in 0..n {
+        b.push(&table(i), 0, &[token(i, 0)], Logits::None);
+    }
+    gpu.forward(&b);
+    b.clear();
+    for i in 0..n {
+        let want = if watched.contains(&i) {
+            Logits::Last
+        } else {
+            Logits::None
+        };
+        b.push(&table(i), 1, &[token(i, 1)], want);
+    }
+    let together = gpu.forward(&b).to_vec();
+    for (k, &i) in watched.iter().enumerate() {
+        let mut one = Batch::default();
+        one.push(&table(i), 1, &[token(i, 1)], Logits::Last);
+        let alone = gpu.forward(&one)[..cfg.vocab].to_vec();
+        let got = &together[k * cfg.vocab..(k + 1) * cfg.vocab];
+        let diff = got
+            .iter()
+            .zip(&alone)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(diff < 0.05, "sequence {i}: {diff}");
+    }
+}
+
 /// The prefill attention kernel (a run of tokens at once, through a
 /// scrambled block table) against the per-token kernel, over many cache
 /// blocks and query tiles.
