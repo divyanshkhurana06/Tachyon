@@ -3,7 +3,7 @@
 //! integer sum is scaled into one running total, the same arithmetic for one
 //! token or four, so batching never changes a result.
 
-use super::{bf16_to_f32, QK};
+use super::{bf16_to_f32, Scales, QK};
 use std::arch::wasm32::*;
 
 /// The sum of a block's 32 int8 products.
@@ -27,10 +27,14 @@ unsafe fn block(w0: v128, w1: v128, x: *const i8) -> i32 {
 }
 
 pub fn dot_q8(ws: &[f32], wq: &[i8], xs: &[f32], xq: &[i8]) -> f32 {
-    let nb = ws.len();
+    dot_q8_with(ws, wq, xs, xq)
+}
+
+pub fn dot_q8_with(ws: impl Scales, wq: &[i8], xs: &[f32], xq: &[i8]) -> f32 {
+    let nb = ws.blocks();
     assert!(wq.len() >= nb * QK && xq.len() >= nb * QK && xs.len() >= nb);
     let mut acc = 0.0;
-    for b in 0..nb {
+    for (b, &x) in xs[..nb].iter().enumerate() {
         let s = unsafe {
             let p = wq.as_ptr().add(b * QK);
             let (w0, w1) = (
@@ -39,16 +43,21 @@ pub fn dot_q8(ws: &[f32], wq: &[i8], xs: &[f32], xq: &[i8]) -> f32 {
             );
             block(w0, w1, xq.as_ptr().add(b * QK))
         };
-        acc += s as f32 * (ws[b] * xs[b]);
+        // SAFETY: b < nb.
+        acc += s as f32 * (unsafe { ws.get(b) } * x);
     }
     acc
 }
 
 pub fn dot_q4(ws: &[f32], wq: &[u8], xs: &[f32], xq: &[i8]) -> f32 {
-    let nb = ws.len();
+    dot_q4_with(ws, wq, xs, xq)
+}
+
+pub fn dot_q4_with(ws: impl Scales, wq: &[u8], xs: &[f32], xq: &[i8]) -> f32 {
+    let nb = ws.blocks();
     assert!(wq.len() >= nb * QK / 2 && xq.len() >= nb * QK && xs.len() >= nb);
     let mut acc = 0.0;
-    for b in 0..nb {
+    for (b, &x) in xs[..nb].iter().enumerate() {
         let s = unsafe {
             let raw = v128_load(wq.as_ptr().add(b * QK / 2) as *const v128);
             let eight = i8x16_splat(8);
@@ -56,7 +65,8 @@ pub fn dot_q4(ws: &[f32], wq: &[u8], xs: &[f32], xq: &[i8]) -> f32 {
             let w1 = i8x16_sub(u8x16_shr(raw, 4), eight);
             block(w0, w1, xq.as_ptr().add(b * QK))
         };
-        acc += s as f32 * (ws[b] * xs[b]);
+        // SAFETY: b < nb.
+        acc += s as f32 * (unsafe { ws.get(b) } * x);
     }
     acc
 }

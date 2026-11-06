@@ -79,11 +79,19 @@ finished; every one should end with a number in the README.
 - [x] **Granite tool calling** in its own format, and its template's default system message fixed
 - [x] **AVX2 kernels** for x86-64, picked at run time, and a Linux CI job that runs every test on them
 
+### v0.9: smaller and faster quantized weights
+
+- [x] **Packed 4-bit scales**: each block's scale and offset as 8-bit multiples of f16 steps shared by 256 weights, refitted to that grid. 4.625 bits per weight for the 4-bit matrices (from 6), with the same quality by KL divergence; models 6-18% smaller
+- [x] **f16 scales for 8-bit weights** (llama.cpp's Q8_0 layout): 8.5 bits per weight, from 9
+- [x] **Compact scales converted where they're used**: the single-token CPU kernels convert eight scales at a time in registers; GPU lanes take eight weights (both nibbles of four bytes) per scale. 4-bit decode 13-26% faster on the GPU, as fast as before on the CPU; GPU decode at chat lengths now on par with llama.cpp
+- [x] **`tachyon kld`**: KL divergence from bf16 and top-token agreement, which showed the importance matrix cutting `q4m`'s divergence by 40% where short-text perplexity said it didn't help
+- Tried and rejected: 6-bit fields packed as in Q4_K (4.5 bits per weight, but unpacking them cost 20% of CPU decode); expanding a row's scales into memory before its dot product, even eight rows at a time (about a tenth of decode on short rows)
+
 ## Next
 
 ### Long context
 
-At 2,048 tokens, prefill is 65% of llama.cpp's and decode 87%. Attention is a third of prefill time there and an eighth of decode. Splitting a head's context across threadgroups, scores in threadgroup memory, and smaller or larger query tiles were all measured and didn't help, so the next attempts are structural:
+At 2,048 tokens, prefill is 63% of llama.cpp's and decode about 92%. Attention is a third of prefill time there and an eighth of decode. Splitting a head's context across threadgroups, scores in threadgroup memory, and smaller or larger query tiles were all measured and didn't help, so the next attempts are structural:
 
 - **Decode:** a single-pass kernel with an online softmax per simdgroup (no scores pass, no barriers until the merge), reading keys a cache block at a time.
 - **Prefill:** double-buffered key/value tiles, so loading the next tile overlaps the matrix multiplies on this one.
@@ -94,14 +102,10 @@ At 2,048 tokens, prefill is 65% of llama.cpp's and decode 87%. Attention is a th
 
 About 65% of llama.cpp. Next: repack weights at load into the interleaved layout `smmla` reads, so the per-block shuffles go away, and fuse activation quantization into the previous op.
 
-### Smaller 4-bit
+### Quantization
 
-With per-block offsets `q4m` is 3.2% from bf16, but each 32 weights now carry 8 bytes of scale and offset.
-
-- **k-quant packing:** 256-weight super-blocks with 6-bit sub-block scales and offsets, for the same quality in 4.5 bits per weight instead of 6.
-- A bigger, more varied calibration set (the importance matrix now helps `q4` but not `q4m`).
-
-*Done when:* `q4m` quality at under 5 bits per weight.
+- **3-bit** matrices in the same packed layout, chosen per matrix by measured KL divergence, for a model under 300 MB.
+- A bigger, more varied calibration set, and the importance matrix computed on the GPU.
 
 ### Serving
 

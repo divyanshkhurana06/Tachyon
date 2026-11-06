@@ -38,54 +38,83 @@ inline void write_out(device float *y, device const float *bias, constant MatPar
     y[idx] = p.accumulate ? y[idx] + s : s;
 }
 
-// Loaders: weights (row, k..k+4) as float4. `cols` is a multiple of 32.
+// Loaders: the weights of `row` at columns k..k+4 and k+16..k+20, where k
+// is 0, 4, 8 or 12 into a 32-column block (`cols` is a multiple of 32). A
+// 4-bit block keeps those eight in the same four bytes, so one load and one
+// scale serve all of them.
+struct W8 {
+    float4 lo, hi;
+};
+
+inline float4 bf16x4(ushort4 q) {
+    return float4(as_type<float>(uint(q.x) << 16), as_type<float>(uint(q.y) << 16),
+                  as_type<float>(uint(q.z) << 16), as_type<float>(uint(q.w) << 16));
+}
+
 struct LoadBf16 {
     device const ushort *w;
     uint cols;
-    float4 operator()(uint row, uint k) const {
-        ushort4 q = *(device const ushort4 *)(w + (ulong)row * cols + k);
-        return float4(as_type<float>(uint(q.x) << 16), as_type<float>(uint(q.y) << 16),
-                      as_type<float>(uint(q.z) << 16), as_type<float>(uint(q.w) << 16));
+    W8 operator()(uint row, uint k) const {
+        device const ushort *p = w + (ulong)row * cols + k;
+        return {bf16x4(*(device const ushort4 *)p), bf16x4(*(device const ushort4 *)(p + 16))};
     }
 };
 
+// Q8 blocks: 32 int8 weights and an f16 scale.
 struct LoadQ8 {
-    device const float *scales;
+    device const half *scales;
     device const char *qs;
     uint cols;
-    float4 operator()(uint row, uint k) const {
+    W8 operator()(uint row, uint k) const {
         ulong e = (ulong)row * cols + k;
-        return float4(*(device const char4 *)(qs + e)) * scales[e / 32];
+        float s = scales[e / 32];
+        return {float4(*(device const char4 *)(qs + e)) * s, float4(*(device const char4 *)(qs + e + 16)) * s};
     }
 };
 
 // Q4 blocks: 16 bytes per 32 weights; byte j holds weight j (low nibble) and
 // weight j+16 (high nibble), each stored offset by 8. A weight is
-// (q - 8) * scale + offset, with a scale and an offset per block.
+// (q - 8) * scale + offset. Scales and offsets are packed per 8 blocks of a
+// row in five words (see kernels::quantize_q4_packed): f16 steps D and M,
+// then a byte per block of scale (unsigned) and of offset (signed) in units
+// of them.
+inline float2 q4_scale(device const uint *packed, uint row, uint cols, uint block) {
+    device const uint *w = packed + ((ulong)row * ((cols / 32 + 7) / 8) + block / 8) * 5;
+    float2 step = float2(as_type<half2>(w[0]));
+    uint j = block % 8;
+    uint s = (w[1 + j / 4] >> (8 * (j % 4))) & 255;
+    int o = as_type<char4>(w[3 + j / 4])[j % 4];
+    return float2(step.x * float(s), step.y * float(o));
+}
+
 struct LoadQ4 {
-    device const float *scales;
+    device const uint *scales;
     device const uchar *qs;
-    device const float *offsets;
     uint cols;
-    float4 operator()(uint row, uint k) const {
+    W8 operator()(uint row, uint k) const {
         ulong e = (ulong)row * cols + k;
-        ulong block = e / 32;
-        uint j = e % 32;
-        uchar4 c = *(device const uchar4 *)(qs + block * 16 + (j & 15));
-        float4 v = j < 16 ? float4(c & uchar4(0xF)) : float4(c >> uchar4(4));
-        return (v - 8.0f) * scales[block] + offsets[block];
+        uchar4 c = *(device const uchar4 *)(qs + (e / 32) * 16 + k % 32);
+        float2 dc = q4_scale(scales, row, cols, k / 32);
+        return {(float4(c & uchar4(0xF)) - 8.0f) * dc.x + dc.y, (float4(c >> uchar4(4)) - 8.0f) * dc.x + dc.y};
     }
 };
+
+// Each lane's first column: per 256 columns, lane l takes block l / 4,
+// columns (l % 4) * 4 and 16 more.
+inline uint lane_k(uint lane) { return (lane / 4) * 32 + (lane % 4) * 4; }
 
 template <typename L>
 inline void matmul_impl(thread const L &load, device const float *x, device float *y, device const float *bias,
                         constant MatParams &p, uint row0, uint lane) {
     if (p.t == 1) { // decode: the hot path, kept lean
         float acc[R] = {0, 0, 0, 0};
-        for (uint k = lane * 4; k < p.cols; k += 128) {
-            float4 xv = *(device const float4 *)(x + k);
+        for (uint k = lane_k(lane); k < p.cols; k += 256) {
+            float4 x0 = *(device const float4 *)(x + k), x1 = *(device const float4 *)(x + k + 16);
             for (uint r = 0; r < R; r++) {
-                if (row0 + r < p.rows) acc[r] += dot(load(row0 + r, k), xv);
+                if (row0 + r < p.rows) {
+                    W8 w = load(row0 + r, k);
+                    acc[r] += dot(w.lo, x0) + dot(w.hi, x1);
+                }
             }
         }
         for (uint r = 0; r < R; r++) {
@@ -97,16 +126,20 @@ inline void matmul_impl(thread const L &load, device const float *x, device floa
     for (uint base = 0; base < p.t; base += TB) {
         uint nb = min(TB, p.t - base);
         float acc[R * TB] = {0};
-        for (uint k = lane * 4; k < p.cols; k += 128) {
-            float4 xv[TB];
+        for (uint k = lane_k(lane); k < p.cols; k += 256) {
+            float4 x0[TB], x1[TB];
             for (uint j = 0; j < TB; j++) {
-                if (j < nb) xv[j] = *(device const float4 *)(x + (ulong)(base + j) * p.cols + k);
+                if (j < nb) {
+                    device const float *xj = x + (ulong)(base + j) * p.cols + k;
+                    x0[j] = *(device const float4 *)xj;
+                    x1[j] = *(device const float4 *)(xj + 16);
+                }
             }
             for (uint r = 0; r < R; r++) {
                 if (row0 + r >= p.rows) break;
-                float4 wf = load(row0 + r, k);
+                W8 w = load(row0 + r, k);
                 for (uint j = 0; j < TB; j++) {
-                    if (j < nb) acc[r * TB + j] += dot(wf, xv[j]);
+                    if (j < nb) acc[r * TB + j] += dot(w.lo, x0[j]) + dot(w.hi, x1[j]);
                 }
             }
         }
@@ -129,7 +162,7 @@ kernel void matmul_bf16(device const ushort *w [[buffer(0)]], device const float
     matmul_impl(load, x, y, bias, p, (tg * SIMDS + sg) * R, lane);
 }
 
-kernel void matmul_q8(device const float *scales [[buffer(0)]], device const char *qs [[buffer(1)]],
+kernel void matmul_q8(device const half *scales [[buffer(0)]], device const char *qs [[buffer(1)]],
                       device const float *x [[buffer(2)]], device float *y [[buffer(3)]],
                       device const float *bias [[buffer(4)]], constant MatParams &p [[buffer(5)]],
                       uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
@@ -138,12 +171,12 @@ kernel void matmul_q8(device const float *scales [[buffer(0)]], device const cha
     matmul_impl(load, x, y, bias, p, (tg * SIMDS + sg) * R, lane);
 }
 
-kernel void matmul_q4(device const float *scales [[buffer(0)]], device const uchar *qs [[buffer(1)]],
-                      device const float *offsets [[buffer(2)]], device const float *x [[buffer(3)]],
-                      device float *y [[buffer(4)]], device const float *bias [[buffer(5)]],
-                      constant MatParams &p [[buffer(6)]], uint tg [[threadgroup_position_in_grid]],
-                      uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-    LoadQ4 load = {scales, qs, offsets, p.cols};
+kernel void matmul_q4(device const uint *scales [[buffer(0)]], device const uchar *qs [[buffer(1)]],
+                      device const float *x [[buffer(2)]], device float *y [[buffer(3)]],
+                      device const float *bias [[buffer(4)]], constant MatParams &p [[buffer(5)]],
+                      uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                      uint lane [[thread_index_in_simdgroup]]) {
+    LoadQ4 load = {scales, qs, p.cols};
     matmul_impl(load, x, y, bias, p, (tg * SIMDS + sg) * R, lane);
 }
 
@@ -177,7 +210,7 @@ struct TileBf16 {
 };
 
 struct TileQ8 {
-    device const float *scales;
+    device const half *scales;
     device const char *qs;
     uint cols;
     void operator()(threadgroup half *d, uint row, uint k) const {
@@ -191,16 +224,15 @@ struct TileQ8 {
 };
 
 struct TileQ4 {
-    device const float *scales;
+    device const uint *scales;
     device const uchar *qs;
-    device const float *offsets;
     uint cols;
     void operator()(threadgroup half *d, uint row, uint k) const {
         ulong e = (ulong)row * cols + k;
-        ulong block = e / 32;
-        bool high = (e % 32) >= 16;
-        device const uchar4 *q = (device const uchar4 *)(qs + block * 16);
-        float s = scales[block], o = offsets[block];
+        bool high = (k % 32) >= 16;
+        device const uchar4 *q = (device const uchar4 *)(qs + (e / 32) * 16);
+        float2 dc = q4_scale(scales, row, cols, k / 32);
+        float s = dc.x, o = dc.y;
         for (uint i = 0; i < 4; i++) {
             uchar4 c = q[i];
             float4 f = ((high ? float4(c >> uchar4(4)) : float4(c & uchar4(0xF))) - 8.0f) * s + o;
@@ -306,7 +338,7 @@ kernel void gemm_bf16(device const ushort *w [[buffer(0)]], device const float *
     gemm_impl(tile, g, x, p.rows, p.cols, tg, tid, sg, shared);
 }
 
-kernel void gemm_q8(device const float *scales [[buffer(0)]], device const char *qs [[buffer(1)]],
+kernel void gemm_q8(device const half *scales [[buffer(0)]], device const char *qs [[buffer(1)]],
                     device const float *x [[buffer(2)]], device float *y [[buffer(3)]],
                     device const float *bias [[buffer(4)]], constant MatParams &p [[buffer(5)]],
                     uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
@@ -317,13 +349,13 @@ kernel void gemm_q8(device const float *scales [[buffer(0)]], device const char 
     gemm_impl(tile, g, x, p.rows, p.cols, tg, tid, sg, shared);
 }
 
-kernel void gemm_q4(device const float *scales [[buffer(0)]], device const uchar *qs [[buffer(1)]],
-                    device const float *offsets [[buffer(2)]], device const float *x [[buffer(3)]],
-                    device float *y [[buffer(4)]], device const float *bias [[buffer(5)]],
-                    constant MatParams &p [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]],
-                    uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+kernel void gemm_q4(device const uint *scales [[buffer(0)]], device const uchar *qs [[buffer(1)]],
+                    device const float *x [[buffer(2)]], device float *y [[buffer(3)]],
+                    device const float *bias [[buffer(4)]], constant MatParams &p [[buffer(5)]],
+                    uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                    uint sg [[simdgroup_index_in_threadgroup]]) {
     threadgroup float shared[GM_TOK * GM_ROWS];
-    TileQ4 tile = {scales, qs, offsets, p.cols};
+    TileQ4 tile = {scales, qs, p.cols};
     DenseRows g = {y, bias, p.t, p.rows, p.accumulate, p.has_bias};
     gemm_impl(tile, g, x, p.rows, p.cols, tg, tid, sg, shared);
 }
@@ -672,10 +704,13 @@ inline void moe_impl(thread const L &load, device const float *x, device float *
     uint base = ids[slot] * p.rows;
     device const float *xs = x + (ulong)(p.per_slot ? slot : slot / p.k) * p.cols;
     float acc[R] = {0, 0, 0, 0};
-    for (uint k = lane * 4; k < p.cols; k += 128) {
-        float4 xv = *(device const float4 *)(xs + k);
+    for (uint k = lane_k(lane); k < p.cols; k += 256) {
+        float4 x0 = *(device const float4 *)(xs + k), x1 = *(device const float4 *)(xs + k + 16);
         for (uint r = 0; r < R; r++) {
-            if (row0 + r < p.rows) acc[r] += dot(load(base + row0 + r, k), xv);
+            if (row0 + r < p.rows) {
+                W8 w = load(base + row0 + r, k);
+                acc[r] += dot(w.lo, x0) + dot(w.hi, x1);
+            }
         }
     }
     for (uint r = 0; r < R; r++) {
@@ -692,7 +727,7 @@ kernel void moe_bf16(device const ushort *w [[buffer(0)]], device const float *x
     moe_impl(load, x, y, ids, p, tg, sg, lane);
 }
 
-kernel void moe_q8(device const float *scales [[buffer(0)]], device const char *qs [[buffer(1)]],
+kernel void moe_q8(device const half *scales [[buffer(0)]], device const char *qs [[buffer(1)]],
                    device const float *x [[buffer(2)]], device float *y [[buffer(3)]],
                    device const uint *ids [[buffer(4)]], constant MoeParams &p [[buffer(5)]],
                    uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
@@ -701,12 +736,12 @@ kernel void moe_q8(device const float *scales [[buffer(0)]], device const char *
     moe_impl(load, x, y, ids, p, tg, sg, lane);
 }
 
-kernel void moe_q4(device const float *scales [[buffer(0)]], device const uchar *qs [[buffer(1)]],
-                   device const float *offsets [[buffer(2)]], device const float *x [[buffer(3)]],
-                   device float *y [[buffer(4)]], device const uint *ids [[buffer(5)]],
-                   constant MoeParams &p [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]],
-                   uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-    LoadQ4 load = {scales, qs, offsets, p.cols};
+kernel void moe_q4(device const uint *scales [[buffer(0)]], device const uchar *qs [[buffer(1)]],
+                   device const float *x [[buffer(2)]], device float *y [[buffer(3)]],
+                   device const uint *ids [[buffer(4)]], constant MoeParams &p [[buffer(5)]],
+                   uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                   uint lane [[thread_index_in_simdgroup]]) {
+    LoadQ4 load = {scales, qs, p.cols};
     moe_impl(load, x, y, ids, p, tg, sg, lane);
 }
 
@@ -742,13 +777,13 @@ MOE_GEMM(moe_gemm_bf16, TileBf16,
              device const float *unused2 [[buffer(2)]],
          (TileBf16{w, p.cols}))
 MOE_GEMM(moe_gemm_q8, TileQ8,
-         device const float *scales [[buffer(0)]] COMMA device const char *qs [[buffer(1)]] COMMA
+         device const half *scales [[buffer(0)]] COMMA device const char *qs [[buffer(1)]] COMMA
              device const float *unused [[buffer(2)]],
          (TileQ8{scales, qs, p.cols}))
 MOE_GEMM(moe_gemm_q4, TileQ4,
-         device const float *scales [[buffer(0)]] COMMA device const uchar *qs [[buffer(1)]] COMMA
-             device const float *offsets [[buffer(2)]],
-         (TileQ4{scales, qs, offsets, p.cols}))
+         device const uint *scales [[buffer(0)]] COMMA device const uchar *qs [[buffer(1)]] COMMA
+             device const float *unused [[buffer(2)]],
+         (TileQ4{scales, qs, p.cols}))
 
 // A thread per token: its k highest router scores (ties to the lower
 // expert, as on the CPU), weighted by a softmax over those k.

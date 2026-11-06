@@ -218,6 +218,66 @@ fn gpu_matches_cpu() {
     assert_eq!(on_gpu, on_cpu);
 }
 
+/// Each quantized format means the same weights on the GPU as on the CPU:
+/// next-token distributions agree closely through the GPU's GEMM (a
+/// prompt), small-batch and single-token paths. Not exactly, because the
+/// CPU also rounds activations to 8 bits; a misread scale or nibble would
+/// be far outside this.
+#[cfg(target_os = "macos")]
+#[test]
+fn gpu_reads_quantized_weights_as_the_cpu_does() {
+    use tachyon::engine::Backend;
+    use tachyon::kv::{Batch, Logits};
+    let Some((_g, dir)) = setup() else { return };
+    let tok = Tokenizer::load(&dir.join("tokenizer.json")).unwrap();
+    let cfg = Config::load(&dir).unwrap();
+    let text =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("bench/eval.txt"))
+            .unwrap();
+    let ids = &tok.encode(&text, false)[..36];
+    let pool = Arc::new(Pool::new(Pool::default_threads()));
+    let log_softmax = |row: &[f32]| {
+        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+        let lse = max
+            + row
+                .iter()
+                .map(|&l| (l as f64 - max).exp())
+                .sum::<f64>()
+                .ln();
+        row.iter().map(|&l| l as f64 - lse).collect::<Vec<f64>>()
+    };
+    for format in [Format::Q8, Format::Q4M, Format::Q4] {
+        let w = Weights::load(&dir, &cfg, format).unwrap();
+        let mut gpu = match tachyon::gpu::GpuBackend::new(cfg.clone(), w, 16, 256, true) {
+            Ok(g) => g,
+            Err(e) => return eprintln!("skipping: {e}"),
+        };
+        let w = Weights::load(&dir, &cfg, format).unwrap();
+        let mut cpu = CpuBackend::new(cfg.clone(), w, pool.clone(), 16);
+        let table: Vec<u32> = (0..3).collect();
+        let mut worst = 0f64;
+        // 32 tokens, then 3, then 1.
+        for (start, end) in [(0, 32), (32, 35), (35, 36)] {
+            let mut b = Batch::default();
+            b.push(&table, start, &ids[start..end], Logits::All);
+            let on_gpu = gpu.forward(&b).to_vec();
+            let on_cpu = cpu.forward(&b);
+            let rows = on_gpu
+                .chunks_exact(cfg.vocab)
+                .zip(on_cpu.chunks_exact(cfg.vocab));
+            // Position 0 has the model's outsized first-token activations,
+            // where the CPU's 8-bit rounding shows most: left out.
+            for (g, c) in rows.skip((start == 0) as usize) {
+                let (lg, lc) = (log_softmax(g), log_softmax(c));
+                let kl: f64 = lc.iter().zip(&lg).map(|(&c, &g)| c.exp() * (c - g)).sum();
+                worst = worst.max(kl);
+            }
+        }
+        eprintln!("{}: worst KL between backends {worst:.5}", format.name());
+        assert!(worst < 0.02, "{}: {worst}", format.name());
+    }
+}
+
 /// The prefill attention kernel (a run of tokens at once, through a
 /// scrambled block table) against the per-token kernel, over many cache
 /// blocks and query tiles.

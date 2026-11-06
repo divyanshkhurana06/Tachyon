@@ -210,7 +210,7 @@ struct GpuMatrix {
     kernel: Kernel,
     rows: usize,
     cols: usize,
-    /// bf16: [data]; quantized: [scales, quants]
+    /// bf16: [data]; quantized: [scales (f16, or packed 4-bit), quants]
     bufs: Vec<Buffer>,
 }
 
@@ -225,29 +225,13 @@ impl GpuMatrix {
                     Buffer::from_slice(ctx, qs)?,
                 ],
             ),
-            Matrix::Q4 {
-                scales,
-                qs,
-                offsets,
-                ..
-            } => {
-                let zeros;
-                let offsets = match offsets {
-                    Some(o) => o.as_slice(),
-                    None => {
-                        zeros = vec![0f32; scales.len()];
-                        &zeros
-                    }
-                };
-                (
-                    Kernel::MatQ4,
-                    vec![
-                        Buffer::from_slice(ctx, scales)?,
-                        Buffer::from_slice(ctx, qs)?,
-                        Buffer::from_slice(ctx, offsets)?,
-                    ],
-                )
-            }
+            Matrix::Q4 { scales, qs, .. } => (
+                Kernel::MatQ4,
+                vec![
+                    Buffer::from_slice(ctx, scales)?,
+                    Buffer::from_slice(ctx, qs)?,
+                ],
+            ),
         };
         if m.cols() % 32 != 0 {
             return Err(Error::msg("GPU matrices need a multiple of 32 columns"));

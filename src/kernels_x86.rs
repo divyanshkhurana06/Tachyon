@@ -9,7 +9,7 @@
 //! same instructions in the same order for one token or four, so batching
 //! never changes a result.
 
-use super::{scalar, QK};
+use super::{scalar, Scales, QK};
 use std::arch::x86_64::*;
 use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
 
@@ -76,11 +76,11 @@ unsafe fn load(p: *const i8) -> __m256i {
 }
 
 #[target_feature(enable = "avx2,fma")]
-unsafe fn q8(ws: &[f32], wq: &[i8], xs: &[f32], xq: &[i8]) -> f32 {
+unsafe fn q8<S: Scales>(ws: S, wq: &[i8], xs: &[f32], xq: &[i8]) -> f32 {
     let mut acc = _mm256_setzero_ps();
-    for b in 0..ws.len() {
+    for b in 0..ws.blocks() {
         let s = block_q8(load(wq.as_ptr().add(b * QK)), load(xq.as_ptr().add(b * QK)));
-        let d = *ws.get_unchecked(b) * *xs.get_unchecked(b);
+        let d = ws.get(b) * *xs.get_unchecked(b);
         acc = _mm256_fmadd_ps(s, _mm256_set1_ps(d), acc);
     }
     hsum(acc)
@@ -101,14 +101,14 @@ unsafe fn q8_x4(ws: &[f32], wq: &[i8], xs: [&[f32]; 4], xq: [&[i8]; 4]) -> [f32;
 }
 
 #[target_feature(enable = "avx2,fma")]
-unsafe fn q4(ws: &[f32], wq: &[u8], xs: &[f32], xq: &[i8]) -> f32 {
+unsafe fn q4<S: Scales>(ws: S, wq: &[u8], xs: &[f32], xq: &[i8]) -> f32 {
     let mut acc = _mm256_setzero_ps();
-    for b in 0..ws.len() {
+    for b in 0..ws.blocks() {
         let s = block_q4(
             nibbles(wq.as_ptr().add(b * QK / 2)),
             load(xq.as_ptr().add(b * QK)),
         );
-        let d = *ws.get_unchecked(b) * *xs.get_unchecked(b);
+        let d = ws.get(b) * *xs.get_unchecked(b);
         acc = _mm256_fmadd_ps(s, _mm256_set1_ps(d), acc);
     }
     hsum(acc)
@@ -170,31 +170,38 @@ unsafe fn bf16s(w: &[u16], x: &[f32]) -> f32 {
         + (i..n).map(|j| super::bf16_to_f32(w[j]) * x[j]).sum::<f32>()
 }
 
-fn check_q8(ws: &[f32], wq: usize, xs: &[f32], xq: &[i8]) {
-    let nb = ws.len();
+fn check_q8(nb: usize, wq: usize, xs: &[f32], xq: &[i8]) {
     assert!(wq >= nb * QK && xq.len() >= nb * QK && xs.len() >= nb);
 }
 
 pub fn dot_q8(ws: &[f32], wq: &[i8], xs: &[f32], xq: &[i8]) -> f32 {
-    check_q8(ws, wq.len(), xs, xq);
+    dot_q8_with(ws, wq, xs, xq)
+}
+
+pub fn dot_q8_with<S: Scales>(ws: S, wq: &[i8], xs: &[f32], xq: &[i8]) -> f32 {
+    check_q8(ws.blocks(), wq.len(), xs, xq);
     if avx2() {
         unsafe { q8(ws, wq, xs, xq) }
     } else {
-        scalar::dot_q8(ws, wq, xs, xq)
+        scalar::dot_q8_with(ws, wq, xs, xq)
     }
 }
 
 pub fn dot_q4(ws: &[f32], wq: &[u8], xs: &[f32], xq: &[i8]) -> f32 {
-    check_q8(ws, wq.len() * 2, xs, xq);
+    dot_q4_with(ws, wq, xs, xq)
+}
+
+pub fn dot_q4_with<S: Scales>(ws: S, wq: &[u8], xs: &[f32], xq: &[i8]) -> f32 {
+    check_q8(ws.blocks(), wq.len() * 2, xs, xq);
     if avx2() {
         unsafe { q4(ws, wq, xs, xq) }
     } else {
-        scalar::dot_q4(ws, wq, xs, xq)
+        scalar::dot_q4_with(ws, wq, xs, xq)
     }
 }
 
 pub fn dot_q8_x4(ws: &[f32], wq: &[i8], xs: [&[f32]; 4], xq: [&[i8]; 4]) -> [f32; 4] {
-    (0..4).for_each(|j| check_q8(ws, wq.len(), xs[j], xq[j]));
+    (0..4).for_each(|j| check_q8(ws.len(), wq.len(), xs[j], xq[j]));
     if avx2() {
         unsafe { q8_x4(ws, wq, xs, xq) }
     } else {
@@ -203,7 +210,7 @@ pub fn dot_q8_x4(ws: &[f32], wq: &[i8], xs: [&[f32]; 4], xq: [&[i8]; 4]) -> [f32
 }
 
 pub fn dot_q4_x4(ws: &[f32], wq: &[u8], xs: [&[f32]; 4], xq: [&[i8]; 4]) -> [f32; 4] {
-    (0..4).for_each(|j| check_q8(ws, wq.len() * 2, xs[j], xq[j]));
+    (0..4).for_each(|j| check_q8(ws.len(), wq.len() * 2, xs[j], xq[j]));
     if avx2() {
         unsafe { q4_x4(ws, wq, xs, xq) }
     } else {

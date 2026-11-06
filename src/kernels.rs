@@ -3,9 +3,11 @@
 //! Apple Silicon Mac), AVX2 on x86-64, SIMD128 in the browser, plain Rust
 //! elsewhere.
 //!
-//! Quantized formats store weights in blocks of [`QK`] values sharing one f32
-//! scale. Activations are quantized to 8 bits on the fly so the inner loop is
-//! integer multiply-accumulate, then each block's sum is scaled once.
+//! Quantized formats store weights in blocks of [`QK`] values sharing a
+//! scale (f16 for 8-bit, 6-bit and packed for 4-bit), which the dot products
+//! take expanded to f32 a row at a time. Activations are quantized to 8 bits
+//! on the fly so the inner loop is integer multiply-accumulate, then each
+//! block's sum is scaled once.
 
 /// Values per quantization block.
 pub const QK: usize = 32;
@@ -118,38 +120,321 @@ pub fn quantize_q4(x: &[f32], scales: &mut [f32], qs: &mut [u8]) {
     }
 }
 
-/// 4-bit with an offset per block: value = `d * (q - 8) + c`, q in 0..=15,
-/// so a block's 16 levels span its own range instead of one centred on
-/// zero. Same nibble layout as [`quantize_q4`]. For each block the scale and
-/// offset minimize `sum_j w_j (x_j - value_j)^2` (a weighted least-squares
-/// fit for each of several roundings, as llama.cpp's k-quants search), with
-/// `w_j = importance_j * sqrt(sigma^2 + x_j^2)` and importance 1 without an
-/// importance matrix.
-pub fn quantize_q4_offset(
-    row: &[f32],
-    importance: Option<&[f32]>,
-    scales: &mut [f32],
-    offsets: &mut [f32],
-    qs: &mut [u8],
-) {
-    let sigma2 = row.iter().map(|v| v * v).sum::<f32>() / row.len() as f32;
-    for (b, block) in row.chunks_exact(QK).enumerate() {
-        let mut w = [0f32; QK];
-        for j in 0..QK {
-            let imp = importance.map_or(1.0, |i| i[b * QK + j]);
-            w[j] = imp * (sigma2 + block[j] * block[j]).sqrt();
+/// f16 to f32 for finite values without branches, so loops of it
+/// vectorize: the bits shifted into place, then rescaled by the difference
+/// in exponent bias (which also renormalizes subnormals).
+#[inline]
+pub fn f16_finite(h: u16) -> f32 {
+    let (h, sign) = (h as u32 & 0x7FFF, (h as u32 & 0x8000) << 16);
+    f32::from_bits(sign | (h << 13)) * f32::from_bits(0x7780_0000) // 2^112
+}
+
+/// Weights' 8-bit blocks, as [`quantize_q8`] but with each scale stored as
+/// f16 (8.5 bits per weight, llama.cpp's Q8_0): values are rounded against
+/// the f16 scale, so they stay within -127..=127 of it.
+pub fn quantize_q8_weights(x: &[f32], scales: &mut [u16], qs: &mut [i8]) {
+    for ((block, q), scale) in x
+        .chunks_exact(QK)
+        .zip(qs.chunks_exact_mut(QK))
+        .zip(scales.iter_mut())
+    {
+        let amax = block.iter().fold(0f32, |m, v| m.max(v.abs()));
+        *scale = f32_to_f16(amax / 127.0);
+        let d = f16_finite(*scale);
+        let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+        for (qi, &v) in q.iter_mut().zip(block) {
+            *qi = (v * id).round().clamp(-127.0, 127.0) as i8;
         }
-        let (d, c, levels) = fit_q4_offset(block, &w);
-        let q = &mut qs[b * QK / 2..(b + 1) * QK / 2];
-        for j in 0..QK / 2 {
-            q[j] = levels[j] | (levels[j + QK / 2] << 4);
-        }
-        scales[b] = d;
-        offsets[b] = c;
     }
 }
 
-/// (scale, offset, levels) for one block; see [`quantize_q4_offset`].
+/// f16 scales to f32, a row at a time (NEON on aarch64: rows of 8-bit
+/// weights can be as short as 16 blocks, where a plain loop costs a quarter
+/// as much as the dot product).
+pub fn unpack_f16(h: &[u16], out: &mut [f32]) {
+    #[cfg(target_arch = "aarch64")]
+    let done = neon::unpack_f16_scales(h, out);
+    #[cfg(not(target_arch = "aarch64"))]
+    let done = 0;
+    for (o, &h) in out[done..].iter_mut().zip(&h[done..]) {
+        *o = f16_finite(h);
+    }
+}
+
+/// 4-bit blocks per super-block of packed scales.
+pub const SUPER: usize = 8;
+/// Words of packed scales per super-block.
+pub const SUPER_WORDS: usize = 5;
+
+/// Packed 4-bit scales: `value = d * (q - 8) + c` per block as before, but
+/// each [`SUPER`] blocks (256 weights) of a row share five words: f16 steps
+/// `D` and `M` (word 0), then each block's 8-bit scale `s` in 0..=255 (words
+/// 1 and 2, a byte per block) and signed offset `o` in -128..=127 (words 3
+/// and 4), for `d = D * s` and `c = M * o`. With 16 bytes of 4-bit values
+/// per block that is 4.625 bits per weight, from 6 with an f32 scale and
+/// offset per block. (llama.cpp's Q4_K packs 6-bit fields into 4.5 bits per
+/// weight; whole bytes widen to floats in a few vector instructions, and the
+/// fields are expanded once per row per matrix multiply, so for a single
+/// token their cost is on the same scale as the dot product's.) A row's last
+/// super-block may hold fewer blocks.
+pub fn quantize_q4_packed(
+    row: &[f32],
+    importance: Option<&[f32]>,
+    packed: &mut [u32],
+    qs: &mut [u8],
+) {
+    let sigma2 = row.iter().map(|v| v * v).sum::<f32>() / row.len() as f32;
+    let nb = row.len() / QK;
+    for (k, words) in packed.chunks_exact_mut(SUPER_WORDS).enumerate() {
+        let blocks = k * SUPER..((k + 1) * SUPER).min(nb);
+        // Each block's own best scale and offset, unconstrained.
+        let mut fits = Vec::with_capacity(SUPER);
+        for b in blocks.clone() {
+            let x = &row[b * QK..(b + 1) * QK];
+            let mut w = [0f32; QK];
+            for j in 0..QK {
+                let imp = importance.map_or(1.0, |i| i[b * QK + j]);
+                w[j] = imp * (sigma2 + x[j] * x[j]).sqrt();
+            }
+            let (d, c, _) = fit_q4_offset(x, &w);
+            fits.push((d.max(0.0), c, w));
+        }
+        let dmax = fits.iter().fold(0f32, |m, f| m.max(f.0));
+        let cmax = fits.iter().fold(0f32, |m, f| m.max(f.1.abs()));
+        let (dh, mh) = (f32_to_f16(dmax / 255.0), f32_to_f16(cmax / 127.0));
+        let (step_d, step_c) = (f16_finite(dh), f16_finite(mh));
+        words.fill(0);
+        words[0] = dh as u32 | (mh as u32) << 16;
+        for (j, (b, (d, c, w))) in blocks.zip(fits).enumerate() {
+            let x = &row[b * QK..(b + 1) * QK];
+            // The four roundings of (scale, offset) to the grid around the
+            // free fit, each with its levels refitted; the closest wins.
+            let near = |v: f32, step: f32, lo: f32, hi: f32| {
+                let f = if step > 0.0 { (v / step).floor() } else { 0.0 };
+                [f.clamp(lo, hi), (f + 1.0).clamp(lo, hi)]
+            };
+            let mut best = (f32::INFINITY, 0u32, 0u32, [8u8; QK]);
+            for s in near(d, step_d, 0.0, 255.0) {
+                for o in near(c, step_c, -128.0, 127.0) {
+                    let (dq, cq) = (step_d * s, step_c * o);
+                    let id = if dq > 0.0 { 1.0 / dq } else { 0.0 };
+                    let mut levels = [8u8; QK];
+                    let mut err = 0.0;
+                    for i in 0..QK {
+                        let l = ((x[i] - cq) * id + 8.0).round().clamp(0.0, 15.0);
+                        levels[i] = l as u8;
+                        err += w[i] * (x[i] - dq * (l - 8.0) - cq).powi(2);
+                    }
+                    if err < best.0 {
+                        best = (err, s as u32, o as i32 as u8 as u32, levels);
+                    }
+                }
+            }
+            let (_, s, o, levels) = best;
+            words[1 + j / 4] |= s << (8 * (j % 4));
+            words[3 + j / 4] |= o << (8 * (j % 4));
+            let q = &mut qs[b * QK / 2..(b + 1) * QK / 2];
+            for i in 0..QK / 2 {
+                q[i] = levels[i] | (levels[i + QK / 2] << 4);
+            }
+        }
+    }
+}
+
+/// One row's packed 4-bit scales ([`quantize_q4_packed`]) as each block's
+/// `d` and `c`. This runs once per row per matrix multiply, so for a single
+/// token it costs about as much as the dot product itself unless it is
+/// vectorized (NEON on aarch64).
+pub fn unpack_q4(packed: &[u32], d: &mut [f32], c: &mut [f32]) {
+    #[cfg(target_arch = "aarch64")]
+    neon::unpack_q4_scales(packed, d, c);
+    #[cfg(not(target_arch = "aarch64"))]
+    unpack_q4_scalar(packed, d, c);
+}
+
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))] // tests compare against it
+fn unpack_q4_scalar(packed: &[u32], d: &mut [f32], c: &mut [f32]) {
+    let nb = d.len();
+    let supers = packed.chunks_exact(SUPER_WORDS).take(nb.div_ceil(SUPER));
+    for ((w, d), c) in supers.zip(d.chunks_mut(SUPER)).zip(c.chunks_mut(SUPER)) {
+        let (step_d, step_c) = (f16_finite(w[0] as u16), f16_finite((w[0] >> 16) as u16));
+        for (j, (d, c)) in d.iter_mut().zip(c).enumerate() {
+            let (s, o) = (w[1 + j / 4] >> (8 * (j % 4)), w[3 + j / 4] >> (8 * (j % 4)));
+            *d = step_d * (s as u8) as f32;
+            *c = step_c * (o as u8 as i8) as f32;
+        }
+    }
+}
+
+#[cfg(target_endian = "big")]
+compile_error!("packed scales are read as little-endian bytes");
+
+/// Where a row's per-block weight scales come from, for the single-token
+/// kernels, which convert compact scales in registers as they go: a
+/// matrix-vector product's dot products are bound by their chain of
+/// multiply-adds, so the conversion fits in spare issue slots, where
+/// expanding a row into memory first costs about a tenth of decode time.
+/// Every source gives a block exactly the scale the expanded rows hold.
+pub trait Scales: Copy {
+    fn blocks(self) -> usize;
+    /// # Safety
+    /// `b < self.blocks()`.
+    unsafe fn get(self, b: usize) -> f32;
+    /// Blocks `8k..8k + 8`, the same values as [`Scales::get`].
+    ///
+    /// # Safety
+    /// `8k + 8 <= self.blocks()`.
+    #[inline(always)]
+    unsafe fn eight(self, k: usize) -> [f32; SUPER] {
+        std::array::from_fn(|j| self.get(k * SUPER + j))
+    }
+}
+
+impl Scales for &[f32] {
+    fn blocks(self) -> usize {
+        self.len()
+    }
+    #[inline(always)]
+    unsafe fn get(self, b: usize) -> f32 {
+        *self.get_unchecked(b)
+    }
+    #[inline(always)]
+    unsafe fn eight(self, k: usize) -> [f32; SUPER] {
+        *(self.as_ptr().add(k * SUPER) as *const [f32; SUPER])
+    }
+}
+
+/// f16 scales, one per block (8-bit weights).
+#[derive(Clone, Copy)]
+pub struct F16Scales<'a>(pub &'a [u16]);
+
+impl Scales for F16Scales<'_> {
+    fn blocks(self) -> usize {
+        self.0.len()
+    }
+    #[inline(always)]
+    unsafe fn get(self, b: usize) -> f32 {
+        f16_finite(*self.0.get_unchecked(b))
+    }
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    unsafe fn eight(self, k: usize) -> [f32; SUPER] {
+        neon::f16_eight(self.0.as_ptr().add(k * SUPER))
+    }
+}
+
+/// A row's packed 4-bit scales ([`quantize_q4_packed`]).
+#[derive(Clone, Copy)]
+pub struct PackedScales<'a> {
+    words: &'a [u32],
+    blocks: usize,
+}
+
+impl<'a> PackedScales<'a> {
+    pub fn new(words: &'a [u32], blocks: usize) -> PackedScales<'a> {
+        assert!(words.len() >= blocks.div_ceil(SUPER) * SUPER_WORDS);
+        PackedScales { words, blocks }
+    }
+}
+
+impl Scales for PackedScales<'_> {
+    fn blocks(self) -> usize {
+        self.blocks
+    }
+    #[inline(always)]
+    unsafe fn get(self, b: usize) -> f32 {
+        let w = self.words.as_ptr().add(b / SUPER * SUPER_WORDS);
+        // A block's scale byte: words 1 and 2 as bytes.
+        let s = *(w.add(1) as *const u8).add(b % SUPER);
+        f16_finite(*w as u16) * s as f32
+    }
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    unsafe fn eight(self, k: usize) -> [f32; SUPER] {
+        neon::packed_eight(self.words.as_ptr().add(k * SUPER_WORDS))
+    }
+}
+
+/// `f` on the scales expanded to f32 (for a kernel that takes them so).
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+fn expanded<R>(ws: impl Scales, f: impl FnOnce(&[f32]) -> R) -> R {
+    let nb = ws.blocks();
+    let (mut stack, mut heap) = ([0f32; 512], Vec::new());
+    let buf = if nb <= stack.len() {
+        &mut stack[..nb]
+    } else {
+        heap.resize(nb, 0.0);
+        &mut heap[..]
+    };
+    for (b, v) in buf.iter_mut().enumerate() {
+        // SAFETY: b < nb.
+        *v = unsafe { ws.get(b) };
+    }
+    f(buf)
+}
+
+/// [`dot_q8`] with the scales as they are stored: the same result.
+pub fn dot_q8_with(ws: impl Scales, wq: &[i8], xs: &[f32], xq: &[i8]) -> f32 {
+    simd::dot_q8_with(ws, wq, xs, xq)
+}
+
+/// [`dot_q4`] with the scales as they are stored: the same result.
+pub fn dot_q4_with(ws: impl Scales, wq: &[u8], xs: &[f32], xq: &[i8]) -> f32 {
+    simd::dot_q4_with(ws, wq, xs, xq)
+}
+
+/// A row's packed 4-bit offsets against a token's blocks' input sums
+/// (`scale * sum of quantized values` per block): `sum_b c_b sums_b`, read
+/// straight from the packed bytes. `sums` is padded with zeros to whole
+/// super-blocks (a row's packed bytes past its end are zero too). The same
+/// result as [`dot_offsets_expanded`] on the offsets [`unpack_q4`] gives:
+/// eight lanes, one per block of a super-block, added up at the end.
+pub fn dot_offsets(words: &[u32], sums: &[f32]) -> f32 {
+    assert!(sums.len() % SUPER == 0 && words.len() >= sums.len() / SUPER * SUPER_WORDS);
+    #[cfg(target_arch = "aarch64")]
+    return neon::dot_offsets(words, sums);
+    #[cfg(not(target_arch = "aarch64"))]
+    offsets_lanes(sums, |k, c| {
+        let w = &words[k * SUPER_WORDS..];
+        let step = f16_finite((w[0] >> 16) as u16);
+        for (j, c) in c.iter_mut().enumerate() {
+            *c = step * ((w[3 + j / 4] >> (8 * (j % 4))) as u8 as i8) as f32;
+        }
+    })
+}
+
+/// [`dot_offsets`] on expanded offsets (as many as `sums`), for several
+/// tokens.
+pub fn dot_offsets_expanded(c: &[f32], sums: &[f32]) -> f32 {
+    assert!(sums.len() % SUPER == 0 && c.len() >= sums.len());
+    #[cfg(target_arch = "aarch64")]
+    return neon::dot_offsets_expanded(c, sums);
+    #[cfg(not(target_arch = "aarch64"))]
+    offsets_lanes(sums, |k, out| {
+        out.copy_from_slice(&c[k * SUPER..(k + 1) * SUPER])
+    })
+}
+
+/// The lanes both offset dots share: `fill(k, c)` writes super-block `k`'s
+/// offsets.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+fn offsets_lanes(sums: &[f32], mut fill: impl FnMut(usize, &mut [f32; SUPER])) -> f32 {
+    let mut acc = [0f32; SUPER];
+    for (k, x) in sums.chunks_exact(SUPER).enumerate() {
+        let mut c = [0f32; SUPER];
+        fill(k, &mut c);
+        for j in 0..SUPER {
+            acc[j] = c[j].mul_add(x[j], acc[j]);
+        }
+    }
+    let a: [f32; 4] = std::array::from_fn(|j| acc[j] + acc[j + 4]);
+    (a[0] + a[1]) + (a[2] + a[3])
+}
+
+/// (scale, offset, levels) for one block, minimizing `sum_j w_j (x_j -
+/// value_j)^2` by a weighted least-squares fit for each of several
+/// roundings, as llama.cpp's k-quants search. Weights are `w_j = importance_j
+/// * sqrt(sigma^2 + x_j^2)` (importance 1 without an importance matrix).
 fn fit_q4_offset(x: &[f32], w: &[f32]) -> (f32, f32, [u8; QK]) {
     let (lo, hi) = x
         .iter()
@@ -284,6 +569,20 @@ pub fn pair_tokens(xs: &[f32], xq: &[i8], t: usize, cols: usize) -> (Vec<f32>, V
     (ps, pq)
 }
 
+// Each platform's kernels, for the functions every one of them has.
+#[cfg(target_arch = "aarch64")]
+use neon as simd;
+#[cfg(not(any(
+    target_arch = "aarch64",
+    target_arch = "x86_64",
+    all(target_arch = "wasm32", target_feature = "simd128")
+)))]
+use scalar as simd;
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+use wasm as simd;
+#[cfg(target_arch = "x86_64")]
+use x86 as simd;
+
 #[cfg(target_arch = "aarch64")]
 pub use neon::{
     dot2_q4_pairs, dot2_q8_pairs, dot_bf16, dot_f32, dot_q4, dot_q4_x4, dot_q8, dot_q8_x4, has_i8mm,
@@ -316,10 +615,69 @@ mod x86;
 
 #[cfg(target_arch = "aarch64")]
 mod neon {
-    use super::QK;
+    use super::{f16_finite, Scales, QK, SUPER, SUPER_WORDS};
     use std::arch::aarch64::*;
-
     use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+
+    /// The first multiple of 8 of [`super::unpack_f16`], returning how
+    /// many: [`f16_finite`] on 8 lanes.
+    pub fn unpack_f16_scales(h: &[u16], out: &mut [f32]) -> usize {
+        let n = h.len().min(out.len()) / 8 * 8;
+        // SAFETY: i + 8 <= n is in bounds of both; NEON is always present.
+        unsafe {
+            let bias = vdupq_n_f32(f32::from_bits(0x7780_0000));
+            let (magnitude, sign) = (vdupq_n_u32(0x7FFF), vdupq_n_u32(0x8000));
+            for i in (0..n).step_by(8) {
+                let v = vld1q_u16(h.as_ptr().add(i));
+                for (j, half) in [vget_low_u16(v), vget_high_u16(v)].into_iter().enumerate() {
+                    let w = vmovl_u16(half);
+                    let bits = vorrq_u32(
+                        vshlq_n_u32::<13>(vandq_u32(w, magnitude)),
+                        vshlq_n_u32::<16>(vandq_u32(w, sign)),
+                    );
+                    let f = vmulq_f32(vreinterpretq_f32_u32(bits), bias);
+                    vst1q_f32(out.as_mut_ptr().add(i + 4 * j), f);
+                }
+            }
+        }
+        n
+    }
+
+    /// [`super::unpack_q4`], four blocks per instruction: each word of
+    /// fields is broadcast and shifted by a different amount per lane.
+    pub fn unpack_q4_scales(packed: &[u32], d: &mut [f32], c: &mut [f32]) {
+        let nb = d.len();
+        assert!(c.len() == nb && packed.len() >= nb.div_ceil(SUPER) * SUPER_WORDS);
+        let (mut ds, mut cs) = ([0f32; SUPER], [0f32; SUPER]);
+        for k in 0..nb.div_ceil(SUPER) {
+            let n = (nb - k * SUPER).min(SUPER);
+            // SAFETY: the bounds are checked above (a partial last
+            // super-block goes through a buffer); NEON is always present on
+            // aarch64.
+            unsafe {
+                let w = packed.as_ptr().add(k * SUPER_WORDS);
+                let step_d = f16_finite(*w as u16);
+                let step_c = f16_finite((*w >> 16) as u16);
+                let s = vmovl_u8(vld1_u8(w.add(1) as *const u8));
+                let o = vmovl_s8(vld1_s8(w.add(3) as *const i8));
+                let (pd, pc) = if n == SUPER {
+                    (d.as_mut_ptr().add(k * SUPER), c.as_mut_ptr().add(k * SUPER))
+                } else {
+                    (ds.as_mut_ptr(), cs.as_mut_ptr())
+                };
+                let f = |v: uint16x4_t| vcvtq_f32_u32(vmovl_u16(v));
+                let g = |v: int16x4_t| vcvtq_f32_s32(vmovl_s16(v));
+                vst1q_f32(pd, vmulq_n_f32(f(vget_low_u16(s)), step_d));
+                vst1q_f32(pd.add(4), vmulq_n_f32(f(vget_high_u16(s)), step_d));
+                vst1q_f32(pc, vmulq_n_f32(g(vget_low_s16(o)), step_c));
+                vst1q_f32(pc.add(4), vmulq_n_f32(g(vget_high_s16(o)), step_c));
+            }
+            if n < SUPER {
+                d[k * SUPER..].copy_from_slice(&ds[..n]);
+                c[k * SUPER..].copy_from_slice(&cs[..n]);
+            }
+        }
+    }
 
     /// A CPU feature check, done once.
     fn cached(flag: &AtomicU8, detect: fn() -> bool) -> bool {
@@ -496,25 +854,24 @@ mod neon {
     /// does per lane, so a token's result doesn't depend on which kernel or
     /// which batch it went through.
     #[target_feature(enable = "dotprod")]
-    unsafe fn dot_rows_sdot<const N: usize, const Q4: bool>(
-        ws: &[f32],
+    unsafe fn dot_rows_sdot<const N: usize, const Q4: bool, S: Scales>(
+        ws: S,
         wq: *const u8,
         xs: [&[f32]; N],
         xq: [&[i8]; N],
     ) -> [f32; N] {
-        let nb = ws.len();
+        let nb = ws.blocks();
         for j in 0..N {
             assert!(xq[j].len() >= nb * QK && xs[j].len() >= nb);
         }
         let mut acc = [0f32; N];
-        for b in 0..nb {
+        let mut block = |b: usize, wd: f32| {
             let (w0, w1) = if Q4 {
                 unpack_q4(wq.add(b * QK / 2))
             } else {
                 let p = wq.add(b * QK) as *const i8;
                 (vld1q_s8(p), vld1q_s8(p.add(16)))
             };
-            let wd = *ws.get_unchecked(b);
             for j in 0..N {
                 let px = xq[j].as_ptr().add(b * QK);
                 let s = sdot(
@@ -524,33 +881,130 @@ mod neon {
                 );
                 acc[j] = (vaddvq_s32(s) as f32).mul_add(wd * *xs[j].get_unchecked(b), acc[j]);
             }
+        };
+        // Scales eight blocks at a time, so compact ones are converted with
+        // vector instructions; then any blocks left over one by one.
+        for k in 0..nb / SUPER {
+            let wd = ws.eight(k);
+            for (j, &wd) in wd.iter().enumerate() {
+                block(k * SUPER + j, wd);
+            }
+        }
+        for b in nb / SUPER * SUPER..nb {
+            block(b, ws.get(b));
         }
         acc
     }
 
     pub fn dot_q8(ws: &[f32], wq: &[i8], xs: &[f32], xq: &[i8]) -> f32 {
+        dot_q8_with(ws, wq, xs, xq)
+    }
+
+    pub fn dot_q8_with<S: Scales>(ws: S, wq: &[i8], xs: &[f32], xq: &[i8]) -> f32 {
         if dotprod() {
-            assert!(wq.len() >= ws.len() * QK);
-            unsafe { dot_rows_sdot::<1, false>(ws, wq.as_ptr() as *const u8, [xs], [xq])[0] }
+            assert!(wq.len() >= ws.blocks() * QK);
+            unsafe { dot_rows_sdot::<1, false, S>(ws, wq.as_ptr() as *const u8, [xs], [xq])[0] }
         } else {
-            dot_q8_neon(ws, wq, xs, xq)
+            super::expanded(ws, |d| dot_q8_neon(d, wq, xs, xq))
+        }
+    }
+
+    pub fn dot_q4_with<S: Scales>(ws: S, wq: &[u8], xs: &[f32], xq: &[i8]) -> f32 {
+        if dotprod() {
+            assert!(wq.len() >= ws.blocks() * QK / 2);
+            unsafe { dot_rows_sdot::<1, true, S>(ws, wq.as_ptr(), [xs], [xq])[0] }
+        } else {
+            super::expanded(ws, |d| dot_q4_neon(d, wq, xs, xq))
+        }
+    }
+
+    /// Eight f16 scales as [`f16_finite`] gives them.
+    #[inline(always)]
+    pub unsafe fn f16_eight(h: *const u16) -> [f32; SUPER] {
+        let v = vld1q_u16(h);
+        let (magnitude, sign) = (vdupq_n_u32(0x7FFF), vdupq_n_u32(0x8000));
+        let bias = vdupq_n_f32(f32::from_bits(0x7780_0000));
+        let f = |half: uint16x4_t| {
+            let w = vmovl_u16(half);
+            let bits = vorrq_u32(
+                vshlq_n_u32::<13>(vandq_u32(w, magnitude)),
+                vshlq_n_u32::<16>(vandq_u32(w, sign)),
+            );
+            vmulq_f32(vreinterpretq_f32_u32(bits), bias)
+        };
+        std::mem::transmute::<[float32x4_t; 2], [f32; SUPER]>([
+            f(vget_low_u16(v)),
+            f(vget_high_u16(v)),
+        ])
+    }
+
+    /// A super-block's eight 4-bit scales as [`unpack_q4_scales`] gives them.
+    #[inline(always)]
+    pub unsafe fn packed_eight(w: *const u32) -> [f32; SUPER] {
+        let step = f16_finite(*w as u16);
+        let s = vmovl_u8(vld1_u8(w.add(1) as *const u8));
+        let f = |v: uint16x4_t| vmulq_n_f32(vcvtq_f32_u32(vmovl_u16(v)), step);
+        std::mem::transmute::<[float32x4_t; 2], [f32; SUPER]>([
+            f(vget_low_u16(s)),
+            f(vget_high_u16(s)),
+        ])
+    }
+
+    /// [`super::dot_offsets`] and [`super::dot_offsets_expanded`]: blocks
+    /// 0..4 and 4..8 of each super-block in two vector lanes, multiply-added
+    /// in registers, then summed. Both build the same offsets (the packed
+    /// version as [`unpack_q4_scales`] does) and add them in the same order.
+    /// The callers checked `sums` is whole super-blocks that `offsets`
+    /// covers.
+    #[inline(always)]
+    unsafe fn offsets_lanes(
+        sums: &[f32],
+        offsets: impl Fn(usize) -> (float32x4_t, float32x4_t),
+    ) -> f32 {
+        let (mut lo, mut hi) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
+        for k in 0..sums.len() / SUPER {
+            let (c0, c1) = offsets(k);
+            let p = sums.as_ptr().add(k * SUPER);
+            lo = vfmaq_f32(lo, c0, vld1q_f32(p));
+            hi = vfmaq_f32(hi, c1, vld1q_f32(p.add(4)));
+        }
+        vaddvq_f32(vaddq_f32(lo, hi))
+    }
+
+    pub fn dot_offsets(words: &[u32], sums: &[f32]) -> f32 {
+        // SAFETY: see `offsets_lanes`; NEON is always present.
+        unsafe {
+            offsets_lanes(sums, |k| {
+                let w = words.as_ptr().add(k * SUPER_WORDS);
+                let step = f16_finite((*w >> 16) as u16);
+                let o = vmovl_s8(vld1_s8(w.add(3) as *const i8));
+                (
+                    vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(o))), step),
+                    vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(o))), step),
+                )
+            })
+        }
+    }
+
+    pub fn dot_offsets_expanded(c: &[f32], sums: &[f32]) -> f32 {
+        // SAFETY: see `offsets_lanes`.
+        unsafe {
+            offsets_lanes(sums, |k| {
+                let p = c.as_ptr().add(k * SUPER);
+                (vld1q_f32(p), vld1q_f32(p.add(4)))
+            })
         }
     }
 
     pub fn dot_q4(ws: &[f32], wq: &[u8], xs: &[f32], xq: &[i8]) -> f32 {
-        if dotprod() {
-            assert!(wq.len() >= ws.len() * QK / 2);
-            unsafe { dot_rows_sdot::<1, true>(ws, wq.as_ptr(), [xs], [xq])[0] }
-        } else {
-            dot_q4_neon(ws, wq, xs, xq)
-        }
+        dot_q4_with(ws, wq, xs, xq)
     }
 
     /// Four tokens against one 8-bit weight row.
     pub fn dot_q8_x4(ws: &[f32], wq: &[i8], xs: [&[f32]; 4], xq: [&[i8]; 4]) -> [f32; 4] {
         if dotprod() {
             assert!(wq.len() >= ws.len() * QK);
-            unsafe { dot_rows_sdot::<4, false>(ws, wq.as_ptr() as *const u8, xs, xq) }
+            unsafe { dot_rows_sdot::<4, false, &[f32]>(ws, wq.as_ptr() as *const u8, xs, xq) }
         } else {
             [0, 1, 2, 3].map(|j| dot_q8_neon(ws, wq, xs[j], xq[j]))
         }
@@ -560,7 +1014,7 @@ mod neon {
     pub fn dot_q4_x4(ws: &[f32], wq: &[u8], xs: [&[f32]; 4], xq: [&[i8]; 4]) -> [f32; 4] {
         if dotprod() {
             assert!(wq.len() >= ws.len() * QK / 2);
-            unsafe { dot_rows_sdot::<4, true>(ws, wq.as_ptr(), xs, xq) }
+            unsafe { dot_rows_sdot::<4, true, &[f32]>(ws, wq.as_ptr(), xs, xq) }
         } else {
             [0, 1, 2, 3].map(|j| dot_q4_neon(ws, wq, xs[j], xq[j]))
         }
@@ -683,7 +1137,7 @@ mod neon {
     allow(dead_code)
 )]
 mod scalar {
-    use super::{bf16_to_f32, QK};
+    use super::{bf16_to_f32, Scales, QK};
 
     pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
         a.iter().zip(b).map(|(x, y)| x * y).sum()
@@ -694,18 +1148,27 @@ mod scalar {
     }
 
     pub fn dot_q8(ws: &[f32], wq: &[i8], xs: &[f32], xq: &[i8]) -> f32 {
-        (0..ws.len())
+        dot_q8_with(ws, wq, xs, xq)
+    }
+
+    pub fn dot_q8_with(ws: impl Scales, wq: &[i8], xs: &[f32], xq: &[i8]) -> f32 {
+        (0..ws.blocks())
             .map(|b| {
                 let s: i32 = (0..QK)
                     .map(|j| wq[b * QK + j] as i32 * xq[b * QK + j] as i32)
                     .sum();
-                s as f32 * ws[b] * xs[b]
+                // SAFETY: b < blocks.
+                s as f32 * unsafe { ws.get(b) } * xs[b]
             })
             .sum()
     }
 
     pub fn dot_q4(ws: &[f32], wq: &[u8], xs: &[f32], xq: &[i8]) -> f32 {
-        (0..ws.len())
+        dot_q4_with(ws, wq, xs, xq)
+    }
+
+    pub fn dot_q4_with(ws: impl Scales, wq: &[u8], xs: &[f32], xq: &[i8]) -> f32 {
+        (0..ws.blocks())
             .map(|b| {
                 let mut s = 0i32;
                 for j in 0..QK / 2 {
@@ -713,7 +1176,8 @@ mod scalar {
                     s += ((byte & 0xF) as i32 - 8) * xq[b * QK + j] as i32;
                     s += ((byte >> 4) as i32 - 8) * xq[b * QK + j + QK / 2] as i32;
                 }
-                s as f32 * ws[b] * xs[b]
+                // SAFETY: b < blocks.
+                s as f32 * unsafe { ws.get(b) } * xs[b]
             })
             .sum()
     }
@@ -961,20 +1425,87 @@ mod tests {
         quantize_q4(&x, &mut s, &mut q);
         dequantize_q4(&s, &q, &mut sym);
         for imp in [None, Some(imp.as_slice())] {
-            let (mut s, mut o, mut q) = (vec![0.0; nb], vec![0.0; nb], vec![0u8; x.len() / 2]);
-            quantize_q4_offset(&x, imp, &mut s, &mut o, &mut q);
+            let mut packed = vec![0u32; nb.div_ceil(SUPER) * SUPER_WORDS];
+            let mut q = vec![0u8; x.len() / 2];
+            quantize_q4_packed(&x, imp, &mut packed, &mut q);
+            let (mut d, mut c) = (vec![0.0; nb], vec![0.0; nb]);
+            unpack_q4(&packed, &mut d, &mut c);
             let mut out = vec![0.0; x.len()];
-            dequantize_q4(&s, &q, &mut out);
-            for (block, &c) in out.chunks_exact_mut(QK).zip(&o) {
+            dequantize_q4(&d, &q, &mut out);
+            for (block, &c) in out.chunks_exact_mut(QK).zip(&c) {
                 block.iter_mut().for_each(|v| *v += c);
             }
-            assert!(
-                werr(&out, imp) < werr(&sym, imp) * 0.8,
-                "{} vs {}",
-                werr(&out, imp),
-                werr(&sym, imp)
+            // Against each block's own free fit, in f32: packing the scales
+            // into 6 bits costs little.
+            let mut free = vec![0.0; x.len()];
+            for (b, out) in free.chunks_exact_mut(QK).enumerate() {
+                let xb = &x[b * QK..(b + 1) * QK];
+                let w: Vec<f32> = (0..QK)
+                    .map(|j| imp.map_or(1.0, |i| i[b * QK + j]) * (sigma2 + xb[j] * xb[j]).sqrt())
+                    .collect();
+                let (d, c, l) = fit_q4_offset(xb, &w);
+                for j in 0..QK {
+                    out[j] = d * (l[j] as f32 - 8.0) + c;
+                }
+            }
+            let (e, e_sym, e_free) = (werr(&out, imp), werr(&sym, imp), werr(&free, imp));
+            assert!(e < e_sym * 0.8, "{e} vs {e_sym}");
+            assert!(e < e_free * 1.15, "{e} vs {e_free}");
+        }
+    }
+
+    #[test]
+    fn packed_scales_round_trip() {
+        for h in 0..0x7C00u16 {
+            assert_eq!(f16_finite(h).to_bits(), f16_to_f32(h).to_bits());
+            assert_eq!(
+                f16_finite(h | 0x8000).to_bits(),
+                f16_to_f32(h | 0x8000).to_bits()
             );
         }
+        // A partial last super-block, and blocks of one value.
+        let mut x = data(11 * QK, 5);
+        x[3 * QK..4 * QK].fill(0.25);
+        x[9 * QK..10 * QK].fill(0.0);
+        let mut packed = vec![0u32; 2 * SUPER_WORDS];
+        let mut q = vec![0u8; x.len() / 2];
+        quantize_q4_packed(&x, None, &mut packed, &mut q);
+        let (mut d, mut c) = (vec![0.0; 11], vec![0.0; 11]);
+        unpack_q4(&packed, &mut d, &mut c);
+        // The vectorized unpacking matches the plain one on any bits.
+        let any: Vec<u32> = data(15, 9).iter().map(|v| v.to_bits() >> 2).collect();
+        for nb in [8, 11, 24] {
+            let (mut d1, mut c1, mut d2, mut c2) =
+                (vec![0.0; nb], vec![0.0; nb], vec![0.0; nb], vec![0.0; nb]);
+            unpack_q4(&any, &mut d1, &mut c1);
+            unpack_q4_scalar(&any, &mut d2, &mut c2);
+            assert_eq!((d1, c1), (d2, c2));
+        }
+        let mut out = vec![0.0; x.len()];
+        dequantize_q4(&d, &q, &mut out);
+        for (block, &c) in out.chunks_exact_mut(QK).zip(&c) {
+            block.iter_mut().for_each(|v| *v += c);
+        }
+        assert!(out[9 * QK..10 * QK].iter().all(|&v| v == 0.0));
+        assert!(out[3 * QK..4 * QK].iter().all(|&v| (v - 0.25).abs() < 0.01));
+        let rms = (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt();
+        let err = (x
+            .iter()
+            .zip(&out)
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f32>()
+            / x.len() as f32)
+            .sqrt();
+        assert!(err < rms * 0.12, "{err} vs {rms}");
+        let (mut s, mut q8) = (vec![0u16; 11], vec![0i8; x.len()]);
+        quantize_q8_weights(&x, &mut s, &mut q8);
+        let mut ds = vec![0.0; 11];
+        unpack_f16(&s, &mut ds);
+        dequantize_q8(&ds, &q8, &mut out);
+        assert!(x
+            .iter()
+            .zip(&out)
+            .all(|(a, b)| (a - b).abs() <= 0.5 / 127.0 + 1e-3));
     }
 
     #[test]
