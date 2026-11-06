@@ -379,9 +379,10 @@ fn adapters_load_and_unload_while_serving() {
     let Some((_g, dir)) = setup() else { return };
     let cfg = Config::load(&dir).unwrap();
     let tmp = scratch("serve");
+    // Strong enough to change a short greedy reply on every platform.
     let synth = [
-        Synthetic::new(&cfg, 8, 16.0, false, 7),
-        Synthetic::new(&cfg, 16, 16.0, true, 8),
+        Synthetic::new(&cfg, 8, 64.0, false, 7),
+        Synthetic::new(&cfg, 16, 64.0, true, 8),
     ];
     for (i, sy) in synth.iter().enumerate() {
         sy.write(&tmp.join(format!("adapter{i}")));
