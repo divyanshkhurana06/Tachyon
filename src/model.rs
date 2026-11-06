@@ -11,7 +11,9 @@ use std::thread;
 use crate::config::Config;
 use crate::engine::{copy_blocks, Backend};
 use crate::imatrix::{Importance, LayerImportance};
-use crate::kernels::{axpy, dot_f32, rmsnorm, silu};
+use crate::kernels::{
+    attention_scores, axpy, dot_f32, exp_inplace, rmsnorm, silu_mul, weighted_sum,
+};
 use crate::kv::{slot, Batch, BLOCK};
 use crate::lora::{Adapters, LayerLora, Lora};
 use crate::pool::{Pool, SyncPtr};
@@ -336,6 +338,15 @@ struct Scratch {
     sin: Vec<f32>,
 }
 
+/// Runs `f(i)` for each of `t` tokens across the pool: per-token work
+/// between the matrix multiplies (norms, rotations, the MLP's gate), which
+/// on one thread left the others idle for a fifth of a prefill.
+fn per_token(pool: &Pool, t: usize, f: impl Fn(usize) + Sync) {
+    pool.parallel_for(t, t.div_ceil(4 * pool.threads()), |range| {
+        range.for_each(&f)
+    });
+}
+
 fn zeroed(v: &mut Vec<f32>, n: usize) {
     v.clear();
     v.resize(n, 0.0);
@@ -417,20 +428,17 @@ fn attention(
             let n = b.positions[i] as usize + 1;
 
             scores.clear();
-            scores.extend(
-                (0..n).map(|p| dot_f32(q, &k_cache[slot(table, p) * kv_dim + kv..][..hd]) * scale),
-            );
+            let keys = (0..n).map(|p| &k_cache[slot(table, p) * kv_dim + kv..][..hd]);
+            attention_scores(q, keys, scale, &mut scores);
             let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut sum = 0.0;
-            for s in scores.iter_mut() {
-                *s = (*s - max).exp();
-                sum += *s;
-            }
+            scores.iter_mut().for_each(|s| *s -= max);
+            exp_inplace(&mut scores);
+            let inv = 1.0 / scores.iter().sum::<f32>();
+            scores.iter_mut().for_each(|s| *s *= inv);
             // SAFETY: each (token, head) owns its own slice of `att`.
             let o = unsafe { out.slice(i * q_dim + h * hd, hd) };
-            for (p, &s) in scores.iter().enumerate() {
-                axpy(o, s / sum, &v_cache[slot(table, p) * kv_dim + kv..][..hd]);
-            }
+            let values = (0..n).map(|p| &v_cache[slot(table, p) * kv_dim + kv..][..hd]);
+            weighted_sum(&scores, values, o);
         }
     });
 }
@@ -488,15 +496,12 @@ fn moe(
             .w_gate_up
             .matmul_rows(pool, &s.expert_in, m, &mut s.gate_up, rows);
         zeroed(&mut s.hidden, m * inter);
-        for j in 0..m {
-            let (g, u) = s.gate_up[j * 2 * inter..(j + 1) * 2 * inter].split_at(inter);
-            for (h, (&g, &u)) in s.hidden[j * inter..(j + 1) * inter]
-                .iter_mut()
-                .zip(g.iter().zip(u))
-            {
-                *h = silu(g) * u;
-            }
-        }
+        let (hidden, gate_up) = (SyncPtr::new(&mut s.hidden), &s.gate_up);
+        per_token(pool, m, |j| {
+            let (g, u) = gate_up[j * 2 * inter..(j + 1) * 2 * inter].split_at(inter);
+            // SAFETY: each row is written by one task.
+            silu_mul(g, u, unsafe { hidden.slice(j * inter, inter) });
+        });
         if let Some(cal) = cal.as_mut() {
             Importance::accumulate(&mut cal.down, &s.hidden);
         }
@@ -598,14 +603,17 @@ impl Backend for CpuBackend {
                 _ => &none,
             };
             // attention block: x += o(attention(rope(qkv(norm(x)))))
-            for i in 0..t {
+            let (xb, x) = (SyncPtr::new(&mut s.xb), &s.x);
+            per_token(pool, t, |i| {
+                // SAFETY: each row is written by one task.
+                let out = unsafe { xb.slice(i * dim, dim) };
                 rmsnorm(
-                    &mut s.xb[i * dim..(i + 1) * dim],
-                    &s.x[i * dim..(i + 1) * dim],
+                    out,
+                    &x[i * dim..(i + 1) * dim],
                     &layer.attn_norm,
                     c.norm_eps,
                 );
-            }
+            });
             if let Some(cal) = calibration.as_mut() {
                 Importance::accumulate(&mut cal.layers[l].qkv, &s.xb);
             }
@@ -615,14 +623,18 @@ impl Backend for CpuBackend {
                 &mut k_cache[l * layer_cache..(l + 1) * layer_cache],
                 &mut v_cache[l * layer_cache..(l + 1) * layer_cache],
             );
-            for i in 0..t {
-                let row = &mut s.qkv[i * qkv_dim..(i + 1) * qkv_dim];
+            let (qkv, kcp, vcp) = (SyncPtr::new(&mut s.qkv), SyncPtr::new(kc), SyncPtr::new(vc));
+            let (cos, sin) = (&s.cos, &s.sin);
+            per_token(pool, t, |i| {
+                // SAFETY: each token's row of `qkv` and its own cache slot
+                // are written by one task.
+                let row = unsafe { qkv.slice(i * qkv_dim, qkv_dim) };
                 if let Some(bias) = &layer.bqkv {
                     row.iter_mut().zip(bias).for_each(|(v, b)| *v += b);
                 }
                 let (cs, sn) = (
-                    &s.cos[i * half..(i + 1) * half],
-                    &s.sin[i * half..(i + 1) * half],
+                    &cos[i * half..(i + 1) * half],
+                    &sin[i * half..(i + 1) * half],
                 );
                 let (q, kv) = row.split_at_mut(q_dim);
                 let (k, v) = kv.split_at_mut(kv_dim);
@@ -633,9 +645,11 @@ impl Backend for CpuBackend {
                 rope(q, hd, cs, sn);
                 rope(k, hd, cs, sn);
                 let at = b.slots[i] as usize * kv_dim;
-                kc[at..at + kv_dim].copy_from_slice(k);
-                vc[at..at + kv_dim].copy_from_slice(v);
-            }
+                unsafe {
+                    kcp.slice(at, kv_dim).copy_from_slice(k);
+                    vcp.slice(at, kv_dim).copy_from_slice(v);
+                }
+            });
             attention(c, pool, kc, vc, b, &s.qkv, &mut s.att);
             if let Some(cal) = calibration.as_mut() {
                 Importance::accumulate(&mut cal.layers[l].o, &s.att);
@@ -645,14 +659,12 @@ impl Backend for CpuBackend {
             s.x.iter_mut().zip(&s.proj).for_each(|(x, p)| *x += p);
 
             // MLP block: x += down(silu(gate(norm(x))) * up(norm(x)))
-            for i in 0..t {
-                rmsnorm(
-                    &mut s.xb[i * dim..(i + 1) * dim],
-                    &s.x[i * dim..(i + 1) * dim],
-                    &layer.mlp_norm,
-                    c.norm_eps,
-                );
-            }
+            let (xb, x) = (SyncPtr::new(&mut s.xb), &s.x);
+            per_token(pool, t, |i| {
+                // SAFETY: each row is written by one task.
+                let out = unsafe { xb.slice(i * dim, dim) };
+                rmsnorm(out, &x[i * dim..(i + 1) * dim], &layer.mlp_norm, c.norm_eps);
+            });
             if let Some(cal) = calibration.as_mut() {
                 Importance::accumulate(&mut cal.layers[l].gate_up, &s.xb);
             }
@@ -671,15 +683,12 @@ impl Backend for CpuBackend {
             }
             layer.w_gate_up.matmul(pool, &s.xb, t, &mut s.gate_up);
             adapt(ll.gate_up.as_ref(), pool, &s.xb, &mut s.gate_up);
-            for i in 0..t {
-                let (g, u) = s.gate_up[i * 2 * inter..(i + 1) * 2 * inter].split_at(inter);
-                for (h, (&g, &u)) in s.hidden[i * inter..(i + 1) * inter]
-                    .iter_mut()
-                    .zip(g.iter().zip(u))
-                {
-                    *h = silu(g) * u;
-                }
-            }
+            let (hidden, gate_up) = (SyncPtr::new(&mut s.hidden), &s.gate_up);
+            per_token(pool, t, |i| {
+                let (g, u) = gate_up[i * 2 * inter..(i + 1) * 2 * inter].split_at(inter);
+                // SAFETY: each row is written by one task.
+                silu_mul(g, u, unsafe { hidden.slice(i * inter, inter) });
+            });
             if let Some(cal) = calibration.as_mut() {
                 Importance::accumulate(&mut cal.layers[l].down, &s.hidden);
             }

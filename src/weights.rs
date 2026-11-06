@@ -330,6 +330,15 @@ trait IntRows: Sync {
         ps: [&[f32]; P],
         pq: [&[i8]; P],
     ) -> [[f32; 4]; P];
+    /// Rows `r..r + 4` against token pairs: rows r and r + 1, then r + 2 and
+    /// r + 3, exactly as [`IntRows::dot2_pairs`] gives them.
+    fn dot4_pairs<const P: usize>(
+        &self,
+        r: usize,
+        s: [Row; 4],
+        ps: [&[f32]; P],
+        pq: [&[i8]; P],
+    ) -> [[[f32; 4]; P]; 2];
 }
 
 struct Q8Rows<'a> {
@@ -372,6 +381,16 @@ impl IntRows for Q8Rows<'_> {
     ) -> [[f32; 4]; P] {
         let w = [self.quants(r), self.quants(r + 1)];
         kernels::dot2_q8_pairs([s[0].d, s[1].d], w, ps, pq)
+    }
+    fn dot4_pairs<const P: usize>(
+        &self,
+        r: usize,
+        s: [Row; 4],
+        ps: [&[f32]; P],
+        pq: [&[i8]; P],
+    ) -> [[[f32; 4]; P]; 2] {
+        let w = [0, 1, 2, 3].map(|k| self.quants(r + k));
+        kernels::dot4_q8_pairs(s.map(|s| s.d), w, ps, pq)
     }
 }
 
@@ -435,6 +454,16 @@ impl IntRows for Q4Rows<'_> {
         let w = [self.quants(r), self.quants(r + 1)];
         kernels::dot2_q4_pairs([s[0].d, s[1].d], w, ps, pq)
     }
+    fn dot4_pairs<const P: usize>(
+        &self,
+        r: usize,
+        s: [Row; 4],
+        ps: [&[f32]; P],
+        pq: [&[i8]; P],
+    ) -> [[[f32; 4]; P]; 2] {
+        let w = [0, 1, 2, 3].map(|k| self.quants(r + k));
+        kernels::dot4_q4_pairs(s.map(|s| s.d), w, ps, pq)
+    }
 }
 
 /// `out = m · x` for quantized `m`, with `x` quantized to 8 bits first.
@@ -452,7 +481,7 @@ fn int_matmul(
     grain: usize,
     out: SyncPtr<f32>,
 ) {
-    let (xs, xq) = quantize_input(x, t, cols);
+    let (xs, xq) = quantize_input(pool, x, t, cols);
     let nb = cols / QK;
     let tok = |i: usize| (&xs[i * nb..(i + 1) * nb], &xq[i * cols..(i + 1) * cols]);
     let paired = (t >= 2 && kernels::has_i8mm()).then(|| kernels::pair_tokens(&xs, &xq, t, cols));
@@ -463,22 +492,29 @@ fn int_matmul(
     let mut sums = Vec::new();
     if m.has_offsets() {
         sums.resize(t * padded, 0.0);
-        for i in 0..t {
-            for b in 0..nb {
-                let k = i * nb + b;
-                let q: i32 = xq[k * QK..(k + 1) * QK].iter().map(|&q| q as i32).sum();
-                sums[i * padded + b] = xs[k] * q as f32;
+        let sp = SyncPtr::new(&mut sums);
+        pool.parallel_for(t, t.div_ceil(pool.threads()), |range| {
+            for i in range {
+                // SAFETY: each token's sums are written by one task.
+                let row = unsafe { sp.slice(i * padded, nb) };
+                for (b, sum) in row.iter_mut().enumerate() {
+                    let k = i * nb + b;
+                    let q: i32 = xq[k * QK..(k + 1) * QK].iter().map(|&q| q as i32).sum();
+                    *sum = xs[k] * q as f32;
+                }
             }
-        }
+        });
     }
     let stride = if m.has_offsets() { padded } else { nb };
     pool.parallel_for(rows, grain, |range| {
         // SAFETY: each (token, row) of `out` is written by exactly one thread.
+        // (Whether there are offsets is known per matrix type, so for 8-bit
+        // rows this is a single store.)
         let put = |i: usize, r: usize, s: Option<Row>, y: f32| {
-            let y = match (sums.is_empty(), s) {
-                (true, _) => y,
-                (false, None) => y + m.offset(r, &sums[i * padded..(i + 1) * padded]),
-                (false, Some(s)) => {
+            let y = match (m.has_offsets(), s) {
+                (false, _) => y,
+                (true, None) => y + m.offset(r, &sums[i * padded..(i + 1) * padded]),
+                (true, Some(s)) => {
                     y + kernels::dot_offsets_expanded(s.c, &sums[i * padded..(i + 1) * padded])
                 }
             };
@@ -508,6 +544,48 @@ fn int_matmul(
                             &pq[p * 2 * cols..(p + 1) * 2 * cols],
                         )
                     };
+                    // Four rows at a time share each token pair's loads.
+                    while r + 4 <= end {
+                        let s = [row(r), row(r + 1), row(r + 2), row(r + 3)];
+                        // Rows rr and rr + 1 against tokens 2p and 2p + 1.
+                        let store = |rr: usize, p: usize, y: [f32; 4]| {
+                            put(2 * p, rr, Some(s[rr - r]), y[0]);
+                            put(2 * p + 1, rr, Some(s[rr - r]), y[1]);
+                            put(2 * p, rr + 1, Some(s[rr + 1 - r]), y[2]);
+                            put(2 * p + 1, rr + 1, Some(s[rr + 1 - r]), y[3]);
+                        };
+                        let mut p = 0;
+                        while p + 4 <= t / 2 {
+                            let g = [pair(p), pair(p + 1), pair(p + 2), pair(p + 3)];
+                            let [a, b] = m.dot4_pairs(r, s, g.map(|x| x.0), g.map(|x| x.1));
+                            for k in 0..4 {
+                                store(r, p + k, a[k]);
+                                store(r + 2, p + k, b[k]);
+                            }
+                            p += 4;
+                        }
+                        while p + 2 <= t / 2 {
+                            let (x, y) = (pair(p), pair(p + 1));
+                            let [a, b] = m.dot4_pairs(r, s, [x.0, y.0], [x.1, y.1]);
+                            for k in 0..2 {
+                                store(r, p + k, a[k]);
+                                store(r + 2, p + k, b[k]);
+                            }
+                            p += 2;
+                        }
+                        if p < t / 2 {
+                            let [a, b] = m.dot4_pairs(r, s, [pair(p).0], [pair(p).1]);
+                            store(r, p, a[0]);
+                            store(r + 2, p, b[0]);
+                        }
+                        if t % 2 == 1 {
+                            let (xs, xq) = tok(t - 1);
+                            for (k, &s) in s.iter().enumerate() {
+                                put(t - 1, r + k, Some(s), m.dot(r + k, s, xs, xq));
+                            }
+                        }
+                        r += 4;
+                    }
                     while r + 2 <= end {
                         let s = [row(r), row(r + 1)];
                         // Rows r and r + 1 against tokens 2p and 2p + 1.
@@ -570,9 +648,18 @@ fn int_matmul(
     });
 }
 
-fn quantize_input(x: &[f32], t: usize, cols: usize) -> (Vec<f32>, Vec<i8>) {
-    let (mut xs, mut xq) = (vec![0.0; t * cols / QK], vec![0i8; t * cols]);
-    kernels::quantize_q8(x, &mut xs, &mut xq);
+/// The input rows quantized to 8 bits, a token per task.
+fn quantize_input(pool: &Pool, x: &[f32], t: usize, cols: usize) -> (Vec<f32>, Vec<i8>) {
+    let nb = cols / QK;
+    let (mut xs, mut xq) = (vec![0.0; t * nb], vec![0i8; t * cols]);
+    let (ps, pq) = (SyncPtr::new(&mut xs), SyncPtr::new(&mut xq));
+    pool.parallel_for(t, t.div_ceil(pool.threads()), |range| {
+        for i in range {
+            // SAFETY: each token's scales and values are written by one task.
+            let (s, q) = unsafe { (ps.slice(i * nb, nb), pq.slice(i * cols, cols)) };
+            kernels::quantize_q8(&x[i * cols..(i + 1) * cols], s, q);
+        }
+    });
     (xs, xq)
 }
 
@@ -611,7 +698,7 @@ mod tests {
                 let mut out = vec![0.0; t * rows];
                 m.matmul(&pool, &x, t, &mut out);
                 // The activations as the kernels see them, 8-bit.
-                let (xs, xq) = quantize_input(&x, t, cols);
+                let (xs, xq) = quantize_input(&pool, &x, t, cols);
                 let mut xd = vec![0.0; t * cols];
                 kernels::dequantize_q8(&xs, &xq, &mut xd);
                 // Each token alone gives exactly its result in the batch.

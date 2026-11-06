@@ -89,6 +89,8 @@ finished; every one should end with a number in the README.
 - [x] **Priority preemption**: a more urgent request with no room preempts less urgent running ones; under a full 8-sequence server its time to first token went from 9.3 s to 0.034 s
 - [x] **Prefill attention compiled for the model's head size**, with half-precision queries and less threadgroup memory for 128-wide heads, so more threadgroups share a core: 2,048-token prefill +47% (Qwen2.5-0.5B) to +64% (Qwen3-0.6B), 90% of llama.cpp from 63%. GPU prefill in 512-token passes
 - Tried and rejected: skipping the output rescale when no maximum moves, half-precision probabilities (no faster); 256-token CPU prefill passes (12% slower)
+- [x] **CPU prefill +25-32%** (59-61% of llama.cpp to 77-78%): per-token work between the matmuls spread over the pool with a vectorized `exp` (threads had been idle a fifth of the time), and `smmla` taking four weight rows per pass
+- Tried and rejected: CPU attention grouped by tokens and heads (bound by arithmetic, not loads; decoding 5% slower), eight token pairs per `smmla` pass (register spills)
 - Tried and rejected: 6-bit fields packed as in Q4_K (4.5 bits per weight, but unpacking them cost 20% of CPU decode); expanding a row's scales into memory before its dot product, even eight rows at a time (about a tenth of decode on short rows)
 
 ## Next
@@ -104,7 +106,7 @@ At 2,048 tokens, prefill is 90% of llama.cpp's and decode about 92%. Prefill att
 
 ### CPU prefill
 
-About 65% of llama.cpp. Next: repack weights at load into the interleaved layout `smmla` reads, so the per-block shuffles go away, and fuse activation quantization into the previous op.
+About 77% of llama.cpp. The four-row `smmla` kernel is 60% of prefill time at about 3.2 instructions per matrix instruction: per-block scaling, activation loads and the shuffles that pair rows up (8% of them). Next: repack weights at load into the interleaved layout `smmla` reads (the single-token SDOT path would need its own layout or a deinterleave), and keep threads busy through the last tenth they spend waiting.
 
 ### Quantization
 

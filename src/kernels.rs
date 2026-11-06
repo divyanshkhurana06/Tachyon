@@ -527,9 +527,79 @@ pub fn rmsnorm(out: &mut [f32], x: &[f32], w: &[f32], eps: f32) {
     }
 }
 
-#[inline]
-pub fn silu(x: f32) -> f32 {
-    x / (1.0 + (-x).exp())
+/// `exp` of each value, vectorized (NEON on aarch64): `2^n p(r)` with
+/// `x = n ln 2 + r` and Cephes' degree-6 polynomial, within 2 ulp of `exp`
+/// for inputs from -87 to 88 (below that it gives the smallest normal
+/// float rather than 0). Softmax calls it once per score, so libm's scalar
+/// `expf` was a seventh of CPU attention.
+pub fn exp_inplace(xs: &mut [f32]) {
+    #[cfg(target_arch = "aarch64")]
+    neon::exp_inplace(xs);
+    #[cfg(not(target_arch = "aarch64"))]
+    for x in xs {
+        *x = exp_scalar(*x);
+    }
+}
+
+const EXP_P: [f32; 6] = [
+    1.987_569_2e-4,
+    1.398_199_9e-3,
+    8.333_452e-3,
+    4.166_579_6e-2,
+    0.166_666_65,
+    0.5,
+];
+
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+fn exp_scalar(x: f32) -> f32 {
+    let x = x.clamp(-87.336_55, 88.7);
+    let n = (x * std::f32::consts::LOG2_E).round();
+    let r = x - n * 0.693_359_4 - n * -2.121_944_4e-4;
+    let mut y = EXP_P[0];
+    for &c in &EXP_P[1..] {
+        y = y * r + c;
+    }
+    let y = y * (r * r) + r + 1.0;
+    f32::from_bits((y.to_bits() as i32 + ((n as i32) << 23)) as u32)
+}
+
+/// `q · k * scale` for each key, appended to `out` (attention scores). For
+/// 64-wide heads on aarch64 the query stays in registers across keys.
+pub fn attention_scores<'a>(
+    q: &[f32],
+    keys: impl Iterator<Item = &'a [f32]>,
+    scale: f32,
+    out: &mut Vec<f32>,
+) {
+    #[cfg(target_arch = "aarch64")]
+    if q.len() == 64 {
+        return neon::scores_64(q, keys, scale, out);
+    }
+    out.extend(keys.map(|k| dot_f32(q, k) * scale));
+}
+
+/// `out += w_p * row_p` over the rows (attention's weighted sum of
+/// values). For 64-wide heads on aarch64 the output stays in registers.
+pub fn weighted_sum<'a>(w: &[f32], rows: impl Iterator<Item = &'a [f32]>, out: &mut [f32]) {
+    #[cfg(target_arch = "aarch64")]
+    if out.len() == 64 {
+        return neon::weighted_sum_64(w, rows, out);
+    }
+    for (&w, row) in w.iter().zip(rows) {
+        axpy(out, w, row);
+    }
+}
+
+/// `out = silu(g) * u` for each element (the SwiGLU MLP's gate), with
+/// the vectorized exp.
+pub fn silu_mul(g: &[f32], u: &[f32], out: &mut [f32]) {
+    for (o, &g) in out.iter_mut().zip(g) {
+        *o = -g;
+    }
+    exp_inplace(out);
+    for ((o, &g), &u) in out.iter_mut().zip(g).zip(u) {
+        *o = g / (1.0 + *o) * u;
+    }
 }
 
 /// out += a * x
@@ -585,8 +655,39 @@ use x86 as simd;
 
 #[cfg(target_arch = "aarch64")]
 pub use neon::{
-    dot2_q4_pairs, dot2_q8_pairs, dot_bf16, dot_f32, dot_q4, dot_q4_x4, dot_q8, dot_q8_x4, has_i8mm,
+    dot2_q4_pairs, dot2_q8_pairs, dot4_q4_pairs, dot4_q8_pairs, dot_bf16, dot_f32, dot_q4,
+    dot_q4_x4, dot_q8, dot_q8_x4, has_i8mm,
 };
+
+/// Four 8-bit weight rows against `P` token pairs: rows 0 and 1, then rows
+/// 2 and 3, each as [`dot2_q8_pairs`] gives them. (Only aarch64 has a
+/// kernel for it: elsewhere there are no matrix instructions to pair up.)
+#[cfg(not(target_arch = "aarch64"))]
+pub fn dot4_q8_pairs<const P: usize>(
+    ws: [&[f32]; 4],
+    wq: [&[i8]; 4],
+    ps: [&[f32]; P],
+    pq: [&[i8]; P],
+) -> [[[f32; 4]; P]; 2] {
+    [
+        dot2_q8_pairs([ws[0], ws[1]], [wq[0], wq[1]], ps, pq),
+        dot2_q8_pairs([ws[2], ws[3]], [wq[2], wq[3]], ps, pq),
+    ]
+}
+
+/// [`dot4_q8_pairs`] for 4-bit rows.
+#[cfg(not(target_arch = "aarch64"))]
+pub fn dot4_q4_pairs<const P: usize>(
+    ws: [&[f32]; 4],
+    wq: [&[u8]; 4],
+    ps: [&[f32]; P],
+    pq: [&[i8]; P],
+) -> [[[f32; 4]; P]; 2] {
+    [
+        dot2_q4_pairs([ws[0], ws[1]], [wq[0], wq[1]], ps, pq),
+        dot2_q4_pairs([ws[2], ws[3]], [wq[2], wq[3]], ps, pq),
+    ]
+}
 #[cfg(not(any(
     target_arch = "aarch64",
     target_arch = "x86_64",
@@ -811,6 +912,93 @@ mod neon {
         })
     }
 
+    /// [`dot2_pairs`] for two pairs of rows at once: each token pair's
+    /// activations are loaded once for all four rows, which halves the
+    /// loads (and scale products) per matrix instruction. Every output is
+    /// computed exactly as `dot2_pairs` computes it.
+    #[target_feature(enable = "i8mm")]
+    unsafe fn dot4_pairs<const P: usize, const Q4: bool>(
+        ws: [&[f32]; 4],
+        wq: [*const u8; 4],
+        ps: [&[f32]; P],
+        pq: [&[i8]; P],
+    ) -> [[[f32; 4]; P]; 2] {
+        let nb = ws[0].len();
+        assert!(ws.iter().all(|w| w.len() >= nb));
+        for p in 0..P {
+            assert!(pq[p].len() >= nb * 2 * QK && ps[p].len() >= nb * 2);
+        }
+        let mut acc = [[vdupq_n_f32(0.0); P]; 2];
+        for b in 0..nb {
+            let r = wq.map(|w| {
+                if Q4 {
+                    unpack_q4(w.add(b * QK / 2))
+                } else {
+                    let p = w.add(b * QK) as *const i8;
+                    (vld1q_s8(p), vld1q_s8(p.add(16)))
+                }
+            });
+            let w = [0, 2].map(|h| {
+                let (a, c) = (r[h], r[h + 1]);
+                [
+                    zip64::<false>(a.0, c.0),
+                    zip64::<true>(a.0, c.0),
+                    zip64::<false>(a.1, c.1),
+                    zip64::<true>(a.1, c.1),
+                ]
+            });
+            let wd = [0, 2].map(|h| {
+                vcombine_f32(
+                    vdup_n_f32(*ws[h].get_unchecked(b)),
+                    vdup_n_f32(*ws[h + 1].get_unchecked(b)),
+                )
+            });
+            for p in 0..P {
+                let q = pq[p].as_ptr().add(b * 2 * QK);
+                let x = [0, 1, 2, 3].map(|k| vld1q_s8(q.add(16 * k)));
+                let xd = vld1_f32(ps[p].as_ptr().add(2 * b));
+                let xd = vcombine_f32(xd, xd);
+                for h in 0..2 {
+                    let mut s = vdupq_n_s32(0);
+                    for (&w, &x) in w[h].iter().zip(&x) {
+                        s = smmla(s, w, x);
+                    }
+                    acc[h][p] = vfmaq_f32(acc[h][p], vcvtq_f32_s32(s), vmulq_f32(wd[h], xd));
+                }
+            }
+        }
+        acc.map(|a| {
+            a.map(|a| {
+                let mut out = [0.0; 4];
+                vst1q_f32(out.as_mut_ptr(), a);
+                out
+            })
+        })
+    }
+
+    /// Four 8-bit weight rows against `P` token pairs: rows 0 and 1, then
+    /// rows 2 and 3, as [`dot2_q8_pairs`] gives them. Needs [`has_i8mm`].
+    pub fn dot4_q8_pairs<const P: usize>(
+        ws: [&[f32]; 4],
+        wq: [&[i8]; 4],
+        ps: [&[f32]; P],
+        pq: [&[i8]; P],
+    ) -> [[[f32; 4]; P]; 2] {
+        assert!(has_i8mm() && wq.iter().all(|w| w.len() >= ws[0].len() * QK));
+        unsafe { dot4_pairs::<P, false>(ws, wq.map(|w| w.as_ptr() as *const u8), ps, pq) }
+    }
+
+    /// [`dot4_q8_pairs`] for 4-bit rows.
+    pub fn dot4_q4_pairs<const P: usize>(
+        ws: [&[f32]; 4],
+        wq: [&[u8]; 4],
+        ps: [&[f32]; P],
+        pq: [&[i8]; P],
+    ) -> [[[f32; 4]; P]; 2] {
+        assert!(has_i8mm() && wq.iter().all(|w| w.len() >= ws[0].len() * QK / 2));
+        unsafe { dot4_pairs::<P, true>(ws, wq.map(|w| w.as_ptr()), ps, pq) }
+    }
+
     /// Two 8-bit weight rows against `P` token pairs: for each pair
     /// `[row0·t0, row0·t1, row1·t0, row1·t1]`. Needs [`has_i8mm`].
     pub fn dot2_q8_pairs<const P: usize>(
@@ -915,6 +1103,83 @@ mod neon {
             unsafe { dot_rows_sdot::<1, true, S>(ws, wq.as_ptr(), [xs], [xq])[0] }
         } else {
             super::expanded(ws, |d| dot_q4_neon(d, wq, xs, xq))
+        }
+    }
+
+    pub fn scores_64<'a>(
+        q: &[f32],
+        keys: impl Iterator<Item = &'a [f32]>,
+        scale: f32,
+        out: &mut Vec<f32>,
+    ) {
+        assert!(q.len() == 64);
+        // SAFETY: the query and every key are checked to be 64 long.
+        unsafe {
+            let qv: [float32x4_t; 16] = std::array::from_fn(|i| vld1q_f32(q.as_ptr().add(4 * i)));
+            for k in keys {
+                assert!(k.len() >= 64);
+                let p = k.as_ptr();
+                let mut a = [vdupq_n_f32(0.0); 4];
+                for i in 0..16 {
+                    a[i % 4] = vfmaq_f32(a[i % 4], qv[i], vld1q_f32(p.add(4 * i)));
+                }
+                let s = vaddq_f32(vaddq_f32(a[0], a[1]), vaddq_f32(a[2], a[3]));
+                out.push(vaddvq_f32(s) * scale);
+            }
+        }
+    }
+
+    pub fn weighted_sum_64<'a>(w: &[f32], rows: impl Iterator<Item = &'a [f32]>, out: &mut [f32]) {
+        assert!(out.len() == 64);
+        // SAFETY: the output and every row are checked to be 64 long.
+        unsafe {
+            let mut o: [float32x4_t; 16] =
+                std::array::from_fn(|i| vld1q_f32(out.as_ptr().add(4 * i)));
+            for (&w, row) in w.iter().zip(rows) {
+                assert!(row.len() >= 64);
+                let p = row.as_ptr();
+                for (i, o) in o.iter_mut().enumerate() {
+                    *o = vfmaq_n_f32(*o, vld1q_f32(p.add(4 * i)), w);
+                }
+            }
+            for (i, o) in o.iter().enumerate() {
+                vst1q_f32(out.as_mut_ptr().add(4 * i), *o);
+            }
+        }
+    }
+
+    pub fn exp_inplace(xs: &mut [f32]) {
+        // SAFETY: whole groups of four are in bounds; the rest go through
+        // a buffer. NEON is always present.
+        unsafe fn exp4(x: float32x4_t) -> float32x4_t {
+            let x = vminq_f32(vmaxq_f32(x, vdupq_n_f32(-87.336_55)), vdupq_n_f32(88.7));
+            let n = vrndnq_f32(vmulq_n_f32(x, std::f32::consts::LOG2_E));
+            let r = vfmsq_f32(
+                vfmsq_f32(x, n, vdupq_n_f32(0.693_359_4)),
+                n,
+                vdupq_n_f32(-2.121_944_4e-4),
+            );
+            let mut y = vdupq_n_f32(super::EXP_P[0]);
+            for &c in &super::EXP_P[1..] {
+                y = vfmaq_f32(vdupq_n_f32(c), y, r);
+            }
+            let y = vaddq_f32(vfmaq_f32(r, y, vmulq_f32(r, r)), vdupq_n_f32(1.0));
+            let e = vshlq_n_s32::<23>(vcvtq_s32_f32(n));
+            vreinterpretq_f32_s32(vaddq_s32(vreinterpretq_s32_f32(y), e))
+        }
+        let whole = xs.len() / 4 * 4;
+        unsafe {
+            for i in (0..whole).step_by(4) {
+                let p = xs.as_mut_ptr().add(i);
+                vst1q_f32(p, exp4(vld1q_f32(p)));
+            }
+            if whole < xs.len() {
+                let mut t = [0f32; 4];
+                t[..xs.len() - whole].copy_from_slice(&xs[whole..]);
+                vst1q_f32(t.as_mut_ptr(), exp4(vld1q_f32(t.as_ptr())));
+                let n = xs.len() - whole;
+                xs[whole..].copy_from_slice(&t[..n]);
+            }
         }
     }
 
@@ -1451,6 +1716,18 @@ mod tests {
             let (e, e_sym, e_free) = (werr(&out, imp), werr(&sym, imp), werr(&free, imp));
             assert!(e < e_sym * 0.8, "{e} vs {e_sym}");
             assert!(e < e_free * 1.15, "{e} vs {e_free}");
+        }
+    }
+
+    #[test]
+    fn exp_is_within_two_ulp() {
+        let mut xs: Vec<f32> = (0..200_000).map(|i| -87.0 + i as f32 * 0.000_875).collect();
+        xs.extend([0.0, -0.0, 1.0, -1e-30, -50.5, -87.3]);
+        let want: Vec<f32> = xs.iter().map(|x| x.exp()).collect();
+        exp_inplace(&mut xs);
+        for (x, (got, want)) in xs.iter().zip(want.iter()).enumerate() {
+            let ulps = (got.to_bits() as i64 - want.to_bits() as i64).abs();
+            assert!(ulps <= 2, "{x}: {got} vs {want} ({ulps} ulp)");
         }
     }
 

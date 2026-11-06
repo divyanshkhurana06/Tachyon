@@ -69,10 +69,10 @@ Qwen2.5-0.5B-Instruct, one sequence at a time:
 | GPU | 8-bit | 525 MB | 2,632 tok/s | 141.8 tok/s | 17.99 |
 | GPU | `q4m` (mixed 4/8-bit) | 417 MB | 2,488 tok/s | 147.9 tok/s | 18.69 |
 | GPU | `q4` (mostly 4-bit) | 366 MB | 2,452 tok/s | **148.7 tok/s** | 19.42 |
-| CPU | bf16 | 988 MB | 168 tok/s | 82.3 tok/s | 17.94 |
-| CPU | 8-bit | 525 MB | 689 tok/s | 137.4 tok/s | 18.05 |
-| CPU | `q4m` | 417 MB | 590 tok/s | 139.4 tok/s | 18.66 |
-| CPU | `q4` | 366 MB | 553 tok/s | 141.1 tok/s | 19.42 |
+| CPU | bf16 | 988 MB | 151 tok/s | 80.2 tok/s | 17.94 |
+| CPU | 8-bit | 525 MB | 916 tok/s | 144.6 tok/s | 17.99 |
+| CPU | `q4m` | 417 MB | 596 tok/s | 124.6 tok/s | 18.74 |
+| CPU | `q4` | 366 MB | 615 tok/s | 135.2 tok/s | 19.51 |
 
 From `tachyon bench`: best of 3 runs, prefill 256 tokens, decode 128, perplexity over 979 tokens of [`bench/eval.txt`](bench/eval.txt). Speeds move by ±20% with background load, CPU decode most of all.
 
@@ -122,10 +122,10 @@ Same model (Qwen2.5-0.5B-Instruct, 8-bit: Tachyon's `q8` against Qwen's official
 | GPU prefill, 2,048 tokens | 3,043 tok/s | 2,752 tok/s | 90% |
 | GPU decode, 256-token context | 131–138 tok/s | 138 tok/s | **on par** |
 | GPU decode, 2,048-token context | 128–129 tok/s | 113–125 tok/s | ~92% |
-| CPU prefill, 6 threads | 976–986 tok/s | 606–614 tok/s | ~62% |
-| CPU decode, 6 threads | 134–140 tok/s | 125–129 tok/s | ~92% |
+| CPU prefill, 6 threads | 1,015–1,179 tok/s | 779–916 tok/s | ~77% |
+| CPU decode, 6 threads | 148–152 tok/s | 128–145 tok/s | ~92% |
 
-Short prompts and chat-length decoding are on par with llama.cpp, a mature engine with years of Apple-specific tuning, from code with no dependencies, and long prompts are at 90%. The remaining gap is CPU prefill, which llama.cpp sends through Apple's Accelerate framework to the AMX matrix units while Tachyon uses ARM's int8 matrix instructions. Over the last four releases GPU prefill went from 64% to on par, and from 63% to 90% for 2,048-token prompts (attention compiled for the model's head size, below); CPU prefill from 20% to about 65%; and GPU decode from 93% to on par (with the packed scales below).
+Short prompts and chat-length decoding are on par with llama.cpp, a mature engine with years of Apple-specific tuning, from code with no dependencies, and long prompts are at 90%. The remaining gap is CPU prefill, at about 77%. Over the last four releases GPU prefill went from 64% to on par, and from 63% to 90% for 2,048-token prompts (attention compiled for the model's head size, below); CPU prefill from 20% to about 77% (four weight rows per matrix instruction pass, and no thread left idle between them, below); and GPU decode from 93% to on par (with the packed scales below).
 
 ### Speculative decoding: up to 2.2x faster
 
@@ -195,6 +195,7 @@ Property tests check the matchers against the JSON parser on tens of thousands o
 - **Constrained decoding is a matcher plus a sampler filter.** JSON mode, JSON Schema and forced tool calls are all the same mechanism: a byte-level automaton that says whether a token's bytes can come next, and a sampler that ranks the likely tokens first and asks about those, so the check costs a few hundred probes per token, not 150,000.
 - **The CPU's int8 path is SDOT.** One `sdot` instruction multiplies 16 pairs of int8 values and adds them into four int32 lanes, against four instructions for the widening multiply-adds it replaced (written as inline assembly, since Rust's intrinsic for it is unstable). Each weight block is also loaded once for four tokens. Prefill went from about 300 to 490 tok/s and batch-4 decoding from about 200 to 400 tok/s.
 - **Then I8MM.** The M2 and later also have `smmla`, which multiplies a 2x8 int8 matrix by an 8x2 one: two weight rows by two tokens, 32 multiply-adds per instruction. Activations are interleaved two tokens at a time once per matmul so the instruction reads them directly, and each weight block is loaded once for eight tokens. CPU prefill went up another 45%, to about 700 tok/s.
+- **Then the threads between the matmuls.** A profile of CPU prefill (macOS `sample` on a prefill loop) found the six threads idle a fifth of the time: between matrix multiplies the main thread did the per-token work alone (norms, rotary embeddings, the MLP's SiLU through libm's scalar `expf`, and quantizing each matmul's input). That work now runs across the pool, with a vectorized `exp`. The `smmla` kernel also takes four weight rows per pass instead of two, so each token pair's activations are loaded once for four rows. Together: CPU prefill +25-32% at 256 tokens (from 59-61% of llama.cpp to 77-78%, alternating runs), +11-39% at 2,048, with every output still computed bit for bit as before between alone and batched. Rejected: grouping CPU attention by tokens and heads to share key loads (it is bound by arithmetic, not loads, and decoding got 5% slower), eight token pairs per `smmla` pass (register spills), and 256-token CPU passes (still slower than 128).
 - **Batch invariance.** Every int8 path (single token, four tokens with SDOT, token pairs with I8MM) scales each block's exact integer sum into one running total with a fused multiply-add, in the same order, so a sequence's logits on the CPU are bit-for-bit the same whether it runs alone or batched with any others. A kernel test checks that equality exactly, not within a tolerance.
 - **Mixture of experts without a round trip.** A router scores 32 experts per token and keeps the top 8, weighted by a softmax over those 8. On the GPU everything stays in one command buffer: a kernel routes each token, decode runs a matrix-vector product per (token, expert) that reads only the chosen experts' rows of the stacked expert matrices, and prefill first lists each expert's tokens on the GPU and then runs one GEMM per expert over its gathered rows. That last step made prefill 4.5x faster (392 to 1,747 tok/s). Granite's extra scalings (embeddings, attention, residuals, logits) are folded into the weights at load where they can be, so no kernel changed for them.
 - **The offset costs nothing in the int8 kernels.** With `value = scale * (q - 8) + offset`, a block's dot product is the old integer sum plus `offset * (sum of the block's inputs)`. The input sums are computed once per token, the offset term is a short dot product per row, and every CPU path (SDOT, I8MM, the browser's SIMD) adds it the same way, so batch invariance holds.
@@ -212,7 +213,7 @@ Property tests check the matchers against the JSON parser on tens of thousands o
 
 ### How it's verified
 
-`cargo test --release` runs 87 tests, in CI on Apple Silicon and on x86-64 Linux (where the AVX2 kernels run). GitHub's virtual Macs expose a GPU that returns zeros, so the engine self-tests the GPU at startup and refuses a broken one; there the GPU comparisons skip, and they run on real hardware. Beyond unit tests of every kernel against a scalar reference, the tests check against the real model that:
+`cargo test --release` runs 88 tests, in CI on Apple Silicon and on x86-64 Linux (where the AVX2 kernels run). GitHub's virtual Macs expose a GPU that returns zeros, so the engine self-tests the GPU at startup and refuses a broken one; there the GPU comparisons skip, and they run on real hardware. Beyond unit tests of every kernel against a scalar reference, the tests check against the real model that:
 
 - several sequences batched together produce exactly the tokens each produces alone, on CPU and GPU;
 - the GPU produces exactly the same greedy tokens as the CPU, for Qwen2.5, Qwen3, Llama 3.2 and the Granite mixture of experts (through both its per-token and per-expert paths);
