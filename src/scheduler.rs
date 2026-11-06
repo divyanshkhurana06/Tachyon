@@ -18,6 +18,11 @@
 //! re-queues ahead of its priority class, to be copied back in when there is
 //! room. Without swap space left it is recomputed instead; its full blocks
 //! stay in the prefix cache, so that is often nearly free too.
+//!
+//! LoRA adapters are loaded and unloaded through the same channel as
+//! requests, between steps, and requests name their adapter, resolved when
+//! they arrive: so a request always runs with the adapter it named, or is
+//! refused.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,10 +31,12 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
+use crate::config::Config;
 use crate::constrain::Constraint;
 use crate::engine::{Backend, SKIP};
 use crate::generate::Finish;
 use crate::kv::{Batch, BlockPool, Logits, Seq};
+use crate::lora::{Adapter, Adapters};
 use crate::sampler::{Sampler, SamplerConfig, TokenLogprob};
 use crate::tokenizer::{Tokenizer, Utf8Stream};
 
@@ -48,8 +55,9 @@ pub struct Request {
     pub cancel: Arc<AtomicBool>,
     /// Report each token's log-probability and this many alternatives.
     pub logprobs: Option<usize>,
-    /// The LoRA adapter to run with (see `lora.rs`), 0 for none.
-    pub adapter: u32,
+    /// The LoRA adapter to run with, by name (see `lora.rs`); `None` for
+    /// the base model.
+    pub adapter: Option<String>,
     /// Lower runs first, as in vLLM; ties go to the earlier request.
     pub priority: i32,
     /// Special tokens whose text is part of the reply (Granite's
@@ -108,9 +116,18 @@ pub struct Stats {
     pub swaps: std::sync::atomic::AtomicU64,
 }
 
+/// What the scheduler thread receives.
+enum Message {
+    Request(Request),
+    Load(Adapter, Sender<Result<(), String>>),
+    Unload(String, Sender<Result<(), String>>),
+}
+
 pub struct Scheduler {
-    tx: Sender<Request>,
+    tx: Sender<Message>,
     pub stats: Arc<Stats>,
+    /// The adapters loaded now, in id order.
+    adapters: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl Scheduler {
@@ -121,20 +138,46 @@ impl Scheduler {
     ) -> Scheduler {
         let (tx, rx) = mpsc::channel();
         let stats = Arc::new(Stats::default());
-        let st = stats.clone();
+        let adapters = Arc::default();
+        let (st, names) = (stats.clone(), Arc::clone(&adapters));
         thread::Builder::new()
             .name("scheduler".into())
-            .spawn(move || Worker::new(backend, tok, opts, st).run(rx))
+            .spawn(move || Worker::new(backend, tok, opts, st, names).run(rx))
             .expect("spawn scheduler");
-        Scheduler { tx, stats }
+        Scheduler {
+            tx,
+            stats,
+            adapters,
+        }
     }
 
     pub fn submit(&self, req: Request) {
-        if let Err(mpsc::SendError(req)) = self.tx.send(req) {
+        if let Err(mpsc::SendError(Message::Request(req))) = self.tx.send(Message::Request(req)) {
             let _ = req
                 .events
                 .send(Event::Error("the scheduler has stopped".into()));
         }
+    }
+
+    /// Adds an adapter that requests may then name, between two steps.
+    pub fn load_adapter(&self, adapter: Adapter) -> Result<(), String> {
+        let (tx, rx) = mpsc::channel();
+        let _ = self.tx.send(Message::Load(adapter, tx));
+        rx.recv()
+            .unwrap_or_else(|_| Err("the scheduler has stopped".into()))
+    }
+
+    /// Removes an adapter no queued or running request uses.
+    pub fn unload_adapter(&self, name: &str) -> Result<(), String> {
+        let (tx, rx) = mpsc::channel();
+        let _ = self.tx.send(Message::Unload(name.to_string(), tx));
+        rx.recv()
+            .unwrap_or_else(|_| Err("the scheduler has stopped".into()))
+    }
+
+    /// The names of the adapters loaded now.
+    pub fn adapters(&self) -> Vec<String> {
+        self.adapters.lock().unwrap().clone()
     }
 }
 
@@ -157,6 +200,11 @@ struct Sequence {
     picked_logprob: Option<TokenLogprob>,
     /// A preempted sequence's cache, while it waits to be resumed.
     swapped: Option<Swapped>,
+    /// Its adapter's id in the batch (0: none), and the salt that keeps its
+    /// prefix cache apart (unique to each adapter ever loaded, so a reused
+    /// id never meets another adapter's cached blocks).
+    adapter: u32,
+    salt: u32,
 }
 
 /// The keys and values of a sequence's first `len` positions, out of the
@@ -191,6 +239,13 @@ struct Worker {
     batch: Batch,
     /// Tokens' worth of swapped-out cache held now.
     swapped_tokens: usize,
+    cfg: Config,
+    /// Loaded adapters by id - 1 (a slot emptied by unloading is reused by
+    /// the next load), and each one's prefix-cache salt.
+    adapters: Vec<Option<Adapter>>,
+    salts: Vec<u32>,
+    next_salt: u32,
+    names: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl Worker {
@@ -199,8 +254,10 @@ impl Worker {
         tok: Arc<Tokenizer>,
         opts: SchedulerOptions,
         stats: Arc<Stats>,
+        names: Arc<std::sync::Mutex<Vec<String>>>,
     ) -> Worker {
         let pool = BlockPool::new(backend.num_blocks());
+        let cfg = backend.config().clone();
         Worker {
             backend,
             tok,
@@ -211,20 +268,28 @@ impl Worker {
             waiting: VecDeque::new(),
             batch: Batch::default(),
             swapped_tokens: 0,
+            cfg,
+            adapters: Vec::new(),
+            salts: Vec::new(),
+            next_salt: 1,
+            names,
         }
     }
 
-    fn run(mut self, rx: Receiver<Request>) {
+    fn run(mut self, rx: Receiver<Message>) {
         loop {
             // Sleep only when there is nothing at all to do.
             if self.running.is_empty() && self.waiting.is_empty() {
                 match rx.recv() {
-                    Ok(req) => self.enqueue(req),
+                    Ok(m) => self.receive(m),
                     Err(_) => return,
                 }
             }
-            while let Ok(req) = rx.try_recv() {
-                self.enqueue(req);
+            while let Ok(m) = rx.try_recv() {
+                self.receive(m);
+            }
+            if self.running.is_empty() && self.waiting.is_empty() {
+                continue;
             }
             let started = Instant::now();
             self.drop_cancelled();
@@ -242,6 +307,84 @@ impl Worker {
         }
     }
 
+    fn receive(&mut self, m: Message) {
+        match m {
+            Message::Request(req) => self.enqueue(req),
+            Message::Load(adapter, reply) => {
+                let _ = reply.send(self.load(adapter));
+            }
+            Message::Unload(name, reply) => {
+                let _ = reply.send(self.unload(&name));
+            }
+        }
+    }
+
+    fn slot(&self, name: &str) -> Option<usize> {
+        self.adapters
+            .iter()
+            .position(|a| a.as_ref().is_some_and(|a| a.name == name))
+    }
+
+    /// Rebuilds the backend's adapters from the slots (ranks are padded to
+    /// the largest, so all of them change together), and the list of names.
+    fn install(&mut self) -> Result<(), String> {
+        let built = Adapters::build(&self.cfg, &self.adapters).map_err(|e| e.to_string())?;
+        self.backend
+            .load_adapters(built)
+            .map_err(|e| e.to_string())?;
+        *self.names.lock().unwrap() = self
+            .adapters
+            .iter()
+            .flatten()
+            .map(|a| a.name.clone())
+            .collect();
+        Ok(())
+    }
+
+    fn load(&mut self, adapter: Adapter) -> Result<(), String> {
+        if self.slot(&adapter.name).is_some() {
+            return Err(format!("adapter {:?} is already loaded", adapter.name));
+        }
+        let i = match self.adapters.iter().position(Option::is_none) {
+            Some(i) => i,
+            None => {
+                self.adapters.push(None);
+                self.salts.push(0);
+                self.adapters.len() - 1
+            }
+        };
+        self.adapters[i] = Some(adapter);
+        self.salts[i] = self.next_salt;
+        self.next_salt += 1;
+        self.install().inspect_err(|_| {
+            // Back to what was there; that built before.
+            self.adapters[i] = None;
+            let _ = self.install();
+        })
+    }
+
+    fn unload(&mut self, name: &str) -> Result<(), String> {
+        let i = self
+            .slot(name)
+            .ok_or_else(|| format!("adapter {name:?} is not loaded"))?;
+        let id = i as u32 + 1;
+        let users = self
+            .running
+            .iter()
+            .chain(&self.waiting)
+            .filter(|s| s.adapter == id)
+            .count();
+        if users > 0 {
+            return Err(format!("adapter {name:?} is in use by {users} requests"));
+        }
+        self.adapters[i] = None;
+        while self.adapters.last().is_some_and(Option::is_none) {
+            self.adapters.pop();
+            self.salts.pop();
+        }
+        self.install()
+    }
+
     fn enqueue(&mut self, req: Request) {
         let limit = self
             .opts
@@ -255,6 +398,17 @@ impl Worker {
             )));
             return;
         }
+        let (adapter, salt) = match &req.adapter {
+            None => (0, 0),
+            Some(name) => match self.slot(name) {
+                Some(i) => (i as u32 + 1, self.salts[i]),
+                None => {
+                    let msg = format!("adapter {name:?} is not loaded");
+                    let _ = req.events.send(Event::Error(msg));
+                    return;
+                }
+            },
+        };
         let sampler = Sampler::new(req.sampler.clone());
         let s = Sequence {
             tokens: req.prompt.clone(),
@@ -271,6 +425,8 @@ impl Worker {
             picked: 0,
             picked_logprob: None,
             swapped: None,
+            adapter,
+            salt,
         };
         self.queue(s, false);
     }
@@ -326,7 +482,7 @@ impl Worker {
                 // Swapped out: blocks still in the prefix cache are taken
                 // from there, and the rest copied back in.
                 Some(w) => {
-                    let mut seq = self.pool.start_with(&s.tokens[..w.len], s.req.adapter);
+                    let mut seq = self.pool.start_with(&s.tokens[..w.len], s.salt);
                     let cached = seq.blocks.len();
                     if !self.pool.reserve(&mut seq, w.len) {
                         self.pool.release(seq);
@@ -342,7 +498,7 @@ impl Worker {
                     seq
                 }
                 None => {
-                    let seq = self.pool.start_with(&s.tokens, s.req.adapter);
+                    let seq = self.pool.start_with(&s.tokens, s.salt);
                     s.cached.get_or_insert(seq.len);
                     seq
                 }
@@ -433,7 +589,7 @@ impl Worker {
                 } else {
                     Logits::None
                 },
-                s.req.adapter,
+                s.adapter,
             );
             seq.len = fed + take;
             s.seq = Some(seq);

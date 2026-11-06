@@ -114,7 +114,8 @@ pub struct LayerLora {
 
 /// A set of adapters for one base model. Adapter ids start at 1 (0 is the
 /// base model) in the order given; ranks are padded with zeros to the
-/// largest.
+/// largest. A slot may be empty (an adapter unloaded while serving), with
+/// an empty name and zero weights.
 pub struct Adapters {
     pub names: Vec<String>,
     pub rank: usize,
@@ -253,6 +254,12 @@ impl Adapters {
         if list.is_empty() {
             bail!("no adapters");
         }
+        Adapters::build(c, &list.into_iter().map(Some).collect::<Vec<_>>())
+    }
+
+    /// Adapters in slots: slot `i` is id `i + 1`, and `None` an empty one.
+    pub fn build(c: &Config, slots: &[Option<Adapter>]) -> Result<Adapters> {
+        let list: Vec<&Adapter> = slots.iter().flatten().collect();
         for (i, a) in list.iter().enumerate() {
             if list[..i].iter().any(|b| b.name == a.name) || a.name.is_empty() {
                 bail!(
@@ -266,7 +273,7 @@ impl Adapters {
             .iter()
             .map(|a| a.rank)
             .max()
-            .unwrap()
+            .unwrap_or(0)
             .next_multiple_of(4);
         let (q, kv, inter, dim) = (c.q_dim(), c.kv_dim(), c.intermediate, c.hidden);
         // (modules, their output rows, input columns) per stacked matrix.
@@ -276,7 +283,7 @@ impl Adapters {
             (&[4, 5], vec![inter, inter], dim),
             (&[6], vec![dim], inter),
         ];
-        let n = list.len();
+        let n = slots.len();
         let mut layers = Vec::with_capacity(c.layers);
         for l in 0..c.layers {
             let mut out: [Option<Lora>; 4] = Default::default();
@@ -303,7 +310,8 @@ impl Adapters {
                 } else {
                     1.0
                 };
-                for (id, ad) in list.iter().enumerate() {
+                for (id, ad) in slots.iter().enumerate() {
+                    let Some(ad) = ad else { continue };
                     let mut row0 = 0;
                     for (s, (&m, &seg)) in modules.iter().zip(seg_rows).enumerate() {
                         let found = ad.weights.iter().find(|p| p.layer == l && p.module == m);
@@ -360,7 +368,10 @@ impl Adapters {
             bail!("adapter {} has more layers than the model", a.name);
         }
         Ok(Adapters {
-            names: list.into_iter().map(|a| a.name).collect(),
+            names: slots
+                .iter()
+                .map(|a| a.as_ref().map_or(String::new(), |a| a.name.clone()))
+                .collect(),
             rank,
             layers,
         })
@@ -370,7 +381,7 @@ impl Adapters {
     pub fn id(&self, name: &str) -> Option<u32> {
         self.names
             .iter()
-            .position(|n| n == name)
+            .position(|n| n == name && !name.is_empty())
             .map(|i| i as u32 + 1)
     }
 

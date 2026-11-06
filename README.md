@@ -51,6 +51,8 @@ The CPU gets 3.3x by batch 16, with sequences sharing each weight load in its in
 
 From `tachyon bench-batch --lora ...` (8-bit base). A test checks the adapters against the same updates merged into the weights, and the GPU's against the CPU's (to 0.0001 in logits).
 
+**Adapters come and go while serving.** With `--allow-lora-loading`, `POST /v1/load_lora_adapter` with `{"lora_name": "sql", "lora_path": "adapters/sql"}` loads one into a running server and `POST /v1/unload_lora_adapter` with `{"lora_name": "sql"}` removes it (vLLM's endpoints; off by default, since they read whatever path they are given). Loads, unloads and requests go through the scheduler's one queue, so a request runs with the adapter it named or is refused, never with one swapped in under it; an adapter some request is still using can't be unloaded. Each adapter ever loaded gets its own prefix-cache salt, so one loaded into a freed id never picks up the previous adapter's cached prompts (a test catches exactly that when the salt is the id).
+
 ### Under memory pressure: swap-out preemption and priorities
 
 When the KV cache fills, the least urgent sequence (by `priority`, then arrival) is preempted. With swap space (`--swap-tokens`, on by default) its keys and values are copied out to host memory and back in when it resumes; blocks still in the prefix cache are taken from there rather than copied. With 32 users in a 2,048-token cache (about 150 preemptions per run), swapping matched recomputing in throughput (953 against 951–953 tok/s): the prefix cache already keeps most of a preempted sequence's work. It lowered the median time to first token to 0.09–0.10 s, from 0.10–0.18 s. Tests check that preempted requests, swapped or recomputed, produce exactly the text they produce alone, and that queued requests start in priority order.
@@ -167,7 +169,7 @@ Property tests check the matchers against the JSON parser on tens of thousands o
 | [`kv.rs`](src/kv.rs) | Paged KV cache: block allocator, per-sequence block tables, prefix cache with LRU eviction |
 | [`scheduler.rs`](src/scheduler.rs) | Continuous batching, chunked prefill, priorities, preemption by swap-out or recompute, parallel sampling |
 | [`lora.rs`](src/lora.rs) | LoRA adapters from PEFT checkpoints, applied per token with the batch grouped by adapter |
-| [`server.rs`](src/server.rs) | HTTP/1.1 on `std::net`: `/v1/chat/completions` (streaming, `stop`, `response_format`, `ignore_eos`), `/v1/models`, `/info`, chat page |
+| [`server.rs`](src/server.rs) | HTTP/1.1 on `std::net`: `/v1/chat/completions` (streaming, `stop`, `response_format`, `ignore_eos`), `/v1/models`, adapter loading, `/info`, chat page |
 | [`model.rs`](src/model.rs) | CPU forward pass over a batch: RMSNorm, grouped-query attention through block tables, RoPE (with Llama 3's scaling), SiLU MLP or mixture of experts, Qwen3's q/k norm |
 | [`gpu/`](src/gpu) | Metal backend: [`kernels.metal`](src/gpu/kernels.metal) (matrix-vector kernels for decode, `simdgroup_matrix` GEMM for batches and per expert, FlashAttention-style prefill attention and paged decode attention, expert routing, RoPE, norms) and an [Objective-C bridge](src/gpu/shim.m) compiled by `build.rs` |
 | [`kernels.rs`](src/kernels.rs) | NEON kernels for bf16, int8×int8 and int4×int8: I8MM matrix instructions for batches, SDOT for single tokens; the quantizers. AVX2 versions in [`kernels_x86.rs`](src/kernels_x86.rs), WebAssembly SIMD in [`kernels_wasm.rs`](src/kernels_wasm.rs) |
@@ -207,7 +209,7 @@ Property tests check the matchers against the JSON parser on tens of thousands o
 
 ### How it's verified
 
-`cargo test --release` runs 85 tests, in CI on Apple Silicon and on x86-64 Linux (where the AVX2 kernels run). GitHub's virtual Macs expose a GPU that returns zeros, so the engine self-tests the GPU at startup and refuses a broken one; there the GPU comparisons skip, and they run on real hardware. Beyond unit tests of every kernel against a scalar reference, the tests check against the real model that:
+`cargo test --release` runs 86 tests, in CI on Apple Silicon and on x86-64 Linux (where the AVX2 kernels run). GitHub's virtual Macs expose a GPU that returns zeros, so the engine self-tests the GPU at startup and refuses a broken one; there the GPU comparisons skip, and they run on real hardware. Beyond unit tests of every kernel against a scalar reference, the tests check against the real model that:
 
 - several sequences batched together produce exactly the tokens each produces alone, on CPU and GPU;
 - the GPU produces exactly the same greedy tokens as the CPU, for Qwen2.5, Qwen3, Llama 3.2 and the Granite mixture of experts (through both its per-token and per-expert paths);
@@ -217,7 +219,7 @@ Property tests check the matchers against the JSON parser on tens of thousands o
 - speculative decoding (model or prompt-lookup drafter) is identical to plain greedy decoding, and speculative sampling reproduces the target distribution (200,000 trials);
 - reusing the KV cache gives the same output as recomputing it;
 - JSON mode always parses, schema-constrained output has the requested shape (optional properties may be left out, in order, required ones never) and keeps to its patterns, formats, lengths and number ranges, and forced tool calls fit the function's schema, in Qwen's, Llama's and Granite's formats;
-- LoRA adapters give what merging them into the weights gives, the GPU's match the CPU's, and a batch mixing adapters gives each sequence what it gets alone;
+- LoRA adapters give what merging them into the weights gives, the GPU's match the CPU's, a batch mixing adapters gives each sequence what it gets alone, and adapters loaded and unloaded while serving give the same replies as before, refuse to unload in use, and never share a stale prefix cache;
 - requests preempted under memory pressure, swapped out or recomputed, produce exactly the text they produce alone, and queued requests start in priority order;
 - the tokenizer round-trips code, Unicode and emoji and won't let user text forge control tokens, and GPT-2-style pre-tokenization splits as its regex does (and, outside `cargo test`, the token ids match llama.cpp's exactly; see the design notes);
 - the JSON parser, safetensors reader and pre-tokenizer survive thousands of random and corrupted inputs, and the JSON and JSON Schema matchers never accept anything the parser rejects.

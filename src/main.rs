@@ -81,6 +81,8 @@ options:
                      runs a request with the adapter its `model` names;
                      `run` and `chat` use --adapter, or the first
   --adapter NAME     which adapter `run` and `chat` use
+  --allow-lora-loading  let `serve` load and unload adapters while running
+                     (POST /v1/load_lora_adapter and /v1/unload_lora_adapter)
   --out FILE         where `calibrate` writes (default <model>/imatrix.bin)
   --url URL          server for `loadtest` (default http://127.0.0.1:8080)
   --clients LIST     concurrency levels for `loadtest` (default 1,4,16)
@@ -124,6 +126,7 @@ struct Args {
     lora: Vec<(String, PathBuf)>,
     adapter: Option<String>,
     swap_tokens: Option<usize>,
+    allow_lora_loading: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -171,6 +174,7 @@ fn parse_args() -> Result<Args> {
         lora: Vec::new(),
         adapter: None,
         swap_tokens: None,
+        allow_lora_loading: false,
     };
     while let Some(flag) = it.next() {
         let mut value = || {
@@ -248,6 +252,7 @@ fn parse_args() -> Result<Args> {
             "--host" => a.host = value()?,
             "--kv-tokens" => a.kv_tokens = num(&flag, value()?)?,
             "--swap-tokens" => a.swap_tokens = Some(num(&flag, value()?)?),
+            "--allow-lora-loading" => a.allow_lora_loading = true,
             "--max-seqs" => a.max_seqs = num(&flag, value()?)?,
             "--json" => a.json = true,
             "--schema" => a.schema = Some(value()?.into()),
@@ -338,7 +343,9 @@ fn load_backend(
     } else {
         Box::new(CpuBackend::new(cfg.clone(), weights, pool.clone(), blocks))
     };
-    if !a.lora.is_empty() && dir == a.model {
+    // (`serve` hands its adapters to the scheduler instead, which can load
+    // and unload them while serving.)
+    if !a.lora.is_empty() && dir == a.model && a.cmd != "serve" {
         let adapters = tachyon::lora::Adapters::load(&cfg, &a.lora)?;
         eprintln!(
             "loaded LoRA adapters {} (rank {}, {:.0} MB)",
@@ -897,6 +904,11 @@ fn serve(a: &Args) -> Result<()> {
             swap_tokens: a.swap_tokens.unwrap_or(blocks * BLOCK),
         },
     );
+    for (name, dir) in &a.lora {
+        let adapter = tachyon::lora::Adapter::load(name, dir)?;
+        scheduler.load_adapter(adapter).map_err(Error)?;
+        eprintln!("loaded LoRA adapter {name} from {}", dir.display());
+    }
     let server = Server {
         scheduler,
         tok,
@@ -916,7 +928,7 @@ fn serve(a: &Args) -> Result<()> {
         kv_tokens: blocks * BLOCK,
         defaults: a.sampler.clone(),
         max_tokens: a.max_tokens,
-        adapters: a.lora.iter().map(|(n, _)| n.clone()).collect(),
+        allow_lora_loading: a.allow_lora_loading,
     };
     tachyon::server::serve(server, &format!("{}:{}", a.host, a.port))
 }

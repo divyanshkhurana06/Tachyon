@@ -51,8 +51,9 @@ pub struct Server {
     pub kv_tokens: usize,
     pub defaults: SamplerConfig,
     pub max_tokens: usize,
-    /// LoRA adapters a request can name as its `model` (ids from 1).
-    pub adapters: Vec<String>,
+    /// Whether `/v1/load_lora_adapter` may load adapters from the server's
+    /// disk (vLLM's `VLLM_ALLOW_RUNTIME_LORA_UPDATING`).
+    pub allow_lora_loading: bool,
 }
 
 impl Server {
@@ -62,7 +63,13 @@ impl Server {
             ("model", self.model_id.as_str().into()),
             (
                 "adapters",
-                Json::Arr(self.adapters.iter().map(|a| a.as_str().into()).collect()),
+                Json::Arr(
+                    self.scheduler
+                        .adapters()
+                        .into_iter()
+                        .map(Json::from)
+                        .collect(),
+                ),
             ),
             ("backend", self.backend.as_str().into()),
             ("params", self.params.into()),
@@ -227,9 +234,9 @@ fn handle(mut conn: TcpStream, server: &Server) -> io::Result<()> {
                 ("owned_by", "tachyon".into()),
             ])];
             // Adapters are listed as models of their own, as vLLM does.
-            models.extend(server.adapters.iter().map(|a| {
+            models.extend(server.scheduler.adapters().into_iter().map(|a| {
                 obj([
-                    ("id", a.as_str().into()),
+                    ("id", a.into()),
                     ("object", "model".into()),
                     ("owned_by", "tachyon".into()),
                     ("parent", server.model_id.as_str().into()),
@@ -242,11 +249,75 @@ fn handle(mut conn: TcpStream, server: &Server) -> io::Result<()> {
             )
         }
         ("POST", "/v1/chat/completions") => chat_completion(&mut conn, server, &req.body),
+        ("POST", "/v1/load_lora_adapter") => load_adapter(&mut conn, server, &req.body),
+        ("POST", "/v1/unload_lora_adapter") => unload_adapter(&mut conn, server, &req.body),
         _ => error(
             &mut conn,
             "404 Not Found",
             &format!("no route for {} {}", req.method, req.path),
         ),
+    }
+}
+
+/// `lora_name` (and `lora_path`) from an adapter request's JSON body.
+fn adapter_request(body: &[u8]) -> std::result::Result<(String, Option<String>), String> {
+    let text = std::str::from_utf8(body).map_err(|_| "body is not UTF-8".to_string())?;
+    let j = Json::parse(text)?;
+    let field = |k: &str| j.get(k).and_then(Json::as_str).map(str::to_string);
+    let name = field("lora_name").ok_or("`lora_name` must be a string")?;
+    Ok((name, field("lora_path")))
+}
+
+/// vLLM's run-time adapter loading: `{"lora_name", "lora_path"}`, where the
+/// path is a PEFT checkpoint folder on the server's disk. Off unless the
+/// server was started with `--allow-lora-loading`, since it reads whatever
+/// path it is given.
+fn load_adapter(conn: &mut TcpStream, server: &Server, body: &[u8]) -> io::Result<()> {
+    if !server.allow_lora_loading {
+        let msg =
+            "loading adapters at run time is off (start the server with --allow-lora-loading)";
+        return error(conn, "403 Forbidden", msg);
+    }
+    let (name, path) = match adapter_request(body) {
+        Ok((name, Some(path))) => (name, path),
+        Ok(_) => return error(conn, "400 Bad Request", "`lora_path` must be a string"),
+        Err(e) => return error(conn, "400 Bad Request", &e),
+    };
+    if name.is_empty() || name == server.model_id {
+        let msg = format!("an adapter can't be called {name:?}");
+        return error(conn, "400 Bad Request", &msg);
+    }
+    let loaded = crate::lora::Adapter::load(&name, std::path::Path::new(&path))
+        .map_err(|e| e.to_string())
+        .and_then(|a| server.scheduler.load_adapter(a));
+    match loaded {
+        Ok(()) => {
+            eprintln!("loaded LoRA adapter {name} from {path}");
+            let msg = format!("Success: LoRA adapter '{name}' added successfully.");
+            respond(conn, "200 OK", "text/plain; charset=utf-8", msg.as_bytes())
+        }
+        Err(e) => error(conn, "400 Bad Request", &e),
+    }
+}
+
+/// `{"lora_name"}`: unloads an adapter that no request is using.
+fn unload_adapter(conn: &mut TcpStream, server: &Server, body: &[u8]) -> io::Result<()> {
+    if !server.allow_lora_loading {
+        let msg =
+            "unloading adapters at run time is off (start the server with --allow-lora-loading)";
+        return error(conn, "403 Forbidden", msg);
+    }
+    let name = match adapter_request(body) {
+        Ok((name, _)) => name,
+        Err(e) => return error(conn, "400 Bad Request", &e),
+    };
+    match server.scheduler.unload_adapter(&name) {
+        Ok(()) => {
+            eprintln!("unloaded LoRA adapter {name}");
+            let msg = format!("Success: LoRA adapter '{name}' removed successfully.");
+            respond(conn, "200 OK", "text/plain; charset=utf-8", msg.as_bytes())
+        }
+        Err(e) => error(conn, "400 Bad Request", &e),
     }
 }
 
@@ -665,15 +736,17 @@ fn chat_completion(conn: &mut TcpStream, server: &Server, body: &[u8]) -> io::Re
         );
         return error(conn, "400 Bad Request", &msg);
     }
-    let adapter = server
-        .adapters
-        .iter()
-        .position(|a| Some(a) == req.model.as_ref());
-    let model_id = adapter.map_or(server.model_id.as_str(), |i| &server.adapters[i]);
+    // An adapter if `model` names one (the scheduler checks again, in
+    // order with loading and unloading); anything else is the base model.
+    let adapter = (req.model.as_ref())
+        .filter(|m| server.scheduler.adapters().contains(m))
+        .cloned();
+    let model_id = adapter.clone().unwrap_or_else(|| server.model_id.clone());
+    let model_id = model_id.as_str();
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     server.scheduler.submit(Request {
-        adapter: adapter.map_or(0, |i| i as u32 + 1),
+        adapter,
         visible: server.template.visible_tokens(),
         priority: req.priority,
         prompt,

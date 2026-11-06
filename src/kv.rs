@@ -205,13 +205,15 @@ impl BlockPool {
         self.start_with(prompt, 0)
     }
 
-    /// [`BlockPool::start`] for a sequence run with LoRA adapter `adapter`:
-    /// it shares cached blocks only with sequences of the same adapter.
-    pub fn start_with(&mut self, prompt: &[u32], adapter: u32) -> Seq {
-        let root = if adapter == 0 {
+    /// [`BlockPool::start`] for a sequence run with a LoRA adapter: it
+    /// shares cached blocks only with sequences of the same `salt` (0 for
+    /// the base model; the scheduler gives each adapter it ever loads its
+    /// own, so an id reused after unloading never meets stale blocks).
+    pub fn start_with(&mut self, prompt: &[u32], salt: u32) -> Seq {
+        let root = if salt == 0 {
             ROOT
         } else {
-            chain(ROOT, &[adapter])
+            chain(ROOT, &[salt])
         };
         let mut seq = Seq {
             root,

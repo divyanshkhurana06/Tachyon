@@ -73,7 +73,7 @@ fn submit(
         events: tx,
         cancel: Arc::new(AtomicBool::new(false)),
         logprobs: None,
-        adapter: 0,
+        adapter: None,
         visible: Vec::new(),
         priority,
     });

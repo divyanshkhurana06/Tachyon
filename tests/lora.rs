@@ -3,7 +3,8 @@
 //! PEFT's format and loaded back the way `--lora` loads them.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::AtomicBool;
+use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 
 use tachyon::config::Config;
 use tachyon::engine::Backend;
@@ -12,7 +13,8 @@ use tachyon::kv::{Batch, Logits};
 use tachyon::lora::{Adapter, Adapters, MODULES};
 use tachyon::model::{CpuBackend, Weights};
 use tachyon::pool::Pool;
-use tachyon::sampler::argmax;
+use tachyon::sampler::{argmax, SamplerConfig};
+use tachyon::scheduler::{Event, Request, Scheduler, SchedulerOptions};
 use tachyon::tokenizer::Tokenizer;
 use tachyon::weights::{Format, Matrix};
 
@@ -328,5 +330,116 @@ fn gpu_adapters_match_cpu() {
         );
         assert!(effect > 1.0 && diff < 0.01, "{diff} vs {effect}");
     }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Submits a greedy request (with `adapter`, by name) and returns its event
+/// stream.
+fn submit(s: &Scheduler, prompt: &[u32], adapter: Option<&str>, n: usize) -> mpsc::Receiver<Event> {
+    let (tx, rx) = mpsc::channel();
+    s.submit(Request {
+        prompt: prompt.to_vec(),
+        max_tokens: n,
+        sampler: SamplerConfig {
+            temperature: 0.0,
+            ..SamplerConfig::default()
+        },
+        stop_tokens: Vec::new(),
+        constraint: None,
+        events: tx,
+        cancel: Arc::new(AtomicBool::new(false)),
+        logprobs: None,
+        adapter: adapter.map(str::to_string),
+        visible: Vec::new(),
+        priority: 0,
+    });
+    rx
+}
+
+/// The whole reply, or the error.
+fn reply(rx: mpsc::Receiver<Event>) -> Result<String, String> {
+    let mut text = String::new();
+    for e in rx {
+        match e {
+            Event::Text(t) => text.push_str(&t),
+            Event::Done(_) => return Ok(text),
+            Event::Error(e) => return Err(e),
+            Event::Logprob(_) => {}
+        }
+    }
+    Err("no reply".into())
+}
+
+/// Adapters loaded and unloaded while serving: requests name them, get
+/// what they'd get from adapters loaded at startup, can't name one that is
+/// gone, and keep one that is in use from being unloaded. An adapter loaded
+/// into a freed id starts with a clean prefix cache.
+#[test]
+fn adapters_load_and_unload_while_serving() {
+    let Some((_g, dir)) = setup() else { return };
+    let cfg = Config::load(&dir).unwrap();
+    let tmp = scratch("serve");
+    let synth = [
+        Synthetic::new(&cfg, 8, 16.0, false, 7),
+        Synthetic::new(&cfg, 16, 16.0, true, 8),
+    ];
+    for (i, sy) in synth.iter().enumerate() {
+        sy.write(&tmp.join(format!("adapter{i}")));
+    }
+    let load =
+        |name: &str, i: usize| Adapter::load(name, &tmp.join(format!("adapter{i}"))).unwrap();
+    let tok = Arc::new(Tokenizer::load(&dir.join("tokenizer.json")).unwrap());
+    let s = Scheduler::spawn(
+        Box::new(cpu(&cfg, Weights::load(&dir, &cfg, Format::Q8).unwrap())),
+        tok.clone(),
+        SchedulerOptions {
+            max_seqs: 8,
+            max_seq_len: 512,
+            swap_tokens: 0,
+        },
+    );
+    // Long enough to fill cache blocks, which the next requests reuse.
+    let text =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("bench/eval.txt"))
+            .unwrap();
+    let prompt = tok.encode(&text, false)[..60].to_vec();
+    let run = |adapter: Option<&str>| reply(submit(&s, &prompt, adapter, 12));
+
+    assert!(run(Some("a0")).unwrap_err().contains("not loaded"));
+    let base = run(None).unwrap();
+    s.load_adapter(load("a0", 0)).unwrap();
+    let a0 = run(Some("a0")).unwrap();
+    assert_ne!(a0, base, "the adapter should change the reply");
+    s.load_adapter(load("a1", 1)).unwrap();
+    assert_eq!(s.adapters(), ["a0", "a1"]);
+    let a1 = run(Some("a1")).unwrap();
+    assert_ne!(a1, a0);
+    // Padding a0 to a1's rank changes nothing, and the base is untouched.
+    assert_eq!(run(Some("a0")).unwrap(), a0);
+    assert_eq!(run(None).unwrap(), base);
+    assert!(s
+        .load_adapter(load("a0", 1))
+        .unwrap_err()
+        .contains("already loaded"));
+
+    // In use: a long reply holds a1.
+    let busy = submit(&s, &prompt, Some("a1"), 200);
+    assert!(matches!(busy.recv().unwrap(), Event::Text(_)));
+    assert!(s.unload_adapter("a1").unwrap_err().contains("in use"));
+    reply(busy).unwrap();
+
+    s.unload_adapter("a0").unwrap();
+    assert_eq!(s.adapters(), ["a1"]);
+    assert!(run(Some("a0")).unwrap_err().contains("not loaded"));
+    assert_eq!(run(Some("a1")).unwrap(), a1);
+    // a1's weights under a new name take a0's freed id; a0's cached blocks
+    // for this prompt must not leak into it.
+    s.load_adapter(load("b", 1)).unwrap();
+    assert_eq!(s.adapters(), ["b", "a1"]);
+    assert_eq!(run(Some("b")).unwrap(), a1);
+    s.unload_adapter("b").unwrap();
+    s.unload_adapter("a1").unwrap();
+    assert!(s.adapters().is_empty());
+    assert_eq!(run(None).unwrap(), base);
     let _ = std::fs::remove_dir_all(&tmp);
 }

@@ -85,6 +85,7 @@ finished; every one should end with a number in the README.
 - [x] **f16 scales for 8-bit weights** (llama.cpp's Q8_0 layout): 8.5 bits per weight, from 9
 - [x] **Compact scales converted where they're used**: the single-token CPU kernels convert eight scales at a time in registers; GPU lanes take eight weights (both nibbles of four bytes) per scale. 4-bit decode 13-26% faster on the GPU, as fast as before on the CPU; GPU decode at chat lengths now on par with llama.cpp
 - [x] **`tachyon kld`**: KL divergence from bf16 and top-token agreement, which showed the importance matrix cutting `q4m`'s divergence by 40% where short-text perplexity said it didn't help
+- [x] **LoRA adapters loaded and unloaded while serving** (vLLM's `/v1/load_lora_adapter` and `/v1/unload_lora_adapter`), serialized with requests in the scheduler, with a prefix-cache salt per adapter ever loaded
 - Tried and rejected: 6-bit fields packed as in Q4_K (4.5 bits per weight, but unpacking them cost 20% of CPU decode); expanding a row's scales into memory before its dot product, even eight rows at a time (about a tenth of decode on short rows)
 
 ## Next
@@ -110,7 +111,7 @@ About 65% of llama.cpp. Next: repack weights at load into the interleaved layout
 ### Serving
 
 - Priority preemption: an urgent request preempts running ones instead of waiting for a free slot.
-- LoRA: load and unload adapters while serving, and adapters on mixture-of-experts MLPs.
+- LoRA adapters on mixture-of-experts MLPs.
 - Fewer LoRA dispatches at batch 1 (8 per layer now; launches are most of the remaining 10%).
 
 ### Models
