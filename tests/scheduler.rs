@@ -134,32 +134,51 @@ fn preempted_requests_match_running_alone() {
     assert_eq!(recomputed, want);
 }
 
+/// One sequence at a time: the most urgent request preempts the running
+/// one, which resumes (swapped back in) ahead of its priority class, and
+/// the rest wait in priority order; the preempted reply is unchanged.
 #[test]
-fn urgent_requests_go_first() {
+fn urgent_requests_preempt_and_go_first() {
     let Some((_g, dir)) = setup() else { return };
     let ps = prompts(&dir);
-    // One at a time: while the first runs, the rest queue by priority.
-    let s = scheduler(&dir, 64, 1, 0);
+    let s = scheduler(&dir, 64, 1, 4096);
+    let alone = collect(submit(&s, ps[0].clone(), 60, 0)).0;
     let order = Arc::new(Mutex::new(Vec::new()));
     let first = submit(&s, ps[0].clone(), 60, 0);
     // Once it is generating, queue the others.
-    while !matches!(first.recv().unwrap(), Event::Text(_)) {}
+    let mut head = String::new();
+    loop {
+        match first.recv().unwrap() {
+            Event::Text(t) => {
+                head.push_str(&t);
+                break;
+            }
+            Event::Error(e) => panic!("{e}"),
+            _ => {}
+        }
+    }
     let rest: Vec<_> = [(1, 5), (2, 0), (3, -1)]
         .into_iter()
         .map(|(i, p)| (i, submit(&s, ps[i].clone(), 8, p)))
         .collect();
+    let texts = Arc::new(Mutex::new(vec![String::new(); 4]));
     let waits: Vec<_> = std::iter::once((0, first))
         .chain(rest)
         .map(|(i, rx)| {
-            let order = order.clone();
+            let (order, texts) = (order.clone(), texts.clone());
             thread::spawn(move || {
-                collect(rx);
+                let text = collect(rx).0;
+                texts.lock().unwrap()[i] = text;
                 order.lock().unwrap().push(i);
             })
         })
         .collect();
     waits.into_iter().for_each(|w| w.join().unwrap());
-    assert_eq!(*order.lock().unwrap(), [0, 3, 2, 1]);
+    assert_eq!(*order.lock().unwrap(), [3, 0, 2, 1]);
+    assert_eq!(head + &texts.lock().unwrap()[0], alone);
+    let st = &s.stats;
+    assert!(st.preemptions.load(Ordering::Relaxed) >= 1);
+    assert!(st.swaps.load(Ordering::Relaxed) >= 1);
 }
 
 /// Blocks swapped out of one place in the GPU's cache and into another give

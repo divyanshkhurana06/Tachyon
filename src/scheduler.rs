@@ -13,11 +13,12 @@
 //! sampled token) and feeds as many as the budget allows.
 //!
 //! When the KV cache runs out, the least urgent sequence not yet in the step
-//! (lowest priority, then latest to arrive) is preempted: its keys and
-//! values are copied out to host memory, its blocks released, and it
-//! re-queues ahead of its priority class, to be copied back in when there is
-//! room. Without swap space left it is recomputed instead; its full blocks
-//! stay in the prefix cache, so that is often nearly free too.
+//! (lowest priority, then latest to arrive) is preempted, as is a less
+//! urgent running sequence when a more urgent request finds no room: its
+//! keys and values are copied out to host memory, its blocks released, and
+//! it re-queues ahead of its priority class, to be copied back in when
+//! there is room. Without swap space left it is recomputed instead; its full
+//! blocks stay in the prefix cache, so that is often nearly free too.
 //!
 //! LoRA adapters are loaded and unloaded through the same channel as
 //! requests, between steps, and requests name their adapter, resolved when
@@ -466,16 +467,29 @@ impl Worker {
 
     /// Moves queued requests into the running set while there is room for
     /// their next chunk, so a freshly preempted sequence isn't readmitted
-    /// only to be preempted again.
+    /// only to be preempted again. Without room, the most urgent waiting
+    /// request preempts less urgent running ones (strictly: equals never
+    /// preempt each other) until it fits.
     fn admit(&mut self) {
-        while self.running.len() < self.opts.max_seqs {
+        loop {
             let Some(s) = self.waiting.front() else { break };
             let restore = s.swapped.as_ref().map_or(0, |w| w.len);
             let chunk = (s.tokens.len() - restore).min(self.backend.max_batch());
-            if !self.running.is_empty()
-                && self.pool.available() < (restore + chunk).div_ceil(crate::kv::BLOCK) + 1
-            {
-                break;
+            let full = self.running.len() >= self.opts.max_seqs;
+            let tight = !self.running.is_empty()
+                && self.pool.available() < (restore + chunk).div_ceil(crate::kv::BLOCK) + 1;
+            if full || tight {
+                let p = s.req.priority;
+                let victim = (0..self.running.len())
+                    .filter(|&j| self.running[j].req.priority > p)
+                    .max_by_key(|&j| (self.running[j].req.priority, self.running[j].arrived));
+                match victim {
+                    Some(j) => {
+                        self.evict(j);
+                        continue;
+                    }
+                    None => break,
+                }
             }
             let mut s = self.waiting.pop_front().unwrap();
             let seq = match s.swapped.take() {
@@ -518,8 +532,7 @@ impl Worker {
 
     /// Frees room by sending a sequence after `after` back to the queue:
     /// only those not yet in this step's batch are candidates, and of them
-    /// the least urgent goes. Its cache is swapped out if there is room for
-    /// it, or else recomputed later.
+    /// the least urgent goes.
     fn preempt(&mut self, after: usize) -> bool {
         if self.running.len() <= after + 1 {
             return false;
@@ -527,6 +540,14 @@ impl Worker {
         let victim = (after + 1..self.running.len())
             .max_by_key(|&j| (self.running[j].req.priority, self.running[j].arrived))
             .unwrap();
+        self.evict(victim);
+        true
+    }
+
+    /// Sends running sequence `victim` back to the queue, ahead of its
+    /// priority class. Its cache is swapped out if there is room for it, or
+    /// else recomputed later.
+    fn evict(&mut self, victim: usize) {
         let mut s = self.running.remove(victim);
         self.stats.preemptions.fetch_add(1, Ordering::Relaxed);
         let len = s.seq.as_ref().map_or(0, |q| q.len);
@@ -541,7 +562,6 @@ impl Worker {
         }
         self.release(&mut s);
         self.queue(s, true);
-        true
     }
 
     fn step(&mut self) {

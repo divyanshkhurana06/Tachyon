@@ -55,7 +55,9 @@ From `tachyon bench-batch --lora ...` (8-bit base). A test checks the adapters a
 
 ### Under memory pressure: swap-out preemption and priorities
 
-When the KV cache fills, the least urgent sequence (by `priority`, then arrival) is preempted. With swap space (`--swap-tokens`, on by default) its keys and values are copied out to host memory and back in when it resumes; blocks still in the prefix cache are taken from there rather than copied. With 32 users in a 2,048-token cache (about 150 preemptions per run), swapping matched recomputing in throughput (953 against 951–953 tok/s): the prefix cache already keeps most of a preempted sequence's work. It lowered the median time to first token to 0.09–0.10 s, from 0.10–0.18 s. Tests check that preempted requests, swapped or recomputed, produce exactly the text they produce alone, and that queued requests start in priority order.
+When the KV cache fills, the least urgent sequence (by `priority`, then arrival) is preempted. With swap space (`--swap-tokens`, on by default) its keys and values are copied out to host memory and back in when it resumes; blocks still in the prefix cache are taken from there rather than copied. With 32 users in a 2,048-token cache (about 150 preemptions per run), swapping matched recomputing in throughput (953 against 951–953 tok/s): the prefix cache already keeps most of a preempted sequence's work. It lowered the median time to first token to 0.09–0.10 s, from 0.10–0.18 s.
+
+A more urgent request that finds no room **preempts** less urgent running ones (strictly less: equals never preempt each other) instead of waiting for one to finish. With 16 load-test clients keeping an 8-sequence server full of 128-token replies, an urgent request (`"priority": -1`) waited a median 9.3 s for its first token, until a wave of replies finished; now it takes 0.034 s, at the cost of one swapped-out reply per urgent request. Tests check that preempted requests, swapped or recomputed, produce exactly the text they produce alone, and that an urgent request preempts the running one while the rest start in priority order.
 
 ### Single-sequence speed and quality
 
@@ -220,7 +222,7 @@ Property tests check the matchers against the JSON parser on tens of thousands o
 - reusing the KV cache gives the same output as recomputing it;
 - JSON mode always parses, schema-constrained output has the requested shape (optional properties may be left out, in order, required ones never) and keeps to its patterns, formats, lengths and number ranges, and forced tool calls fit the function's schema, in Qwen's, Llama's and Granite's formats;
 - LoRA adapters give what merging them into the weights gives, the GPU's match the CPU's, a batch mixing adapters gives each sequence what it gets alone, and adapters loaded and unloaded while serving give the same replies as before, refuse to unload in use, and never share a stale prefix cache;
-- requests preempted under memory pressure, swapped out or recomputed, produce exactly the text they produce alone, and queued requests start in priority order;
+- requests preempted under memory pressure or by a more urgent request, swapped out or recomputed, produce exactly the text they produce alone, and queued requests start in priority order;
 - the tokenizer round-trips code, Unicode and emoji and won't let user text forge control tokens, and GPT-2-style pre-tokenization splits as its regex does (and, outside `cargo test`, the token ids match llama.cpp's exactly; see the design notes);
 - the JSON parser, safetensors reader and pre-tokenizer survive thousands of random and corrupted inputs, and the JSON and JSON Schema matchers never accept anything the parser rejects.
 
